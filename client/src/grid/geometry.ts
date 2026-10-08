@@ -55,7 +55,8 @@ export type Hit =
   | { kind: 'row-resize'; table: TableId; r: number }
   | { kind: 'col-tab'; table: TableId; c: number }
   | { kind: 'row-tab'; table: TableId; r: number }
-  | { kind: 'select-all'; table: TableId };
+  | { kind: 'select-all'; table: TableId }
+  | { kind: 'fill'; table: TableId };
 
 export function hitTest(
   tables: Map<TableId, TableMeta>,
@@ -64,8 +65,19 @@ export function hitTest(
   wy: number,
   selected: TableId | null,
   zoom: number,
+  selection?: { table: TableId; r1: number; c1: number } | null,
 ): Hit {
   const tol = 5 / zoom;
+  // fill handle at the bottom-right corner of the selection
+  if (selection) {
+    const t = tables.get(selection.table);
+    if (t) {
+      const L = layoutOf(t);
+      const fx = t.x + L.colX[Math.min(selection.c1, t.cols - 1) + 1];
+      const fy = t.y + L.rowY[Math.min(selection.r1, t.rows - 1) + 1];
+      if (Math.abs(wx - fx) <= tol && Math.abs(wy - fy) <= tol) return { kind: 'fill', table: t.id };
+    }
+  }
   // topmost first
   for (let i = order.length - 1; i >= 0; i--) {
     const id = order[i];
@@ -139,6 +151,8 @@ export function cursorFor(h: Hit): string {
       return 'e-resize';
     case 'select-all':
       return 'pointer';
+    case 'fill':
+      return 'crosshair';
     default:
       return 'default';
   }

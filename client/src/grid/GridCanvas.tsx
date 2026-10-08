@@ -5,6 +5,7 @@ import { bindRenderer } from './actions';
 import { GridController } from './controller';
 import { GridRenderer } from './renderer';
 import { CellEditor } from './CellEditor';
+import { ContextMenu } from './ContextMenu';
 
 export function GridCanvas() {
   const hostRef = useRef<HTMLDivElement>(null);
@@ -29,7 +30,10 @@ export function GridCanvas() {
       r.markDirty();
     });
     const unsub = useStore.subscribe(() => r.markDirty());
-    const ro = new ResizeObserver(() => r.markDirty());
+    const ro = new ResizeObserver(() => {
+      if (r.initialised) r.app.resize();
+      r.markDirty();
+    });
     ro.observe(host);
     return () => {
       disposed = true;
@@ -43,6 +47,7 @@ export function GridCanvas() {
   return (
     <div className="canvas-host" ref={hostRef} tabIndex={0}>
       {renderer && <CellEditor renderer={renderer} tick={viewportTick} />}
+      <ContextMenu host={hostRef.current} />
     </div>
   );
 }

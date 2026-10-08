@@ -2,7 +2,7 @@
 // keyboard handling and the toolbar.
 
 import * as book from '../engine/book';
-import type { CellKind, Format, TableId } from '../engine/types';
+import type { CellKind, CellView, Format, TableId } from '../engine/types';
 import { cellAt, getState, setStatus, useStore, type Selection } from '../state/store';
 import { layoutOf } from './geometry';
 
@@ -276,6 +276,92 @@ export function fillDown() {
     values.push(row);
   }
   book.apply({ type: 'set_cells', table: sel.table, row: sel.r0 + 1, col: sel.c0, values });
+}
+
+/** Sort the table's data rows (below the header) by a column. Formulas keep their relative references. */
+export function sortTableByColumn(table: TableId, col: number, ascending: boolean, rowRange?: { r0: number; r1: number }) {
+  const st = getState();
+  const meta = st.tables.get(table);
+  if (!meta) return;
+  // sort the selected rows when several are selected, otherwise every row below the header
+  const start = rowRange ? rowRange.r0 : meta.header_rows;
+  const end = rowRange ? rowRange.r1 : meta.rows - 1;
+  const rows: { r: number; key: CellView['v'] }[] = [];
+  for (let r = start; r <= end; r++) rows.push({ r, key: cellAt(table, r, col)?.v ?? null });
+  const rank = (v: CellView['v']) => (v === null ? 3 : 'n' in v ? 0 : 's' in v ? 1 : 'b' in v ? 2 : 3);
+  rows.sort((a, b) => {
+    const ra = rank(a.key);
+    const rb = rank(b.key);
+    if (ra !== rb) return ra - rb; // blanks always last
+    let cmp = 0;
+    if (a.key && b.key) {
+      if ('n' in a.key && 'n' in b.key) cmp = a.key.n - b.key.n;
+      else if ('s' in a.key && 's' in b.key) cmp = a.key.s.localeCompare(b.key.s, undefined, { numeric: true, sensitivity: 'base' });
+      else if ('b' in a.key && 'b' in b.key) cmp = Number(a.key.b) - Number(b.key.b);
+    }
+    return ascending ? cmp : -cmp;
+  });
+  const values: string[][] = rows.map((src, i) => {
+    const target = start + i;
+    const row: string[] = [];
+    for (let c = 0; c < meta.cols; c++) {
+      const cell = cellAt(table, src.r, c);
+      const input = cell?.s ? '' : (cell?.i ?? '');
+      row.push(input.startsWith('=') ? book.shiftFormulaRow(input, src.r, target - src.r) : input);
+    }
+    return row;
+  });
+  book.apply({ type: 'set_cells', table, row: start, col: 0, values });
+}
+
+/** Autofill: extend the source block into the (larger) target selection. */
+export function fillFromSource(table: TableId, src: { r0: number; c0: number; r1: number; c1: number }, target: Selection | null) {
+  if (!target || target.table !== table) return;
+  const sameRows = target.r0 === src.r0 && target.r1 === src.r1;
+  const sameCols = target.c0 === src.c0 && target.c1 === src.c1;
+  if (sameRows && sameCols) return;
+  const srcH = src.r1 - src.r0 + 1;
+  const srcW = src.c1 - src.c0 + 1;
+  const values: string[][] = [];
+  for (let r = target.r0; r <= target.r1; r++) {
+    const row: string[] = [];
+    for (let c = target.c0; c <= target.c1; c++) {
+      const insideSrc = r >= src.r0 && r <= src.r1 && c >= src.c0 && c <= src.c1;
+      if (insideSrc) {
+        row.push(cellAt(table, r, c)?.i ?? '');
+        continue;
+      }
+      const vertical = sameCols;
+      const i = vertical ? (((r - src.r0) % srcH) + srcH) % srcH : (((c - src.c0) % srcW) + srcW) % srcW;
+      const sr = vertical ? src.r0 + i : r;
+      const sc = vertical ? c : src.c0 + i;
+      const srcCell = cellAt(table, sr, sc);
+      const input = srcCell?.i ?? '';
+      // numeric series when the source column/row holds ≥2 numbers with a constant step
+      const seriesValues: number[] = [];
+      for (let k = 0; k < (vertical ? srcH : srcW); k++) {
+        const cc = cellAt(table, vertical ? src.r0 + k : r, vertical ? c : src.c0 + k);
+        if (cc?.k === 'value' && cc.v && 'n' in cc.v) seriesValues.push(cc.v.n);
+        else {
+          seriesValues.length = 0;
+          break;
+        }
+      }
+      if (seriesValues.length >= 1 && srcCell?.k === 'value') {
+        const step = seriesValues.length >= 2 ? seriesValues[1] - seriesValues[0] : 1;
+        const n = seriesValues.length;
+        const idx = vertical ? r - src.r0 : c - src.c0; // may be negative (filling upwards/leftwards)
+        const base = seriesValues[0];
+        const val = seriesValues.length >= 2 || idx >= n ? base + step * idx : base;
+        row.push(String(Math.round(val * 1e10) / 1e10));
+        continue;
+      }
+      if (input.startsWith('=')) row.push(book.shiftFormula(input, r - sr, c - sc));
+      else row.push(input);
+    }
+    values.push(row);
+  }
+  book.apply({ type: 'set_cells', table, row: target.r0, col: target.c0, values });
 }
 
 export function addTable(opts: { x?: number; y?: number; rows?: number; cols?: number; name?: string; values?: string[][] } = {}) {

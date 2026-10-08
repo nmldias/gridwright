@@ -83,6 +83,31 @@ pub fn shift_relative(src: &str, dr: i64, dc: i64) -> String {
     to_string(&expr)
 }
 
+/// Shift only the references that point at `src_row` (single cells and ranges
+/// confined to that row) by `dr`; used when rows are reordered (sorting).
+pub fn shift_same_row(src: &str, src_row: u32, dr: i64) -> String {
+    let mut expr = match parse(src) {
+        Ok(e) => e,
+        Err(_) => return src.to_string(),
+    };
+    parser::for_each_ref_mut(&mut expr, &mut |r| {
+        if r.table.is_some() {
+            return;
+        }
+        match &mut r.kind {
+            RefKind::Cell { row, abs_row, .. } if !*abs_row && *row == src_row => {
+                *row = (*row as i64 + dr).max(0) as u32;
+            }
+            RefKind::Range { r0, r1, abs, .. } if !abs[0] && !abs[2] && *r0 == src_row && *r1 == src_row => {
+                *r0 = (*r0 as i64 + dr).max(0) as u32;
+                *r1 = *r0;
+            }
+            _ => {}
+        }
+    });
+    to_string(&expr)
+}
+
 /// Rewrite references in `src` after `count` rows/cols were inserted (count > 0)
 /// or deleted (count < 0) at index `at` in the table named `table_name` (or the
 /// current table when `is_current`). References into the deleted span become #REF!.
@@ -326,6 +351,7 @@ mod tests {
         assert_eq!(d[1], Rect { table: 2, r0: 1, c0: 1, r1: 1, c1: 1 });
         assert_eq!(shift_relative("A1+$B$2+C$3", 1, 1), "B2 + $B$2 + D$3");
         assert_eq!(shift_relative("SUM(A1:A3)", 0, 2), "SUM(C1:C3)");
+        assert_eq!(shift_same_row("B3*C3+SUM(B2:B5)+$B$3", 2, 4), "B7 * C7 + SUM(B2:B5) + $B$3");
         assert_eq!(adjust_for_insert_delete("SUM(A1:A5)+A7", true, "Table 1", true, 2, 1), "SUM(A1:A6) + A8");
         assert_eq!(adjust_for_insert_delete("SUM(A1:A5)+A3", true, "Table 1", true, 2, -1), "SUM(A1:A4) + #REF!");
         assert_eq!(adjust_for_insert_delete("A1", true, "Table 1", true, 0, -1), "#REF!");

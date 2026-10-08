@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import * as book from '../engine/book';
 import { deleteSelectedTable } from '../grid/actions';
+import { exportTableCsv } from '../grid/ContextMenu';
 import { useStore } from '../state/store';
 
 export function TablePanel() {
@@ -81,6 +82,8 @@ export function TablePanel() {
       <div className="muted small">
         x {Math.round(meta.x)} · y {Math.round(meta.y)} · drag the title bar to move; drag the handles at the right, bottom and corner to add or remove columns and rows; drag column and row edges to resize them.
       </div>
+      <div className="panel-subtitle">Export</div>
+      <button onClick={() => exportTableCsv(meta.id)}>Download table as CSV</button>
       <div className="panel-subtitle">Danger zone</div>
       <button className="danger" onClick={() => deleteSelectedTable()}>
         Delete table

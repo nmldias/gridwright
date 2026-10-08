@@ -138,6 +138,17 @@ impl Book {
         }
     }
 
+    /// Shift references confined to `src_row` by `dr` (row reordering).
+    pub fn shift_formula_row(src: &str, src_row: u32, dr: i32) -> String {
+        let body = formula::formula_body(src);
+        let shifted = formula::shift_same_row(body, src_row, dr as i64);
+        if src.trim_start().starts_with('=') {
+            format!("={}", shifted)
+        } else {
+            shifted
+        }
+    }
+
     /// Table id by name (0 when not found).
     pub fn table_id(&self, name: &str) -> u32 {
         self.engine.wb.table_by_name(name).map(|t| t.id).unwrap_or(0)

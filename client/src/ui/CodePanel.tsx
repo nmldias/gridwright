@@ -105,7 +105,7 @@ export function CodePanel() {
       <div className="code-output">
         {cell.err && <pre className="err">{cell.err}</pre>}
         {cell.out && <pre className="out">{cell.out}</pre>}
-        {!cell.err && !cell.out && <div className="muted">Output: {cell.ss ? `${cell.ss[0]} × ${cell.ss[1]} cells` : cell.v ? 'single value' : 'nothing yet'}</div>}
+        {!cell.err && !cell.out && <div className="muted">Output: {cell.v && 's' in cell.v && cell.v.s.startsWith('data:image/') ? `picture (${cell.ss?.[0]} × ${cell.ss?.[1]} cells)` : cell.ss ? `${cell.ss[0]} × ${cell.ss[1]} cells` : cell.v ? 'single value' : 'nothing yet'}</div>}
       </div>
       <div className="muted small">Ctrl+Enter runs · Ctrl+S saves without running · results spill from this cell; the table grows to fit.</div>
     </div>

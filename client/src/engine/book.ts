@@ -198,6 +198,10 @@ export function shiftFormula(src: string, dr: number, dc: number): string {
   return Book.shift_formula(src, dr, dc);
 }
 
+export function shiftFormulaRow(src: string, srcRow: number, dr: number): string {
+  return Book.shift_formula_row(src, srcRow, dr);
+}
+
 export function tableIdByName(name: string): TableId {
   return getBook().table_id(name);
 }

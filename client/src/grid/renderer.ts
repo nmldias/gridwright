@@ -1,7 +1,7 @@
 // WebGL grid renderer built on PixiJS v8. Draws free-floating tables on an
 // infinite canvas with viewport culling and pooled bitmap text.
 
-import { Application, BitmapFontManager, BitmapText, Container, Graphics } from 'pixi.js';
+import { Application, Assets, BitmapFontManager, BitmapText, Container, Graphics, Sprite, Texture } from 'pixi.js';
 import type { CellView, TableId, TableMeta } from '../engine/types';
 import { colToLetters } from '../engine/types';
 import { getState, type Presence, type Selection } from '../state/store';
@@ -106,19 +106,45 @@ class TableView {
   container = new Container();
   bg = new Graphics();
   lines = new Graphics();
+  imageLayer = new Container();
   textLayer = new Container();
   chrome = new Graphics();
   chromeText = new Container();
   pool: TextPool;
   chromePool: TextPool;
+  sprites: Sprite[] = [];
   constructor() {
-    this.container.addChild(this.chrome, this.bg, this.lines, this.textLayer, this.chromeText);
+    this.container.addChild(this.chrome, this.bg, this.lines, this.imageLayer, this.textLayer, this.chromeText);
     this.pool = new TextPool(this.textLayer);
     this.chromePool = new TextPool(this.chromeText);
   }
   destroy() {
     this.container.destroy({ children: true });
   }
+}
+
+// --- image cells (data: URLs produced by code cells, e.g. matplotlib figures) ---
+const textureCache = new Map<string, Texture | 'loading' | 'failed'>();
+let onTextureLoaded: (() => void) | null = null;
+function textureFor(url: string): Texture | null {
+  const t = textureCache.get(url);
+  if (t === 'loading' || t === 'failed') return null;
+  if (t) return t;
+  textureCache.set(url, 'loading');
+  if (textureCache.size > 200) {
+    const first = textureCache.keys().next().value;
+    if (first) textureCache.delete(first);
+  }
+  Assets.load<Texture>({ src: url, loadParser: 'loadTextures' })
+    .then((tex) => {
+      textureCache.set(url, tex);
+      onTextureLoaded?.();
+    })
+    .catch(() => textureCache.set(url, 'failed'));
+  return null;
+}
+export function isImageValue(s: string): boolean {
+  return s.startsWith('data:image/');
 }
 
 export interface ResizePreview {
@@ -158,6 +184,7 @@ export class GridRenderer {
   rowPreview: RowPreview | null = null;
   movePreview: MovePreview | null = null;
   initialised = false;
+  private raf = 0;
   private host: HTMLElement | null = null;
   viewportListeners = new Set<() => void>();
 
@@ -181,17 +208,27 @@ export class GridRenderer {
     host.appendChild(this.app.canvas);
     this.app.canvas.style.display = 'block';
     this.app.stage.addChild(this.world);
-    this.app.ticker.add(() => {
+    // Render only when something changed (saves CPU/GPU when idle; Pixi's own
+    // ticker would otherwise re-render every frame).
+    this.app.ticker.stop();
+    const loop = () => {
+      if (!this.initialised) return;
       if (this.dirty) {
         this.dirty = false;
         this.draw();
+        this.app.renderer.render(this.app.stage);
       }
-    });
+      this.raf = requestAnimationFrame(loop);
+    };
+    this.raf = requestAnimationFrame(loop);
     this.initialised = true;
+    onTextureLoaded = () => this.markDirty();
     this.markDirty();
   }
 
   destroy() {
+    this.initialised = false;
+    cancelAnimationFrame(this.raf);
     this.app.destroy(true, { children: true });
   }
 
@@ -323,6 +360,7 @@ export class GridRenderer {
     chrome.clear();
     view.pool.reset();
     view.chromePool.reset();
+    let spriteIdx = 0;
 
     // visible row/col window
     const c0 = Math.max(0, vx0 <= 0 ? 0 : indexAt(L.colX, Math.min(vx0, L.width - 0.01)));
@@ -360,6 +398,26 @@ export class GridRenderer {
           }
           const text = displayOf(cell);
           if (!text) continue;
+          if (cell.ss && cell.v && 's' in cell.v && isImageValue(cell.v.s)) {
+            const tex = textureFor(cell.v.s);
+            const sw = (L.colX[Math.min(meta.cols, c + cell.ss[1])] ?? L.width) - x0;
+            const sh = (L.rowY[Math.min(meta.rows, r + cell.ss[0])] ?? L.height) - y0;
+            if (tex) {
+              let sp = view.sprites[spriteIdx];
+              if (!sp) {
+                sp = new Sprite(tex);
+                view.imageLayer.addChild(sp);
+                view.sprites.push(sp);
+              }
+              spriteIdx++;
+              sp.texture = tex;
+              sp.visible = true;
+              const scale = Math.min((sw - 4) / tex.width, (sh - 4) / tex.height);
+              sp.scale.set(scale);
+              sp.position.set(x0 + 2, y0 + 2);
+            }
+            continue;
+          }
           const bold = !!cell.f?.bold || r < meta.header_rows;
           const t = view.pool.acquire(bold ? boldStyle : normalStyle);
           const align = alignOf(cell);
@@ -375,7 +433,8 @@ export class GridRenderer {
             }
           }
           const maxW = Math.max(4, avail - PAD * 2);
-          t.text = fit(text, maxW, bold);
+          const fitted = fit(text, maxW, bold);
+          if (t.text !== fitted) t.text = fitted;
           const isErr = !!cell.v && typeof cell.v === 'object' && 'e' in cell.v;
           const color = hexToNum(cell.f?.color);
           t.tint = isErr ? COLORS.error : color !== null ? color : cell.s ? 0x1e3a8a : COLORS.text;
@@ -386,6 +445,7 @@ export class GridRenderer {
       }
     }
     view.pool.finish();
+    for (let i = spriteIdx; i < view.sprites.length; i++) view.sprites[i].visible = false;
 
     // grid lines (only the visible window)
     for (let c = c0; c <= c1 + 1 && c <= meta.cols; c++) {
@@ -414,7 +474,8 @@ export class GridRenderer {
       chrome.rect(-TAB_SIZE, 0, TAB_SIZE, L.height).fill(COLORS.tab);
       for (let c = c0; c <= c1; c++) {
         const t = view.chromePool.acquire(smallStyle);
-        t.text = colToLetters(c);
+        const letters = colToLetters(c);
+        if (t.text !== letters) t.text = letters;
         t.tint = COLORS.tabText;
         const w = L.colX[c + 1] - L.colX[c];
         t.x = L.colX[c] + (w - t.width) / 2;
@@ -423,7 +484,8 @@ export class GridRenderer {
       }
       for (let r = r0; r <= r1; r++) {
         const t = view.chromePool.acquire(smallStyle);
-        t.text = String(r + 1);
+        const label = String(r + 1);
+        if (t.text !== label) t.text = label;
         t.tint = COLORS.tabText;
         const h = L.rowY[r + 1] - L.rowY[r];
         t.x = -TAB_SIZE + (TAB_SIZE - t.width) / 2;

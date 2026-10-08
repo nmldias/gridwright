@@ -3,7 +3,7 @@
 use crate::formula;
 use crate::model::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1033,37 +1033,35 @@ impl Engine {
             ch.push_cell(&self.wb, *r);
         }
         let all = self.formula_cells();
+        let formula_set: HashSet<CellRef> = all.iter().map(|(r, _)| *r).collect();
         let mut dirty: HashSet<CellRef> = HashSet::new();
-        let mut queue: VecDeque<CellRef> = changed.iter().cloned().collect();
-        let mut seen: HashSet<CellRef> = changed.iter().cloned().collect();
         // formulas among the changed cells are dirty themselves
         for r in changed {
-            if all.iter().any(|(f, _)| f == r) {
+            if formula_set.contains(r) {
                 dirty.insert(*r);
             }
         }
-        while let Some(c) = queue.pop_front() {
-            for (f, rects) in &all {
-                if dirty.contains(f) {
-                    continue;
-                }
-                if rects.iter().any(|rect| rect.table == c.table && rect.contains(c.key())) {
-                    dirty.insert(*f);
-                    if seen.insert(*f) {
-                        queue.push_back(*f);
-                    }
+        // iterative closure: formulas reading any changed cell become dirty, and their
+        // own cells count as changed for the next round
+        let mut frontier: HashSet<CellRef> = changed.iter().cloned().collect();
+        while !frontier.is_empty() {
+            let hit = formulas_reading(&all, &frontier, &dirty);
+            frontier.clear();
+            for f in hit {
+                if dirty.insert(f) {
+                    frontier.insert(f);
                 }
             }
         }
         let dirty_vec: Vec<CellRef> = dirty.into_iter().collect();
         self.evaluate_dirty(&all, &dirty_vec, ch);
         // code cells reading any changed cell
-        let mut all_changed: Vec<CellRef> = changed.to_vec();
+        let mut all_changed: HashSet<CellRef> = changed.iter().cloned().collect();
         all_changed.extend(dirty_vec.iter().cloned());
         let mut reruns = HashSet::new();
         for t in &self.wb.tables {
             for (k, c) in &t.cells {
-                if c.is_code() {
+                if c.is_code() && !c.code_deps.is_empty() {
                     let me = CellRef::new(t.id, k.row, k.col);
                     // a code cell never re-runs because of its own cell or its own spilled output
                     let is_own = |x: &CellRef| {
@@ -1071,7 +1069,7 @@ impl Engine {
                             || (x.table == me.table
                                 && t.cells.get(&x.key()).map(|cc| cc.spill_from == Some(*k)).unwrap_or(false))
                     };
-                    if c.code_deps.iter().any(|d| all_changed.iter().any(|x| x.table == d.table && d.contains(x.key()) && !is_own(x))) {
+                    if rects_hit(&c.code_deps, &all_changed, &is_own) {
                         reruns.insert(me);
                     }
                 }
@@ -1094,16 +1092,27 @@ impl Engine {
         // edges: f -> g when f reads g (both dirty)
         let mut edges: HashMap<CellRef, Vec<CellRef>> = HashMap::new();
         for f in dirty {
-            let mut precedents = vec![];
+            let mut precedents: Vec<CellRef> = vec![];
             if let Some(rs) = rects.get(f) {
-                for g in dirty {
-                    if g != f && rs.iter().any(|rect| rect.table == g.table && rect.contains(g.key())) {
-                        precedents.push(*g);
+                let mut seen: HashSet<CellRef> = HashSet::new();
+                for rect in rs.iter() {
+                    let area = (rect.rows() as u64) * (rect.cols() as u64);
+                    if area <= dirty_set.len() as u64 {
+                        for r in rect.r0..=rect.r1 {
+                            for c in rect.c0..=rect.c1 {
+                                let g = CellRef::new(rect.table, r, c);
+                                if dirty_set.contains(&g) && seen.insert(g) {
+                                    precedents.push(g);
+                                }
+                            }
+                        }
+                    } else {
+                        for g in dirty {
+                            if rect.table == g.table && rect.contains(g.key()) && seen.insert(*g) {
+                                precedents.push(*g);
+                            }
+                        }
                     }
-                }
-                // self reference
-                if rs.iter().any(|rect| rect.table == f.table && rect.contains(f.key())) {
-                    precedents.push(*f);
                 }
             }
             edges.insert(*f, precedents);
@@ -1147,7 +1156,6 @@ impl Engine {
                 }
             }
         }
-        let _ = dirty_set;
         for r in order {
             let value = if in_cycle.contains(&r) {
                 Value::Error(ErrorKind::Cycle)
@@ -1163,6 +1171,40 @@ impl Engine {
             ch.push_cell(&self.wb, r);
         }
     }
+}
+
+/// Does any rectangle contain a cell of `set` (ignoring cells for which `skip` is true)?
+fn rects_hit(rects: &[Rect], set: &HashSet<CellRef>, skip: &dyn Fn(&CellRef) -> bool) -> bool {
+    for rect in rects {
+        let area = (rect.rows() as u64) * (rect.cols() as u64);
+        if area <= set.len() as u64 {
+            for r in rect.r0..=rect.r1 {
+                for c in rect.c0..=rect.c1 {
+                    let g = CellRef::new(rect.table, r, c);
+                    if set.contains(&g) && !skip(&g) {
+                        return true;
+                    }
+                }
+            }
+        } else if set.iter().any(|x| x.table == rect.table && rect.contains(x.key()) && !skip(x)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Formulas (not already dirty) that read at least one cell of `frontier`.
+fn formulas_reading(all: &[(CellRef, Vec<Rect>)], frontier: &HashSet<CellRef>, dirty: &HashSet<CellRef>) -> Vec<CellRef> {
+    let mut out = vec![];
+    for (f, rects) in all {
+        if dirty.contains(f) {
+            continue;
+        }
+        if rects_hit(rects, frontier, &|_| false) {
+            out.push(*f);
+        }
+    }
+    out
 }
 
 fn op_kind(op: &Op) -> char {

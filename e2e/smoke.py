@@ -186,6 +186,49 @@ def main():
         t5 = state()["tables"][0]
         check("dragging the title moves the table", abs(t5["x"] - (t["x"] + 160)) <= 8 and abs(t5["y"] - (t["y"] + 48)) <= 8, f"({t['x']},{t['y']}) -> ({t5['x']},{t5['y']})")
 
+        # --- fill handle: numeric series ---------------------------------------------
+        x, y = cell_screen(first, 12, 0)
+        page.mouse.click(x, y)
+        page.keyboard.type("1")
+        page.keyboard.press("Enter")
+        page.keyboard.type("3")
+        page.keyboard.press("Enter")
+        time.sleep(0.2)
+        x0, y0 = cell_screen(first, 12, 0)
+        page.mouse.click(x0, y0)
+        page.keyboard.down("Shift")
+        page.mouse.click(*cell_screen(first, 13, 0))
+        page.keyboard.up("Shift")
+        time.sleep(0.2)
+        st = state()
+        t = st["tables"][0]
+        vp = viewport()
+        box = canvas_box()
+        fx = box["x"] + (t["x"] + t["cw"][0]) * vp["zoom"] + vp["x"]
+        fy = box["y"] + (t["y"] + sum(t["rh"][:14])) * vp["zoom"] + vp["y"]
+        page.mouse.move(fx, fy)
+        page.mouse.down()
+        page.mouse.move(fx, fy + 3 * 24 * vp["zoom"] + 4, steps=6)
+        page.mouse.up()
+        time.sleep(0.3)
+        series = [cell_value(first, r, 0) for r in (14, 15, 16)]
+        check("fill handle extends a numeric series", all(v and v["v"] == {"n": n} for v, n in zip(series, (5, 7, 9))), str(series))
+
+        # --- context menu: insert a row ------------------------------------------------
+        rows_before = state()["tables"][0]["rows"]
+        x, y = cell_screen(first, 3, 1)
+        page.mouse.click(x, y, button="right")
+        page.wait_for_selector(".context-menu", timeout=3000)
+        page.click(".context-menu >> text=Insert 1 row below")
+        time.sleep(0.3)
+        st = state()
+        v = cell_value(first, 5, 0)  # "West" moved down one row; formula in D6 rewritten
+        d7 = cell_value(first, 6, 3)
+        check("context menu inserts a row and rewrites formulas", st["tables"][0]["rows"] == rows_before + 1 and v is not None and v["v"] == {"s": "West"} and d7 is not None and d7["i"] == "=SUM(D2:D6)", f"rows {st['tables'][0]['rows']} {v} {d7}")
+        page.keyboard.press("Control+z")
+        time.sleep(0.3)
+        check("undo removes the inserted row", state()["tables"][0]["rows"] == rows_before)
+
         # --- JavaScript code cell with spill ----------------------------------------
         x, y = cell_screen(first, 1, 5)
         page.mouse.click(x, y)

@@ -63,7 +63,18 @@ function handleResult(e: MessageEvent) {
   if (!cell || (cell.k !== 'python' && cell.k !== 'javascript')) return; // cell changed meanwhile
   const deps: Rect[] = (d.deps ?? []).map((x: Rect) => ({ table: x.table, r0: x.r0, c0: x.c0, r1: x.r1, c1: x.c1 }));
   if (d.ok) {
-    const output: CellValue[][] | null = d.output ? (d.output as Plain[][]).map((row) => row.map(toCellValue)) : null;
+    let output: CellValue[][] | null;
+    if (d.output && !Array.isArray(d.output) && typeof d.output === 'object' && typeof d.output.image === 'string') {
+      // a picture: reserve a block of cells roughly matching its pixel size (100×24 px cells)
+      const meta = getState().tables.get(ref.table);
+      const avgW = meta && meta.cols ? meta.col_widths.reduce((a, b) => a + b, 0) / meta.cols : 100;
+      const avgH = meta && meta.rows ? meta.row_heights.reduce((a, b) => a + b, 0) / meta.rows : 24;
+      const cols = Math.max(2, Math.min(40, Math.ceil((d.output.width || 640) / avgW)));
+      const rows = Math.max(2, Math.min(200, Math.ceil((d.output.height || 480) / avgH)));
+      output = Array.from({ length: rows }, (_, r) => Array.from({ length: cols }, (_, c) => (r === 0 && c === 0 ? { s: d.output.image as string } : null)));
+    } else {
+      output = d.output ? (d.output as Plain[][]).map((row) => row.map(toCellValue)) : null;
+    }
     book.apply({ type: 'code_result', table: ref.table, row: ref.row, col: ref.col, output, std_out: d.std_out || null, std_err: null, deps });
   } else {
     book.apply({ type: 'code_result', table: ref.table, row: ref.row, col: ref.col, output: null, std_out: d.std_out || null, std_err: d.error || 'error', deps });

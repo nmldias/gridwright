@@ -82,10 +82,43 @@ def _q_plain(x):
         pass
     return str(x)
 
+def _q_figure_png(obj):
+    """matplotlib Figure/Axes → (data URL, width px, height px), else None."""
+    try:
+        import matplotlib
+        from matplotlib.figure import Figure
+        fig = None
+        if isinstance(obj, Figure):
+            fig = obj
+        elif hasattr(obj, "figure") and isinstance(getattr(obj, "figure"), Figure):
+            fig = obj.figure
+        elif hasattr(obj, "get_figure"):
+            f = obj.get_figure()
+            if isinstance(f, Figure):
+                fig = f
+        if fig is None:
+            return None
+        import io, base64
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=96, bbox_inches="tight", facecolor="white")
+        w, h = fig.get_size_inches()
+        data = base64.b64encode(buf.getvalue()).decode("ascii")
+        try:
+            import matplotlib.pyplot as plt
+            plt.close(fig)
+        except Exception:
+            pass
+        return ("data:image/png;base64," + data, int(w * 96), int(h * 96))
+    except Exception:
+        return None
+
 def _q_convert(obj):
-    """Turn a cell result into a JSON 2-D list (or None)."""
+    """Turn a cell result into a JSON 2-D list (or None, or {"image":...})."""
     if obj is None:
         return json.dumps(None)
+    png = _q_figure_png(obj)
+    if png is not None:
+        return json.dumps({"image": png[0], "width": png[1], "height": png[2]})
     try:
         import pandas as pd
         if isinstance(obj, pd.DataFrame):

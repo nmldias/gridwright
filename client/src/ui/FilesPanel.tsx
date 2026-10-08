@@ -26,6 +26,30 @@ export function FilesPanel() {
   }, [fileId, dirty]);
 
   const onImport = async (f: File) => {
+    if (/\.(xlsx|xlsm|xls|ods)$/i.test(f.name)) {
+      const XLSX = await import('xlsx');
+      const wb = XLSX.read(await f.arrayBuffer(), { type: 'array', cellDates: false, cellFormula: true, sheetStubs: true });
+      let n = 0;
+      for (const name of wb.SheetNames) {
+        const sheet = wb.Sheets[name];
+        const rows: (string | number | boolean | null)[][] = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: true, defval: '' });
+        if (!rows.length) continue;
+        const values = rows.map((r) => r.map((v) => (v === null || v === undefined ? '' : String(v))));
+        // formulas are imported as their cached values; SheetJS exposes formulas via cell.f when present
+        for (const addr of Object.keys(sheet)) {
+          if (addr[0] === '!') continue;
+          const cell = sheet[addr] as { f?: string };
+          if (cell.f) {
+            const p = XLSX.utils.decode_cell(addr);
+            if (values[p.r]) values[p.r][p.c] = '=' + cell.f;
+          }
+        }
+        addTable({ name: wb.SheetNames.length > 1 ? `${f.name.replace(/\.[^.]+$/, '')} ${name}` : f.name.replace(/\.[^.]+$/, ''), rows: values.length, cols: Math.max(...values.map((r) => r.length), 1), values });
+        n++;
+      }
+      setStatus(`Imported ${n} sheet${n === 1 ? '' : 's'} from ${f.name}`);
+      return;
+    }
     const text = await f.text();
     if (f.name.toLowerCase().endsWith('.json')) {
       try {
@@ -55,12 +79,12 @@ export function FilesPanel() {
         <button className="primary" onClick={() => void saveCurrentFile()}>
           Save
         </button>
-        <button onClick={() => importRef.current?.click()}>Import CSV / JSON</button>
+        <button onClick={() => importRef.current?.click()}>Import CSV / Excel / JSON</button>
         <button onClick={downloadJson}>Download JSON</button>
         <input
           ref={importRef}
           type="file"
-          accept=".csv,.tsv,.txt,.json"
+          accept=".csv,.tsv,.txt,.json,.xlsx,.xlsm,.xls,.ods"
           style={{ display: 'none' }}
           onChange={(e) => {
             const f = e.target.files?.[0];

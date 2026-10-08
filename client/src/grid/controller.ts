@@ -10,6 +10,7 @@ import {
   commitEdit,
   copySelection,
   fillDown,
+  fillFromSource,
   moveActive,
   pasteFromClipboard,
   selectCell,
@@ -29,7 +30,8 @@ type Mode =
   | { kind: 'col-resize'; table: TableId; c: number; startX: number; startW: number }
   | { kind: 'row-resize'; table: TableId; r: number; startY: number; startH: number }
   | { kind: 'col-select'; table: TableId; c: number }
-  | { kind: 'row-select'; table: TableId; r: number };
+  | { kind: 'row-select'; table: TableId; r: number }
+  | { kind: 'fill'; table: TableId; r0: number; c0: number; r1: number; c1: number };
 
 export class GridController {
   private mode: Mode = { kind: 'idle' };
@@ -50,7 +52,18 @@ export class GridController {
     on(host, 'pointerup', (e) => this.onPointerUp(e));
     on(host, 'pointercancel', (e) => this.onPointerUp(e));
     on(host, 'wheel', (e) => this.onWheel(e), { passive: false });
-    on(host, 'contextmenu', (e) => e.preventDefault());
+    on(host, 'contextmenu', (e: MouseEvent) => {
+      e.preventDefault();
+      const rect = host.getBoundingClientRect();
+      const w = this.renderer.screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
+      const h = this.hit(w.x, w.y);
+      if (h.kind === 'cell') {
+        const sel = getState().selection;
+        const inside = sel && sel.table === h.table && h.r >= sel.r0 && h.r <= sel.r1 && h.c >= sel.c0 && h.c <= sel.c1;
+        if (!inside) selectCell(h.table, h.r, h.c);
+      }
+      host.dispatchEvent(new CustomEvent('gw-contextmenu', { detail: { x: e.clientX, y: e.clientY, hit: h } }));
+    });
     on(window, 'keydown', (e) => this.onKeyDown(e));
     on(window, 'keyup', (e) => {
       if (e.code === 'Space') this.spaceDown = false;
@@ -85,11 +98,14 @@ export class GridController {
 
   private hit(wx: number, wy: number): Hit {
     const st = getState();
-    return hitTest(st.tables, Array.from(st.tables.keys()), wx, wy, st.selectedTable, this.renderer.zoom);
+    return hitTest(st.tables, Array.from(st.tables.keys()), wx, wy, st.selectedTable, this.renderer.zoom, st.selection);
   }
 
   // ------------------------------------------------------------------
   private onPointerDown(e: PointerEvent) {
+    // overlays (context menu, cell editor) handle their own pointer events
+    const target = e.target as HTMLElement | null;
+    if (target && target !== this.host && !(target instanceof HTMLCanvasElement)) return;
     if (e.button === 1 || this.spaceDown) {
       this.beginPan(e);
       return;
@@ -107,6 +123,11 @@ export class GridController {
     const h = this.hit(x, y);
     this.host.setPointerCapture(e.pointerId);
     switch (h.kind) {
+      case 'fill': {
+        const sel = st.selection!;
+        this.mode = { kind: 'fill', table: h.table, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+        break;
+      }
       case 'cell': {
         const now = performance.now();
         const dbl = now - this.lastClick.t < 400 && this.lastClick.table === h.table && this.lastClick.r === h.r && this.lastClick.c === h.c;
@@ -214,6 +235,20 @@ export class GridController {
         if (c >= 0) selectRange(meta.id, 0, Math.min(this.mode.c, c), meta.rows - 1, Math.max(this.mode.c, c));
         return;
       }
+      case 'fill': {
+        const meta = st.tables.get(this.mode.table)!;
+        const L = layoutOf(meta);
+        const r = indexAt(L.rowY, Math.max(0, Math.min(L.height - 0.01, y - meta.y)));
+        const c = indexAt(L.colX, Math.max(0, Math.min(L.width - 0.01, x - meta.x)));
+        if (r < 0 || c < 0) return;
+        const m = this.mode;
+        // extend vertically or horizontally, whichever is dominant
+        const dr = r > m.r1 ? r - m.r1 : r < m.r0 ? r - m.r0 : 0;
+        const dc = c > m.c1 ? c - m.c1 : c < m.c0 ? c - m.c0 : 0;
+        if (Math.abs(dr) >= Math.abs(dc)) selectRange(meta.id, Math.min(m.r0, r), m.c0, Math.max(m.r1, r), m.c1);
+        else selectRange(meta.id, m.r0, Math.min(m.c0, c), m.r1, Math.max(m.c1, c));
+        return;
+      }
       case 'row-select': {
         const meta = st.tables.get(this.mode.table)!;
         const L = layoutOf(meta);
@@ -266,6 +301,10 @@ export class GridController {
     }
     this.host.style.cursor = 'default';
     switch (mode.kind) {
+      case 'fill': {
+        fillFromSource(mode.table, mode, getState().selection);
+        return;
+      }
       case 'move': {
         const p = this.renderer.movePreview;
         this.renderer.movePreview = null;
