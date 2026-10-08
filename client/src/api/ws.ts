@@ -79,8 +79,7 @@ function connect() {
         }
         break;
       case 'reload':
-        // another client saved a newer version; the files panel will offer to reload
-        useStore.setState({ status: 'The document was saved by another client.' });
+        // another client saved; edits are already relayed live, nothing to do
         break;
     }
   };
