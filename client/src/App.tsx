@@ -1,0 +1,122 @@
+import { useEffect, useState } from 'react';
+import { api } from './api/client';
+import { joinFile } from './api/ws';
+import * as book from './engine/book';
+import { GridCanvas } from './grid/GridCanvas';
+import { useStore } from './state/store';
+import { AiPanel } from './ui/AiPanel';
+import { CodePanel } from './ui/CodePanel';
+import { FilesPanel } from './ui/FilesPanel';
+import { FormulaBar } from './ui/FormulaBar';
+import { SettingsPanel } from './ui/SettingsPanel';
+import { SqlPanel } from './ui/SqlPanel';
+import { StatusBar } from './ui/StatusBar';
+import { TablePanel } from './ui/TablePanel';
+import { TopBar } from './ui/TopBar';
+import { installAutosave, openFile, saveCurrentFile } from './ui/files';
+import { installRunner } from './workers/runner';
+
+const SAMPLE: string[][] = [
+  ['Region', 'Units', 'Unit price', 'Revenue'],
+  ['North', '120', '9.5', '=B2*C2'],
+  ['South', '80', '11', '=B3*C3'],
+  ['East', '150', '8.75', '=B4*C4'],
+  ['West', '60', '12.25', '=B5*C5'],
+  ['Total', '=SUM(B2:B5)', '', '=SUM(D2:D5)'],
+];
+
+const INITIAL_FILE = new URLSearchParams(location.search).get('file');
+let booted = false;
+
+export function App() {
+  const ready = useStore((s) => s.ready);
+  const panel = useStore((s) => s.panel);
+  const [boot, setBoot] = useState<string>('loading engine…');
+
+  useEffect(() => {
+    const offRunner = installRunner();
+    const offAutosave = installAutosave();
+    const firstBoot = !booted;
+    booted = true;
+    if (firstBoot) (async () => {
+      try {
+        await book.ensureEngine();
+        const fileId = INITIAL_FILE;
+        if (fileId) {
+          await openFile(fileId);
+        } else {
+          await book.loadBook(null, 'Untitled');
+          // seed the first table so the canvas is not empty
+          const first = useStore.getState().tables.keys().next().value;
+          if (first) {
+            book.apply({ type: 'set_cells', table: first, row: 0, col: 0, values: SAMPLE });
+            useStore.setState({ dirty: false });
+          }
+          joinFile(null);
+        }
+        api.health().catch(() => useStore.setState({ status: 'Server not reachable — files, SQL and AI are unavailable; the spreadsheet still works.' }));
+      } catch (e) {
+        setBoot(`Failed to start: ${(e as Error).message}`);
+      }
+    })();
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        void saveCurrentFile();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (useStore.getState().dirty) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => {
+      offRunner();
+      offAutosave();
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('beforeunload', onBeforeUnload);
+    };
+  }, []);
+
+  // keep ?file= in the URL in sync with the open document
+  const fileId = useStore((s) => s.fileId);
+  useEffect(() => {
+    const url = new URL(location.href);
+    if (fileId) url.searchParams.set('file', fileId);
+    else url.searchParams.delete('file');
+    history.replaceState(null, '', url.toString());
+  }, [fileId]);
+
+  if (!ready) {
+    return (
+      <div className="boot">
+        <div className="logo big">▦</div>
+        <div>{boot}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="app">
+      <TopBar />
+      <FormulaBar />
+      <div className="main">
+        <GridCanvas />
+        {panel !== 'none' && (
+          <aside className="side">
+            {panel === 'code' && <CodePanel />}
+            {panel === 'ai' && <AiPanel />}
+            {panel === 'sql' && <SqlPanel />}
+            {panel === 'files' && <FilesPanel />}
+            {panel === 'table' && <TablePanel />}
+            {panel === 'settings' && <SettingsPanel />}
+          </aside>
+        )}
+      </div>
+      <StatusBar />
+    </div>
+  );
+}
