@@ -362,12 +362,23 @@ export class GridRenderer {
           if (!text) continue;
           const bold = !!cell.f?.bold || r < meta.header_rows;
           const t = view.pool.acquire(bold ? boldStyle : normalStyle);
-          const maxW = Math.max(4, w - PAD * 2);
+          const align = alignOf(cell);
+          // left-aligned text may overflow into empty cells to the right (spreadsheet convention)
+          let avail = w;
+          if (align === 'left' && textWidth(text, bold) > w - PAD * 2) {
+            let cc = c + 1;
+            while (cc < meta.cols && avail < 2000) {
+              const nb = cellMap.get(r * 65536 + cc);
+              if (nb && (nb.i !== '' || nb.v !== null)) break;
+              avail += L.colX[cc + 1] - L.colX[cc];
+              cc++;
+            }
+          }
+          const maxW = Math.max(4, avail - PAD * 2);
           t.text = fit(text, maxW, bold);
           const isErr = !!cell.v && typeof cell.v === 'object' && 'e' in cell.v;
           const color = hexToNum(cell.f?.color);
           t.tint = isErr ? COLORS.error : color !== null ? color : cell.s ? 0x1e3a8a : COLORS.text;
-          const align = alignOf(cell);
           const tw = Math.min(t.width, maxW);
           t.x = align === 'right' ? x0 + w - PAD - tw : align === 'center' ? x0 + (w - tw) / 2 : x0 + PAD;
           t.y = y0 + (h - t.height) / 2 + 0.5;

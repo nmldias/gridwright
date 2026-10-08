@@ -1,0 +1,33 @@
+# Gridwright self-hosted. `docker compose up -d --build` then open http://<host>:8787
+services:
+  gridwright:
+    build: .
+    image: gridwright:local
+    container_name: gridwright
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      # Encrypts stored DB passwords / AI keys. Set a long random string; keep it with your backups.
+      GRIDWRIGHT_SECRET: ${GRIDWRIGHT_SECRET:-change-me-to-a-long-random-string}
+      # Optional shared access token: open http://host:8787/?token=... once per browser.
+      GRIDWRIGHT_TOKEN: ${GRIDWRIGHT_TOKEN:-}
+      # Optional defaults for the AI assistant (can also be set in the UI).
+      AI_BASE_URL: ${AI_BASE_URL:-}
+      AI_MODEL: ${AI_MODEL:-}
+      AI_API_KEY: ${AI_API_KEY:-}
+    volumes:
+      - ./data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach databases / LLM servers running on the host
+
+  # Optional: a PostgreSQL to play with (connect from the SQL panel as host "postgres", user gw / gw)
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["demo-db"]
+    environment:
+      POSTGRES_USER: gw
+      POSTGRES_PASSWORD: gw
+      POSTGRES_DB: demo
+    ports:
+      - "5433:5432"

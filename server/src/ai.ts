@@ -23,7 +23,10 @@ export async function chat(req: Request, res: Response) {
     headers['anthropic-version'] = '2023-06-01';
   }
   const controller = new AbortController();
-  req.on('close', () => controller.abort());
+  // abort the upstream call if the client goes away before we finished
+  res.on('close', () => {
+    if (!res.writableEnded) controller.abort();
+  });
   let upstream: globalThis.Response;
   try {
     upstream = await fetch(`${baseUrl}/chat/completions`, {
