@@ -20,7 +20,8 @@ import {
   startEdit,
   toggleBold,
 } from './actions';
-import { SNAP, cursorFor, hitTest, indexAt, layoutOf, sizeForCorner, type Hit } from './geometry';
+import { SNAP, cursorFor, hitChart, hitTest, indexAt, layoutOf, sizeForCorner, type Hit } from './geometry';
+import { traceStep } from '../ui/review';
 import type { GridRenderer } from './renderer';
 
 type Mode =
@@ -34,6 +35,8 @@ type Mode =
   | { kind: 'col-select'; table: TableId; c: number }
   | { kind: 'row-select'; table: TableId; r: number }
   | { kind: 'fill'; table: TableId; r0: number; c0: number; r1: number; c1: number }
+  | { kind: 'chart-move'; id: number; ox: number; oy: number; moved: boolean }
+  | { kind: 'chart-resize'; id: number; dx: number; dy: number }
   /** touch: undecided between tap, pan and long-press selection */
   | { kind: 'touch-wait'; hit: Hit; sx: number; sy: number; px: number; py: number; timer: number }
   | { kind: 'pinch'; d0: number; z0: number; cx: number; cy: number; wx: number; wy: number };
@@ -111,6 +114,8 @@ export class GridController {
 
   private hit(wx: number, wy: number, touch = false): Hit {
     const st = getState();
+    const ch = hitChart(st.charts, wx, wy, st.selectedChart, this.renderer.zoom, touch);
+    if (ch) return ch;
     return hitTest(st.tables, Array.from(st.tables.keys()), wx, wy, st.selectedTable, this.renderer.zoom, st.selection, touch);
   }
 
@@ -154,7 +159,30 @@ export class GridController {
   /** Start the interaction for a hit (shared by mouse and touch). */
   private beginHit(h: Hit, e: PointerEvent, x: number, y: number, touch: boolean) {
     const st = getState();
+    if (h.kind !== 'chart' && h.kind !== 'chart-resize' && st.selectedChart !== null) useStore.setState({ selectedChart: null });
     switch (h.kind) {
+      case 'chart': {
+        const id = h.id;
+        const chart = st.charts.find((c) => c.id === id)!;
+        const now = performance.now();
+        const dbl = now - this.lastClick.t < 400 && this.lastClick.table === -2 && this.lastClick.r === id;
+        this.lastClick = { t: now, table: -2, r: id, c: 0 };
+        useStore.setState({ selectedChart: id, selectedTable: null });
+        this.renderer.markDirty();
+        if (dbl) {
+          useStore.setState({ panel: 'chart' });
+          this.mode = { kind: 'idle' };
+          return;
+        }
+        this.mode = { kind: 'chart-move', id, ox: x - chart.x, oy: y - chart.y, moved: false };
+        break;
+      }
+      case 'chart-resize': {
+        const id = h.id;
+        const chart = st.charts.find((c) => c.id === id)!;
+        this.mode = { kind: 'chart-resize', id, dx: x - (chart.x + chart.w), dy: y - (chart.y + chart.h) };
+        break;
+      }
       case 'fill': {
         const sel = st.selection!;
         this.mode = { kind: 'fill', table: h.table, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
@@ -166,6 +194,11 @@ export class GridController {
         break;
       }
       case 'cell': {
+        // inside a merged block the top-left cell is the one that is selected and edited
+        const cellHit = h;
+        const mg = st.tables.get(cellHit.table)?.merges?.find((m) => cellHit.r >= m.r0 && cellHit.r <= m.r1 && cellHit.c >= m.c0 && cellHit.c <= m.c1);
+        if (mg) h = { kind: 'cell', table: cellHit.table, r: mg.r0, c: mg.c0 };
+        if (h.kind !== 'cell') return;
         const now = performance.now();
         const dbl = now - this.lastClick.t < 400 && this.lastClick.table === h.table && this.lastClick.r === h.r && this.lastClick.c === h.c;
         this.lastClick = { t: now, table: h.table, r: h.r, c: h.c };
@@ -368,6 +401,26 @@ export class GridController {
         this.renderer.markDirty();
         return;
       }
+      case 'chart-move': {
+        const chart = st.charts.find((c) => c.id === (this.mode as { id: number }).id);
+        if (!chart) return;
+        const nx = Math.round((x - this.mode.ox) / SNAP) * SNAP;
+        const ny = Math.round((y - this.mode.oy) / SNAP) * SNAP;
+        if (!this.mode.moved && Math.hypot(nx - chart.x, ny - chart.y) < SNAP) return;
+        this.mode.moved = true;
+        this.renderer.chartPreview = { id: chart.id, x: nx, y: ny, w: chart.w, h: chart.h };
+        this.renderer.markDirty();
+        return;
+      }
+      case 'chart-resize': {
+        const chart = st.charts.find((c) => c.id === (this.mode as { id: number }).id);
+        if (!chart) return;
+        const w = Math.max(240, Math.round((x - this.mode.dx - chart.x) / SNAP) * SNAP);
+        const h = Math.max(180, Math.round((y - this.mode.dy - chart.y) / SNAP) * SNAP);
+        this.renderer.chartPreview = { id: chart.id, x: chart.x, y: chart.y, w, h };
+        this.renderer.markDirty();
+        return;
+      }
       case 'corner':
       case 'right':
       case 'bottom': {
@@ -441,6 +494,15 @@ export class GridController {
         else this.renderer.markDirty();
         return;
       }
+      case 'chart-move':
+      case 'chart-resize': {
+        const p = this.renderer.chartPreview;
+        this.renderer.chartPreview = null;
+        const chart = getState().charts.find((c) => c.id === mode.id);
+        if (p && chart && (p.x !== chart.x || p.y !== chart.y || p.w !== chart.w || p.h !== chart.h)) book.apply({ type: 'update_chart', chart: { ...chart, x: p.x, y: p.y, w: p.w, h: p.h } }, { note: 'chart moved' });
+        else this.renderer.markDirty();
+        return;
+      }
       case 'corner':
       case 'right':
       case 'bottom': {
@@ -498,6 +560,25 @@ export class GridController {
     if (mod && e.key.toLowerCase() === 'y') {
       e.preventDefault();
       book.redo();
+      return;
+    }
+    if (st.selectedChart !== null) {
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        e.preventDefault();
+        book.apply({ type: 'delete_chart', id: st.selectedChart }, { note: 'chart deleted' });
+        useStore.setState({ selectedChart: null });
+        return;
+      }
+      if (e.key === 'Escape') {
+        useStore.setState({ selectedChart: null });
+        this.renderer.markDirty();
+        return;
+      }
+    }
+    if (mod && (e.key === '[' || e.key === ']')) {
+      // trace precedents (Ctrl+[) / dependents (Ctrl+]) of the active cell
+      e.preventDefault();
+      traceStep(e.key === '[' ? 'precedents' : 'dependents');
       return;
     }
     if (!st.selection) return;
@@ -575,7 +656,7 @@ export class GridController {
         clearSelection();
         return;
       case 'Escape':
-        useStore.setState({ selectedTable: null, filterPopover: null });
+        useStore.setState({ selectedTable: null, filterPopover: null, trace: null });
         this.renderer.markDirty();
         return;
       case 'Home':

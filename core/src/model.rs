@@ -340,6 +340,9 @@ pub struct Format {
     pub fill: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    /// wrap long text onto several lines inside the cell
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrap: Option<bool>,
 }
 
 impl Format {
@@ -364,6 +367,9 @@ impl Format {
         }
         if patch.color.is_some() {
             self.color = patch.color.clone();
+        }
+        if patch.wrap.is_some() {
+            self.wrap = patch.wrap;
         }
     }
 }
@@ -515,6 +521,94 @@ pub struct Validation {
     pub message: Option<String>,
 }
 
+/// A signed-off (attested) rectangle: who, when, and a fingerprint of the values at that moment.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Signoff {
+    pub id: u32,
+    pub r0: u32,
+    pub c0: u32,
+    pub r1: u32,
+    pub c1: u32,
+    pub by: String,
+    pub login: String,
+    /// ISO timestamp supplied by the host
+    pub at: String,
+    pub note: String,
+    /// fingerprint of the displayed values when signed (see `Table::range_hash`)
+    pub hash: String,
+    /// when true, cells inside cannot be edited until the sign-off is removed
+    pub locked: bool,
+}
+
+/// Merged cell block (the top-left cell holds the value).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Merge {
+    pub r0: u32,
+    pub c0: u32,
+    pub r1: u32,
+    pub c1: u32,
+}
+
+impl Merge {
+    pub fn contains(&self, r: u32, c: u32) -> bool {
+        r >= self.r0 && r <= self.r1 && c >= self.c0 && c <= self.c1
+    }
+    pub fn intersects(&self, r0: u32, c0: u32, r1: u32, c1: u32) -> bool {
+        self.r0 <= r1 && r0 <= self.r1 && self.c0 <= c1 && c0 <= self.c1
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ChartSeries {
+    pub name: String,
+    /// range reference text, e.g. `Sales::C2:C13` or `Sales[Revenue]`
+    pub range: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ChartReference {
+    pub value: f64,
+    pub label: String,
+}
+
+/// A chart object on the canvas. Data is read from the referenced ranges by the host.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Chart {
+    pub id: u32,
+    /// bar | hbar | line | area | stacked | waterfall
+    pub kind: String,
+    /// action title (the takeaway)
+    pub title: String,
+    /// dataset and units, shown small and grey
+    pub subtitle: String,
+    /// "EXHIBIT 1 — TOPIC" tag above the title
+    pub exhibit: String,
+    /// source / definitions footnote
+    pub source: String,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    /// range reference text for the category labels
+    pub categories: String,
+    pub series: Vec<ChartSeries>,
+    /// category index drawn in the highlight colour
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub highlight: Option<u32>,
+    /// dashed benchmark line with an inline label
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<ChartReference>,
+    pub show_values: bool,
+    pub stat_cards: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct NamedRange {
@@ -549,6 +643,10 @@ pub struct Table {
     pub cond_formats: Vec<CondFormat>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub validations: Vec<Validation>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub signoffs: Vec<Signoff>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub merges: Vec<Merge>,
 }
 
 /// Cells are stored as a JSON array of `{"r":..,"c":..,"cell":{..}}` entries
@@ -606,6 +704,8 @@ impl Default for Table {
             hidden_rows: vec![],
             cond_formats: vec![],
             validations: vec![],
+            signoffs: vec![],
+            merges: vec![],
         }
     }
 }
@@ -628,7 +728,43 @@ impl Table {
             hidden_rows: vec![],
             cond_formats: vec![],
             validations: vec![],
+            signoffs: vec![],
+            merges: vec![],
         }
+    }
+
+    /// FNV-1a fingerprint of the displayed values of a rectangle (empty cells skipped).
+    pub fn range_hash(&self, r0: u32, c0: u32, r1: u32, c1: u32) -> String {
+        let mut h: u64 = 0xcbf29ce484222325;
+        let mut mix = |bytes: &[u8]| {
+            for b in bytes {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+        };
+        for r in r0..=r1.min(self.rows.saturating_sub(1)) {
+            for c in c0..=c1.min(self.cols.saturating_sub(1)) {
+                let v = self.value_at(CellKey::new(r, c));
+                if v.is_empty() {
+                    continue;
+                }
+                mix(&(r - r0).to_le_bytes());
+                mix(&(c - c0).to_le_bytes());
+                mix(v.to_display().as_bytes());
+                mix(b"|");
+            }
+        }
+        format!("{:016x}", h)
+    }
+
+    /// The locked sign-off covering a cell, if any.
+    pub fn locked_signoff(&self, r: u32, c: u32) -> Option<&Signoff> {
+        self.signoffs.iter().find(|s| s.locked && r >= s.r0 && r <= s.r1 && c >= s.c0 && c <= s.c1)
+    }
+
+    /// Merge block containing a cell, if any.
+    pub fn merge_at(&self, r: u32, c: u32) -> Option<&Merge> {
+        self.merges.iter().find(|m| m.contains(r, c))
     }
 
     /// Header text of a column (row 0 when the table has a header row), as displayed.
@@ -761,6 +897,9 @@ pub struct Workbook {
     pub next_table_id: TableId,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub names: Vec<NamedRange>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub charts: Vec<Chart>,
+    pub next_chart_id: u32,
     /// Serial date-time (days since 1899-12-30) injected by the host for NOW()/TODAY().
     #[serde(skip)]
     pub now_serial: f64,
@@ -774,8 +913,19 @@ impl Workbook {
             tables: vec![],
             next_table_id: 1,
             names: vec![],
+            charts: vec![],
+            next_chart_id: 1,
             now_serial: 45000.0,
         }
+    }
+
+    pub fn alloc_chart_id(&mut self) -> u32 {
+        if self.next_chart_id == 0 {
+            self.next_chart_id = 1;
+        }
+        let id = self.next_chart_id;
+        self.next_chart_id += 1;
+        id
     }
 
     pub fn named_range(&self, name: &str) -> Option<&NamedRange> {

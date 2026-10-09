@@ -22,6 +22,10 @@ interface RuleStats {
 
 const statsCache = new Map<string, RuleStats>();
 let cacheVersion = -1;
+// formula rules: result per (table, rule, cell) for the current cells version, so a redraw
+// evaluates each visible cell at most once per change
+const formulaCache = new Map<string, boolean>();
+let formulaVersion = -1;
 
 function numberOf(v: CellValue): number | null {
   return v && 'n' in v ? v.n : null;
@@ -182,13 +186,25 @@ export function condStyle(meta: TableMeta, cellMap: Map<number, CellView> | unde
         const f = rule.values[0];
         if (!f) break;
         const area = (rule.r1 - rule.r0 + 1) * (rule.c1 - rule.c0 + 1);
-        if (area > 20000) break;
+        if (area > 200000) break;
+        if (formulaVersion !== version) {
+          formulaCache.clear();
+          formulaVersion = version;
+        }
+        const key = `${meta.id}:${idx}:${r}:${c}`;
+        const hit = formulaCache.get(key);
+        if (hit !== undefined) {
+          matched = hit;
+          break;
+        }
         try {
           const res = book.evalAt(meta.id, r, c, f);
           matched = !!res && (('b' in res && res.b) || ('n' in res && res.n !== 0));
         } catch {
           matched = false;
         }
+        if (formulaCache.size > 200000) formulaCache.clear();
+        formulaCache.set(key, matched);
         break;
       }
     }

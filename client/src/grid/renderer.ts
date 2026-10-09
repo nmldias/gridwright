@@ -2,12 +2,14 @@
 // infinite canvas with viewport culling and pooled bitmap text.
 
 import { Application, Assets, BitmapFontManager, BitmapText, Container, Graphics, Sprite, Texture } from 'pixi.js';
-import type { CellView, TableId, TableMeta } from '../engine/types';
+import type { CellView, Chart, Merge, TableId, TableMeta } from '../engine/types';
 import { colToLetters } from '../engine/types';
-import { getState, type Presence, type Selection } from '../state/store';
-import { FILTER_BTN, HANDLE, HANDLE_GAP, TAB_SIZE, TITLE_H, indexAt, layoutOf } from './geometry';
+import * as book from '../engine/book';
+import { getState, type Presence, type Selection, type TraceState } from '../state/store';
+import { CHART_HANDLE, FILTER_BTN, HANDLE, HANDLE_GAP, TAB_SIZE, TITLE_H, indexAt, layoutOf } from './geometry';
 import { alignOf, displayOf } from './format';
 import { condStyle } from './condfmt';
+import { chartData, chartLayout, type ChartData, type Prim } from './charts';
 
 export const FONT = 'Inter, "Segoe UI", Helvetica, Arial, sans-serif';
 export const FONT_SIZE = 13;
@@ -35,7 +37,13 @@ const COLORS = {
   tab: 0xe5e7eb,
   tabText: 0x4b5563,
   handle: 0x2563eb,
+  signed: 0x2e7d32,
+  stale: 0xb26a00,
+  traceIn: 0x0c447c,
+  traceOut: 0x993c1d,
+  merge: 0xcbd5e1,
 };
+const LINE_H = 16; // wrapped text line height
 
 const normalStyle = { fontFamily: FONT, fontSize: FONT_SIZE, fill: 0xffffff };
 const boldStyle = { fontFamily: FONT, fontSize: FONT_SIZE, fill: 0xffffff, fontWeight: 'bold' as const };
@@ -67,6 +75,26 @@ function fit(s: string, maxW: number, bold: boolean): string {
     else hi = mid - 1;
   }
   return s.slice(0, lo);
+}
+
+/** Greedy word wrap into at most `maxLines` lines (long words are cut). */
+function wrapText(s: string, maxW: number, bold: boolean, maxLines: number): string {
+  const lines: string[] = [];
+  for (const para of s.split(/\r?\n/)) {
+    let cur = '';
+    for (const word of para.split(' ')) {
+      const cand = cur ? `${cur} ${word}` : word;
+      if (textWidth(cand, bold) <= maxW) cur = cand;
+      else {
+        if (cur) lines.push(cur);
+        cur = textWidth(word, bold) <= maxW ? word : fit(word, maxW, bold);
+      }
+      if (lines.length >= maxLines) break;
+    }
+    if (lines.length < maxLines) lines.push(cur);
+    if (lines.length >= maxLines) break;
+  }
+  return lines.slice(0, Math.max(1, maxLines)).join('\n');
 }
 
 function luminance(rgb: number): number {
@@ -136,6 +164,38 @@ class TableView {
   }
 }
 
+class ChartView {
+  container = new Container();
+  g = new Graphics();
+  textLayer = new Container();
+  chrome = new Graphics();
+  pool: TextPool;
+  constructor() {
+    this.container.addChild(this.g, this.textLayer, this.chrome);
+    this.pool = new TextPool(this.textLayer);
+  }
+  destroy() {
+    this.container.destroy({ children: true });
+  }
+}
+
+interface ChartCacheEntry {
+  chart: Chart;
+  version: number;
+  w: number;
+  h: number;
+  data: ChartData;
+  prims: Prim[];
+}
+
+export interface ChartPreview {
+  id: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 // --- image cells (data: URLs produced by code cells, e.g. matplotlib figures) ---
 const textureCache = new Map<string, Texture | 'loading' | 'failed'>();
 let onTextureLoaded: (() => void) | null = null;
@@ -185,10 +245,15 @@ export class GridRenderer {
   app = new Application();
   world = new Container();
   tablesLayer = new Container();
+  chartsLayer = new Container();
   overlay = new Container();
   overlayG = new Graphics();
   overlayText: TextPool;
   views = new Map<TableId, TableView>();
+  chartViews = new Map<number, ChartView>();
+  chartCache = new Map<number, ChartCacheEntry>();
+  chartPreview: ChartPreview | null = null;
+  private signoffCache = new Map<TableId, { version: number; stale: Set<number> }>();
   pan = { x: 0, y: 0 };
   zoom = 1;
   dirty = true;
@@ -206,7 +271,7 @@ export class GridRenderer {
   constructor() {
     this.overlay.addChild(this.overlayG);
     this.overlayText = new TextPool(this.overlay);
-    this.world.addChild(this.tablesLayer, this.overlay);
+    this.world.addChild(this.tablesLayer, this.chartsLayer, this.overlay);
   }
 
   async init(host: HTMLElement) {
@@ -341,7 +406,198 @@ export class GridRenderer {
       // keep selected table on top
       if (isSel) this.tablesLayer.setChildIndex(view.container, this.tablesLayer.children.length - 1);
     }
+    this.drawCharts(st.charts, st.selectedChart, w0, w1, zoom);
     this.drawOverlay(selection, selectedTable, tables, zoom, st.presence);
+    this.drawStickyHeader(selection, tables, cells, w0, w1, zoom);
+    this.drawTrace(st.trace, tables, zoom);
+  }
+
+  // ---- charts ------------------------------------------------------------------
+  private drawCharts(charts: Chart[], selected: number | null, w0: { x: number; y: number }, w1: { x: number; y: number }, zoom: number) {
+    const ids = new Set(charts.map((c) => c.id));
+    for (const [id, v] of this.chartViews) {
+      if (!ids.has(id)) {
+        v.destroy();
+        this.chartViews.delete(id);
+        this.chartCache.delete(id);
+      }
+    }
+    for (const chart of charts) {
+      let view = this.chartViews.get(chart.id);
+      if (!view) {
+        view = new ChartView();
+        this.chartViews.set(chart.id, view);
+        this.chartsLayer.addChild(view.container);
+      }
+      const pv = this.chartPreview?.id === chart.id ? this.chartPreview : null;
+      const x = pv ? pv.x : chart.x;
+      const y = pv ? pv.y : chart.y;
+      const w = pv ? pv.w : chart.w;
+      const h = pv ? pv.h : chart.h;
+      view.container.position.set(x, y);
+      const visible = x < w1.x && x + w > w0.x && y - TITLE_H < w1.y && y + h > w0.y;
+      view.container.visible = visible;
+      if (!visible) continue;
+      const isSel = selected === chart.id;
+      if (isSel) this.chartsLayer.setChildIndex(view.container, this.chartsLayer.children.length - 1);
+      let entry = this.chartCache.get(chart.id);
+      if (!entry || entry.chart !== chart || entry.version !== this.cellsVersion || entry.w !== w || entry.h !== h) {
+        const data = entry && entry.version === this.cellsVersion && entry.chart.categories === chart.categories && JSON.stringify(entry.chart.series) === JSON.stringify(chart.series) ? entry.data : chartData(chart);
+        entry = { chart, version: this.cellsVersion, w, h, data, prims: chartLayout(chart, data, w, h) };
+        this.chartCache.set(chart.id, entry);
+      }
+      this.drawPrims(view, entry.prims, zoom);
+      view.chrome.clear();
+      view.chrome.rect(0, 0, w, h).stroke({ width: (isSel ? 1.5 : 1) / zoom, color: isSel ? COLORS.borderSelected : COLORS.grid });
+      if (isSel) {
+        const hs = this.touch ? CHART_HANDLE + 6 : CHART_HANDLE;
+        view.chrome.rect(w - hs / 2, h - hs / 2, hs, hs).fill(0xffffff).stroke({ width: 1.2 / zoom, color: COLORS.handle });
+      }
+    }
+  }
+
+  private drawPrims(view: ChartView, prims: Prim[], zoom: number) {
+    const g = view.g;
+    g.clear();
+    view.pool.reset();
+    for (const p of prims) {
+      switch (p.k) {
+        case 'rect':
+          g.rect(p.x, p.y, p.w, p.h).fill({ color: hexToNum(p.fill) ?? 0, alpha: p.alpha ?? 1 });
+          break;
+        case 'area':
+          g.poly(p.pts.flat()).fill({ color: hexToNum(p.fill) ?? 0, alpha: p.alpha });
+          break;
+        case 'circle':
+          g.circle(p.cx, p.cy, p.r).fill(hexToNum(p.fill) ?? 0);
+          break;
+        case 'line': {
+          const color = hexToNum(p.stroke) ?? 0;
+          if (p.dash) {
+            // dashed: 4 on / 3 off along each segment
+            for (let i = 1; i < p.pts.length; i++) {
+              const [x0, y0] = p.pts[i - 1];
+              const [x1, y1] = p.pts[i];
+              const len = Math.hypot(x1 - x0, y1 - y0);
+              const n = Math.max(1, Math.floor(len / 7));
+              for (let k = 0; k < n; k++) {
+                const t0 = (k * 7) / len;
+                const t1 = Math.min(1, (k * 7 + 4) / len);
+                g.moveTo(x0 + (x1 - x0) * t0, y0 + (y1 - y0) * t0).lineTo(x0 + (x1 - x0) * t1, y0 + (y1 - y0) * t1);
+              }
+            }
+          } else {
+            g.moveTo(p.pts[0][0], p.pts[0][1]);
+            for (let i = 1; i < p.pts.length; i++) g.lineTo(p.pts[i][0], p.pts[i][1]);
+          }
+          g.stroke({ width: Math.max(p.width, 0.75 / zoom), color, alpha: p.alpha ?? 1, join: 'round', cap: 'round' });
+          break;
+        }
+        case 'text': {
+          const style = { fontFamily: FONT, fontSize: p.size, fill: 0xffffff, fontWeight: 'normal' as const };
+          const t = view.pool.acquire(style as any);
+          if (t.text !== p.text) t.text = p.text;
+          t.tint = hexToNum(p.color) ?? COLORS.text;
+          const tw = t.width;
+          const th = t.height;
+          t.x = p.anchor === 'middle' ? p.x - tw / 2 : p.anchor === 'end' ? p.x - tw : p.x;
+          t.y = p.baseline === 'top' ? p.y : p.baseline === 'middle' ? p.y - th / 2 : p.y - th;
+          break;
+        }
+      }
+    }
+    view.pool.finish();
+  }
+
+  /** Header rows of the table holding the selection stay visible at the top of the viewport. */
+  private drawStickyHeader(selection: Selection | null, tables: Map<TableId, TableMeta>, cells: Map<TableId, Map<number, CellView>>, w0: { x: number; y: number }, w1: { x: number; y: number }, zoom: number) {
+    const g = this.overlayG;
+    if (!selection) return;
+    const meta = tables.get(selection.table);
+    if (!meta || meta.header_rows === 0) return;
+    const L = layoutOf(meta);
+    const headerH = L.rowY[Math.min(meta.header_rows, meta.rows)];
+    const top = w0.y + 2 / zoom;
+    if (meta.y + headerH >= top || meta.y + L.height <= top + headerH) return;
+    const cellMap = cells.get(meta.id);
+    const c0 = Math.max(0, w0.x - meta.x <= 0 ? 0 : indexAt(L.colX, Math.min(w0.x - meta.x, L.width - 0.01)));
+    const c1 = w1.x - meta.x >= L.width ? meta.cols - 1 : Math.max(c0, indexAt(L.colX, Math.max(0, w1.x - meta.x)));
+    const x0 = meta.x + L.colX[c0];
+    const x1 = meta.x + L.colX[c1 + 1];
+    g.rect(x0, top, x1 - x0, headerH).fill(COLORS.headerBg).stroke({ width: 1 / zoom, color: COLORS.border });
+    for (let c = c0; c <= c1; c++) g.moveTo(meta.x + L.colX[c + 1], top).lineTo(meta.x + L.colX[c + 1], top + headerH);
+    g.stroke({ width: 1 / zoom, color: COLORS.grid });
+    for (let r = 0; r < meta.header_rows && r < meta.rows; r++) {
+      for (let c = c0; c <= c1; c++) {
+        const cell = cellMap?.get(r * 65536 + c);
+        if (!cell) continue;
+        const text = displayOf(cell);
+        if (!text) continue;
+        const w = L.colX[c + 1] - L.colX[c];
+        const h = L.rowY[r + 1] - L.rowY[r];
+        const t = this.overlayText.acquire(boldStyle);
+        const fitted = fit(text, Math.max(4, w - PAD * 2), true);
+        if (t.text !== fitted) t.text = fitted;
+        t.tint = COLORS.text;
+        const align = alignOf(cell);
+        const tw = Math.min(t.width, w - PAD * 2);
+        t.x = align === 'right' ? meta.x + L.colX[c + 1] - PAD - tw : align === 'center' ? meta.x + L.colX[c] + (w - tw) / 2 : meta.x + L.colX[c] + PAD;
+        t.y = top + L.rowY[r] + (h - t.height) / 2 + 0.5;
+      }
+    }
+    this.overlayText.finish();
+  }
+
+  /** Precedents (navy) and dependents (coral) of the traced cell. */
+  private drawTrace(trace: TraceState | null, tables: Map<TableId, TableMeta>, zoom: number) {
+    if (!trace) return;
+    const g = this.overlayG;
+    const centre = (table: TableId, r: number, c: number): [number, number] | null => {
+      const m = tables.get(table);
+      if (!m || r >= m.rows || c >= m.cols) return null;
+      const L = layoutOf(m);
+      return [m.x + (L.colX[c] + L.colX[c + 1]) / 2, m.y + (L.rowY[r] + L.rowY[r + 1]) / 2];
+    };
+    const from = centre(trace.cell.table, trace.cell.row, trace.cell.col);
+    for (const rect of trace.precedents) {
+      const m = tables.get(rect.table);
+      if (!m) continue;
+      const L = layoutOf(m);
+      const x0 = m.x + L.colX[Math.min(rect.c0, m.cols - 1)];
+      const y0 = m.y + L.rowY[Math.min(rect.r0, m.rows - 1)];
+      const x1 = m.x + L.colX[Math.min(rect.c1 + 1, m.cols)];
+      const y1 = m.y + L.rowY[Math.min(rect.r1 + 1, m.rows)];
+      g.rect(x0, y0, x1 - x0, y1 - y0).fill({ color: COLORS.traceIn, alpha: 0.08 }).stroke({ width: 1.5 / zoom, color: COLORS.traceIn });
+      if (from) g.moveTo((x0 + x1) / 2, (y0 + y1) / 2).lineTo(from[0], from[1]).stroke({ width: 1 / zoom, color: COLORS.traceIn, alpha: 0.6 });
+    }
+    for (const d of trace.dependents) {
+      const m = tables.get(d.table);
+      if (!m || d.row >= m.rows || d.col >= m.cols) continue;
+      const L = layoutOf(m);
+      const x0 = m.x + L.colX[d.col];
+      const y0 = m.y + L.rowY[d.row];
+      g.rect(x0, y0, L.colX[d.col + 1] - L.colX[d.col], L.rowY[d.row + 1] - L.rowY[d.row]).fill({ color: COLORS.traceOut, alpha: 0.08 }).stroke({ width: 1.5 / zoom, color: COLORS.traceOut });
+      if (from) g.moveTo(from[0], from[1]).lineTo(x0 + (L.colX[d.col + 1] - L.colX[d.col]) / 2, y0 + (L.rowY[d.row + 1] - L.rowY[d.row]) / 2).stroke({ width: 1 / zoom, color: COLORS.traceOut, alpha: 0.6 });
+    }
+    if (from) {
+      const m = tables.get(trace.cell.table)!;
+      const L = layoutOf(m);
+      g.rect(m.x + L.colX[trace.cell.col], m.y + L.rowY[trace.cell.row], L.colX[trace.cell.col + 1] - L.colX[trace.cell.col], L.rowY[trace.cell.row + 1] - L.rowY[trace.cell.row]).stroke({ width: 2 / zoom, color: COLORS.traceIn });
+    }
+  }
+
+  private staleSignoffs(meta: TableMeta): Set<number> {
+    if (!meta.signoffs?.length) return new Set();
+    const hit = this.signoffCache.get(meta.id);
+    if (hit && hit.version === this.cellsVersion) return hit.stale;
+    const stale = new Set<number>();
+    try {
+      for (const s of book.signoffStatus(meta.id)) if (s.stale) stale.add(s.id);
+    } catch {
+      /* engine not ready */
+    }
+    this.signoffCache.set(meta.id, { version: this.cellsVersion, stale });
+    return stale;
   }
 
   private effectiveMeta(meta: TableMeta): TableMeta {
@@ -392,6 +648,13 @@ export class GridRenderer {
     if (headerH > 0) bg.rect(0, 0, L.width, headerH).fill(COLORS.headerBg);
     const hasRules = meta.cond_formats && meta.cond_formats.length > 0;
     const invalidMarks: { x: number; y: number }[] = [];
+    // merged blocks: inner cells are skipped, the top-left cell spans the block
+    const mergeAt = new Map<number, Merge>();
+    const mergeInner = new Set<number>();
+    for (const m of meta.merges ?? []) {
+      mergeAt.set(m.r0 * 65536 + m.c0, m);
+      for (let r = m.r0; r <= m.r1; r++) for (let c = m.c0; c <= m.c1; c++) if (r !== m.r0 || c !== m.c0) mergeInner.add(r * 65536 + c);
+    }
 
     // cell fills, spill tints, code markers, text
     const spillRects: { x: number; y: number; w: number; h: number; color: number }[] = [];
@@ -399,13 +662,15 @@ export class GridRenderer {
       for (let r = r0; r <= r1; r++) {
         if (L.hidden.has(r)) continue;
         for (let c = c0; c <= c1; c++) {
+          if (mergeInner.has(r * 65536 + c)) continue;
           const cell = cellMap?.get(r * 65536 + c);
           const cond = hasRules ? condStyle(meta, cellMap, r, c, cell, this.cellsVersion) : null;
           if (!cell && !cond) continue;
+          const merge = mergeAt.get(r * 65536 + c);
           const x0 = L.colX[c];
           const y0 = L.rowY[r];
-          const w = L.colX[c + 1] - x0;
-          const h = L.rowY[r + 1] - y0;
+          const w = (merge ? L.colX[Math.min(meta.cols, merge.c1 + 1)] : L.colX[c + 1]) - x0;
+          const h = (merge ? L.rowY[Math.min(meta.rows, merge.r1 + 1)] : L.rowY[r + 1]) - y0;
           const fill = hexToNum(cond?.fill ?? cell?.f?.fill);
           if (fill !== null) bg.rect(x0, y0, w, h).fill(fill);
           if (!cell) continue;
@@ -447,11 +712,23 @@ export class GridRenderer {
           }
           const bold = (cond?.bold ?? !!cell.f?.bold) || r < meta.header_rows;
           const t = view.pool.acquire(bold ? boldStyle : normalStyle);
-          const align = alignOf(cell);
+          const align = merge && !cell.f?.align ? 'center' : alignOf(cell);
+          const headerReserve = r < meta.header_rows && (isSel || meta.filters.length > 0) ? FILTER_BTN + 2 : 0;
+          if (cell.f?.wrap) {
+            const maxW = Math.max(4, w - PAD * 2 - headerReserve);
+            const wrapped = wrapText(text, maxW, bold, Math.max(1, Math.floor((h - 4) / LINE_H)));
+            if (t.text !== wrapped) t.text = wrapped;
+            const isErrW = !!cell.v && typeof cell.v === 'object' && 'e' in cell.v;
+            const colorW = hexToNum(cond?.color ?? cell?.f?.color);
+            t.tint = isErrW ? COLORS.error : colorW !== null ? colorW : COLORS.text;
+            const tw = Math.min(t.width, maxW);
+            t.x = align === 'right' ? x0 + w - PAD - tw - headerReserve : align === 'center' ? x0 + (w - tw) / 2 : x0 + PAD;
+            t.y = y0 + 4;
+            continue;
+          }
           // left-aligned text may overflow into empty cells to the right (spreadsheet convention)
           let avail = w;
-          const headerReserve = r < meta.header_rows && (isSel || meta.filters.length > 0) ? FILTER_BTN + 2 : 0;
-          if (align === 'left' && cellMap && textWidth(text, bold) > w - PAD * 2 - headerReserve) {
+          if (align === 'left' && cellMap && !merge && textWidth(text, bold) > w - PAD * 2 - headerReserve) {
             let cc = c + 1;
             while (cc < meta.cols && avail < 2000) {
               const nb = cellMap.get(r * 65536 + cc);
@@ -486,7 +763,34 @@ export class GridRenderer {
       lines.moveTo(0, L.rowY[r]).lineTo(L.width, L.rowY[r]);
     }
     lines.stroke({ width: hairline, color: COLORS.grid });
+    // merged blocks cover their inner gridlines
+    for (const m of meta.merges ?? []) {
+      const mx = L.colX[m.c0];
+      const my = L.rowY[m.r0];
+      const mw = L.colX[Math.min(meta.cols, m.c1 + 1)] - mx;
+      const mh = L.rowY[Math.min(meta.rows, m.r1 + 1)] - my;
+      const cell = cellMap?.get(m.r0 * 65536 + m.c0);
+      const fillM = hexToNum(cell?.f?.fill) ?? (m.r0 < meta.header_rows ? COLORS.headerBg : meta.pivot ? COLORS.pivotBg : COLORS.tableBg);
+      lines.rect(mx + hairline / 2, my + hairline / 2, mw - hairline, mh - hairline).fill(fillM);
+      lines.rect(mx, my, mw, mh).stroke({ width: hairline, color: COLORS.merge });
+    }
     if (headerH > 0) lines.moveTo(0, headerH).lineTo(L.width, headerH).stroke({ width: hairline, color: COLORS.border });
+    // sign-offs: outline (green = values unchanged since signing, amber = changed) and a corner mark
+    if (meta.signoffs?.length) {
+      const stale = this.staleSignoffs(meta);
+      for (const so of meta.signoffs) {
+        const sx0 = L.colX[Math.min(so.c0, meta.cols - 1)];
+        const sy0 = L.rowY[Math.min(so.r0, meta.rows - 1)];
+        const sx1 = L.colX[Math.min(so.c1 + 1, meta.cols)];
+        const sy1 = L.rowY[Math.min(so.r1 + 1, meta.rows)];
+        const color = stale.has(so.id) ? COLORS.stale : COLORS.signed;
+        lines.rect(sx0, sy0, sx1 - sx0, sy1 - sy0).stroke({ width: 1.5 / zoom, color, alpha: 0.9 });
+        // badge: filled square with a tick, a bar underneath when locked
+        lines.rect(sx0, sy0, 12, 12).fill(color);
+        lines.moveTo(sx0 + 2.5, sy0 + 6.5).lineTo(sx0 + 5, sy0 + 9).lineTo(sx0 + 9.5, sy0 + 3.5).stroke({ width: 1.5, color: 0xffffff });
+        if (so.locked) lines.rect(sx0, sy0 + 12, 12, 2).fill(COLORS.text);
+      }
+    }
     for (const s of spillRects) lines.rect(s.x, s.y, s.w, s.h).stroke({ width: hairline, color: s.color, alpha: 0.7 });
     // validation marks: small red triangle in the top-right corner
     for (const m of invalidMarks) lines.poly([m.x - 6, m.y, m.x, m.y, m.x, m.y + 6]).fill(COLORS.invalid);
@@ -579,9 +883,16 @@ export class GridRenderer {
       const pos = this.movePreview?.table === meta.id ? this.movePreview : { x: meta.x, y: meta.y };
       const L = layoutOf(meta);
       const r0 = Math.min(selection.r0, meta.rows - 1);
-      const r1 = Math.min(selection.r1, meta.rows - 1);
+      let r1 = Math.min(selection.r1, meta.rows - 1);
       const c0 = Math.min(selection.c0, meta.cols - 1);
-      const c1 = Math.min(selection.c1, meta.cols - 1);
+      let c1 = Math.min(selection.c1, meta.cols - 1);
+      // a selection covering a merged block's top-left cell outlines the whole block
+      for (const m of meta.merges ?? []) {
+        if (m.r0 >= r0 && m.r0 <= r1 && m.c0 >= c0 && m.c0 <= c1) {
+          r1 = Math.max(r1, Math.min(m.r1, meta.rows - 1));
+          c1 = Math.max(c1, Math.min(m.c1, meta.cols - 1));
+        }
+      }
       const x0 = pos.x + L.colX[c0];
       const y0 = pos.y + L.rowY[r0];
       const x1 = pos.x + L.colX[c1 + 1];
@@ -589,12 +900,15 @@ export class GridRenderer {
       const multi = r0 !== r1 || c0 !== c1;
       if (multi) g.rect(x0, y0, x1 - x0, y1 - y0).fill({ color: COLORS.selectionFill, alpha: 0.12 });
       g.rect(x0, y0, x1 - x0, y1 - y0).stroke({ width: 1.5 / zoom, color: COLORS.borderSelected });
-      // active cell
+      // active cell (a merged block's top-left cell outlines the block)
       const ar = Math.min(selection.ar, meta.rows - 1);
       const ac = Math.min(selection.ac, meta.cols - 1);
+      const am = (meta.merges ?? []).find((m) => m.r0 === ar && m.c0 === ac);
       const ax0 = pos.x + L.colX[ac];
       const ay0 = pos.y + L.rowY[ar];
-      g.rect(ax0, ay0, L.colX[ac + 1] - L.colX[ac], L.rowY[ar + 1] - L.rowY[ar]).stroke({ width: 2 / zoom, color: COLORS.borderSelected });
+      const ax1 = pos.x + L.colX[Math.min(meta.cols, (am ? am.c1 : ac) + 1)];
+      const ay1 = pos.y + L.rowY[Math.min(meta.rows, (am ? am.r1 : ar) + 1)];
+      g.rect(ax0, ay0, ax1 - ax0, ay1 - ay0).stroke({ width: 2 / zoom, color: COLORS.borderSelected });
       // fill handle
       g.rect(x1 - 3 / zoom, y1 - 3 / zoom, 6 / zoom, 6 / zoom).fill(COLORS.borderSelected).stroke({ width: 1 / zoom, color: 0xffffff });
       // column/row tabs highlight on the selected table

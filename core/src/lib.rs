@@ -73,6 +73,14 @@ impl Book {
         }
     }
 
+    /// Apply an op authored by another client (JSON `Op`): not recorded for undo.
+    pub fn apply_remote(&mut self, op_json: &str) -> String {
+        match serde_json::from_str::<Op>(op_json) {
+            Ok(op) => js(&self.engine.apply_remote(op)),
+            Err(e) => format!("{{\"error\":{:?},\"cells\":{{}},\"tables\":[],\"reload\":[],\"removed_tables\":[],\"rerun_code\":[],\"created\":[]}}", format!("bad op: {}", e)),
+        }
+    }
+
     pub fn undo(&mut self) -> String {
         js(&self.engine.undo())
     }
@@ -195,6 +203,59 @@ impl Book {
     /// Evaluate a formula body for a specific cell position (conditional-format formulas); JSON value.
     pub fn eval_at(&self, table: u32, row: u32, col: u32, formula: &str) -> String {
         js(&formula::evaluate(&self.engine.wb, table, Some(model::CellKey::new(row, col)), formula::formula_body(formula)))
+    }
+
+    /// JSON array of chart objects.
+    pub fn charts(&self) -> String {
+        js(&self.engine.wb.charts)
+    }
+
+    /// Precedents and dependents of a cell: JSON {precedents: Rect[], dependents: CellRef[]}.
+    pub fn trace(&self, table: u32, row: u32, col: u32) -> String {
+        js(&self.engine.trace(CellRef::new(table, row, col)))
+    }
+
+    /// Every =CHECK(...) cell with its outcome: JSON [{table,row,col,label,ok,error}].
+    pub fn checks(&self) -> String {
+        js(&self.engine.checks())
+    }
+
+    /// Sign-offs of a table whose values changed since signing: JSON [{id, stale}].
+    pub fn signoff_status(&self, table: u32) -> String {
+        js(&self.engine.signoff_status(table))
+    }
+
+    /// Fingerprint of the displayed values of a rectangle.
+    pub fn range_hash(&self, table: u32, r0: u32, c0: u32, r1: u32, c1: u32) -> String {
+        self.engine.wb.table(table).map(|t| t.range_hash(r0, c0, r1, c1)).unwrap_or_default()
+    }
+
+    /// Values of a reference text (`Sales::B2:B13`, `Sales[Revenue]`, a name) as a 2-D JSON array;
+    /// `{"error": "..."}` when it does not resolve.
+    pub fn resolve_values(&self, table: u32, reference: &str) -> String {
+        let body = formula::formula_body(reference);
+        match formula::evaluate_full(&self.engine.wb, table, None, body) {
+            formula::Arg::Scalar(Value::Error(e)) => js(&serde_json::json!({ "error": e.as_str() })),
+            arg => {
+                let arr = arg.as_array();
+                let mut rows: Vec<Vec<serde_json::Value>> = vec![];
+                for r in 0..arr.rows {
+                    rows.push(
+                        arr.row(r)
+                            .into_iter()
+                            .map(|v| match v {
+                                Value::Empty => serde_json::Value::Null,
+                                Value::Number(n) => serde_json::json!(n),
+                                Value::Text(s) => serde_json::Value::String(s),
+                                Value::Bool(b) => serde_json::Value::Bool(b),
+                                Value::Error(e) => serde_json::json!({ "e": e.as_str() }),
+                            })
+                            .collect(),
+                    );
+                }
+                js(&rows)
+            }
+        }
     }
 
     pub fn version() -> String {

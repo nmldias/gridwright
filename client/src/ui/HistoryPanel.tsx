@@ -3,6 +3,8 @@ import { api, type HistoryEntry } from '../api/client';
 import * as book from '../engine/book';
 import { a1, colToLetters, type Op } from '../engine/types';
 import { getState, setStatus, useStore } from '../state/store';
+import { selectCell } from '../grid/actions';
+import { diffDocuments, type VersionDiff } from './compare';
 
 function describe(e: HistoryEntry, tableName: (id: number) => string): string {
   if (!e.op) return e.note ?? (e.checkpoint ? 'snapshot' : '');
@@ -56,6 +58,30 @@ function describe(e: HistoryEntry, tableName: (id: number) => string): string {
       return `${t()}: validation (${op.rules?.length ?? 0} rules)`;
     case 'set_name':
       return `name ${op.name} ${op.reference ? '= ' + op.reference : 'removed'}`;
+    case 'add_signoff':
+      return `${t()}: signed off ${a1(op.r0, op.c0)}:${a1(op.r1, op.c1)} by ${op.by || 'someone'}${op.locked ? ' (locked)' : ''}${op.note ? ' — ' + op.note : ''}`;
+    case 'remove_signoff':
+      return `${t()}: sign-off removed`;
+    case 'set_signoff_locked':
+      return `${t()}: range ${op.locked ? 'locked' : 'unlocked'}`;
+    case 'merge_cells':
+      return `${t()}: merged ${a1(op.r0, op.c0)}:${a1(op.r1, op.c1)}`;
+    case 'unmerge_cells':
+      return `${t()}: unmerged ${a1(op.r0, op.c0)}:${a1(op.r1, op.c1)}`;
+    case 'add_chart':
+      return `chart added: ${op.chart?.title || op.chart?.kind}`;
+    case 'update_chart':
+      return `chart changed: ${op.chart?.title || op.chart?.kind}`;
+    case 'delete_chart':
+      return `chart deleted`;
+    case 'restore_cells':
+      return `undo/redo: ${op.cells?.length ?? 0} cell(s) restored`;
+    case 'restore_tables':
+      return `undo/redo: ${op.tables?.length ?? 0} table(s) restored`;
+    case 'restore_names':
+      return 'undo/redo: names restored';
+    case 'restore_charts':
+      return 'undo/redo: charts restored';
     default:
       return op.type;
   }
@@ -86,6 +112,8 @@ export function HistoryPanel() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [previewSeq, setPreviewSeq] = useState<number | null>(null);
+  const [compareA, setCompareA] = useState<number | null>(null);
+  const [diff, setDiff] = useState<VersionDiff | null>(null);
 
   const tableName = (id: number) => tables.get(id)?.name ?? `table ${id}`;
 
@@ -153,6 +181,31 @@ export function HistoryPanel() {
     }
   };
 
+  const compare = async (b: number) => {
+    if (!fileId) return;
+    if (compareA === null) {
+      setCompareA(b);
+      setStatus('Now pick the second version to compare with', 4000);
+      return;
+    }
+    const [lo, hi] = compareA < b ? [compareA, b] : [b, compareA];
+    setBusy(true);
+    try {
+      const build = async (at: number) => {
+        const bundle = await api.files.replay(fileId, at);
+        if (!bundle) throw new Error('no history');
+        return book.replayDocument(bundle.json, bundle.ops.map((e) => e.op as Op), fileName);
+      };
+      const [ja, jb] = await Promise.all([build(lo), build(hi)]);
+      setDiff(diffDocuments(ja, jb, lo, hi));
+    } catch (e) {
+      setStatus(`Could not compare: ${(e as Error).message}`, 6000);
+    } finally {
+      setCompareA(null);
+      setBusy(false);
+    }
+  };
+
   if (!fileId) {
     return (
       <div className="panel">
@@ -172,11 +225,65 @@ export function HistoryPanel() {
             whole document
           </button>
         )}
+        <a className="link small" href={api.files.historyCsvUrl(fileId)} download title="Download the audit trail as CSV">
+          CSV
+        </a>
         <button onClick={() => void refresh()} title="Refresh">
           ↻
         </button>
       </div>
       {error && <div className="err small">{error}</div>}
+      {compareA !== null && (
+        <div className="small">
+          Comparing from #{compareA}: choose the other version…{' '}
+          <button className="link small" onClick={() => setCompareA(null)}>
+            cancel
+          </button>
+        </div>
+      )}
+      {diff && (
+        <div className="diff-box">
+          <div className="row">
+            <b>
+              #{diff.a} → #{diff.b}
+            </b>
+            <span className="muted small">
+              {diff.lines.length} difference{diff.lines.length === 1 ? '' : 's'}
+              {diff.truncated ? ' (first 500 shown)' : ''}
+            </span>
+            <span className="grow" />
+            <button className="link small" onClick={() => setDiff(null)}>
+              close
+            </button>
+          </div>
+          <table className="diff-table">
+            <tbody>
+              {diff.lines.map((l, i) => (
+                <tr key={i} className={l.kind}>
+                  <td>
+                    {l.table !== undefined && l.row !== undefined ? (
+                      <button className="link small" onClick={() => tables.has(l.table!) && selectCell(l.table!, l.row!, l.col!)}>
+                        {l.where}
+                      </button>
+                    ) : (
+                      l.where
+                    )}
+                  </td>
+                  <td className="old">{l.before}</td>
+                  <td className="new">{l.after}</td>
+                </tr>
+              ))}
+              {!diff.lines.length && (
+                <tr>
+                  <td colSpan={3} className="muted">
+                    No differences in cell inputs, tables or charts.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
       <div className="muted small">{entries.length} change{entries.length === 1 ? '' : 's'} · log position {seq}</div>
       <ul className="history-list">
         {entries.map((e) => (
@@ -198,6 +305,9 @@ export function HistoryPanel() {
               </button>
               <button className="link small" disabled={busy} onClick={() => void restore(e.seq)}>
                 restore
+              </button>
+              <button className="link small" disabled={busy} onClick={() => void compare(e.seq)}>
+                {compareA === null ? 'compare…' : compareA === e.seq ? 'from here' : 'to here'}
               </button>
             </div>
           </li>

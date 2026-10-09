@@ -145,6 +145,115 @@ pub enum Op {
         #[serde(default)]
         reference: Option<String>,
     },
+    /// Attest a rectangle: who, when, a note and a fingerprint of the values; `locked` refuses edits inside it.
+    AddSignoff {
+        table: TableId,
+        r0: u32,
+        c0: u32,
+        r1: u32,
+        c1: u32,
+        #[serde(default)]
+        by: String,
+        #[serde(default)]
+        login: String,
+        #[serde(default)]
+        at: String,
+        #[serde(default)]
+        note: String,
+        #[serde(default)]
+        locked: bool,
+    },
+    RemoveSignoff {
+        table: TableId,
+        id: u32,
+    },
+    SetSignoffLocked {
+        table: TableId,
+        id: u32,
+        locked: bool,
+    },
+    /// Merge a block of cells (the top-left value is kept).
+    MergeCells {
+        table: TableId,
+        r0: u32,
+        c0: u32,
+        r1: u32,
+        c1: u32,
+    },
+    /// Split every merged block intersecting the rectangle.
+    UnmergeCells {
+        table: TableId,
+        r0: u32,
+        c0: u32,
+        r1: u32,
+        c1: u32,
+    },
+    /// Add a chart (id 0 = allocate).
+    AddChart {
+        chart: Chart,
+    },
+    UpdateChart {
+        chart: Chart,
+    },
+    DeleteChart {
+        id: u32,
+    },
+    /// Undo/redo relayed from another client: restore cells (None = delete).
+    RestoreCells {
+        cells: Vec<RestoredCell>,
+    },
+    /// Undo/redo relayed from another client: restore whole tables (None = remove).
+    RestoreTables {
+        tables: Vec<RestoredTable>,
+    },
+    RestoreNames {
+        names: Vec<NamedRange>,
+    },
+    RestoreCharts {
+        charts: Vec<Chart>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RestoredCell {
+    pub table: TableId,
+    pub row: u32,
+    pub col: u32,
+    #[serde(default)]
+    pub cell: Option<Cell>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RestoredTable {
+    pub id: TableId,
+    #[serde(default)]
+    pub table: Option<Table>,
+}
+
+/// Precedents and dependents of a cell (for the trace overlay).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Trace {
+    pub precedents: Vec<Rect>,
+    pub dependents: Vec<CellRef>,
+}
+
+/// A `=CHECK(condition, label)` cell and its current outcome.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CheckView {
+    pub table: TableId,
+    pub row: u32,
+    pub col: u32,
+    pub label: String,
+    pub ok: bool,
+    /// true when the condition evaluated to an error
+    pub error: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SignoffStatus {
+    pub id: u32,
+    /// values inside the rectangle changed since it was signed
+    pub stale: bool,
 }
 
 /// Cell as the host sees it.
@@ -228,6 +337,8 @@ pub struct TableMeta {
     pub hidden_rows: Vec<u32>,
     pub cond_formats: Vec<CondFormat>,
     pub validations: Vec<Validation>,
+    pub signoffs: Vec<Signoff>,
+    pub merges: Vec<Merge>,
 }
 
 impl TableMeta {
@@ -247,6 +358,8 @@ impl TableMeta {
             hidden_rows: t.hidden_rows.clone(),
             cond_formats: t.cond_formats.clone(),
             validations: t.validations.clone(),
+            signoffs: t.signoffs.clone(),
+            merges: t.merges.clone(),
         }
     }
 }
@@ -270,6 +383,15 @@ pub struct Changes {
     /// Workbook names after the op (sent when they changed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub names: Option<Vec<NamedRange>>,
+    /// Charts after the op (sent when they changed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charts: Option<Vec<Chart>>,
+    /// Chart created by this op (AddChart).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_chart: Option<u32>,
+    /// Undo/redo: the restore ops that reproduce this change on another client.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ops: Vec<Op>,
 }
 
 impl Changes {
@@ -302,6 +424,8 @@ enum Inverse {
     Tables(Vec<(TableId, Option<Table>)>),
     /// Restore the workbook names.
     Names(Vec<NamedRange>),
+    /// Restore the chart list.
+    Charts(Vec<Chart>),
 }
 
 pub struct Engine {
@@ -370,6 +494,113 @@ impl Engine {
         out
     }
 
+    /// Precedents (ranges read) and dependents (cells reading it) of a cell.
+    pub fn trace(&self, r: CellRef) -> Trace {
+        let mut out = Trace::default();
+        let t = match self.wb.table(r.table) {
+            Some(t) => t,
+            None => return out,
+        };
+        // a spilled cell traces its source
+        let origin = match t.get(r.key()) {
+            Some(c) => c.spill_from.map(|k| CellRef::new(r.table, k.row, k.col)).unwrap_or(r),
+            None => r,
+        };
+        if let Some(c) = self.wb.cell(origin) {
+            if c.kind == CellKind::Formula {
+                out.precedents = formula::dependencies(&self.wb, origin.table, formula::formula_body(&c.input));
+            } else if c.is_code() {
+                out.precedents = c.code_deps.clone();
+            }
+        }
+        // dependents: formula cells whose deps contain the cell (or any cell of its spill), code cells reading it
+        let mut targets: Vec<CellKey> = vec![r.key()];
+        if let Some(c) = self.wb.cell(origin) {
+            if let Some((rows, cols)) = c.spill_size {
+                for i in 0..rows {
+                    for j in 0..cols {
+                        targets.push(CellKey::new(origin.row + i, origin.col + j));
+                    }
+                }
+            }
+        }
+        for t2 in &self.wb.tables {
+            for (k, c) in &t2.cells {
+                let rects: &[Rect] = if c.kind == CellKind::Formula {
+                    &c.deps
+                } else if c.is_code() {
+                    &c.code_deps
+                } else {
+                    continue;
+                };
+                let hit = rects.iter().any(|rect| rect.table == r.table && targets.iter().any(|k2| rect.contains(*k2)));
+                if hit {
+                    out.dependents.push(CellRef::new(t2.id, k.row, k.col));
+                }
+            }
+        }
+        out.dependents.sort_by_key(|d| (d.table, d.row, d.col));
+        out
+    }
+
+    /// Every `=CHECK(...)` cell with its outcome.
+    pub fn checks(&self) -> Vec<CheckView> {
+        let mut out = vec![];
+        for t in &self.wb.tables {
+            for (k, c) in &t.cells {
+                if c.kind != CellKind::Formula || !c.input.to_ascii_uppercase().contains("CHECK(") {
+                    continue;
+                }
+                let body = formula::formula_body(&c.input);
+                let parsed = match formula::parse(body) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let label = match &parsed {
+                    formula::Expr::Call(name, args) if name.eq_ignore_ascii_case("CHECK") => match args.get(1) {
+                        Some(e) => {
+                            let v = formula::evaluate(&self.wb, t.id, Some(*k), &formula::to_string(e));
+                            v.to_display()
+                        }
+                        None => String::new(),
+                    },
+                    _ => continue,
+                };
+                let (ok, error) = match &c.value {
+                    Value::Bool(b) => (*b, false),
+                    Value::Number(n) => (*n != 0.0, false),
+                    Value::Error(_) => (false, true),
+                    _ => (false, false),
+                };
+                out.push(CheckView {
+                    table: t.id,
+                    row: k.row,
+                    col: k.col,
+                    label: if label.is_empty() { format!("{}!{}", t.name, format!("{}{}", crate::model::col_to_letters(k.col), k.row + 1)) } else { label },
+                    ok,
+                    error,
+                });
+            }
+        }
+        out.sort_by_key(|c| (c.table, c.row, c.col));
+        out
+    }
+
+    /// Which sign-offs of a table no longer match the values they attested.
+    pub fn signoff_status(&self, table: TableId) -> Vec<SignoffStatus> {
+        match self.wb.table(table) {
+            Some(t) => t
+                .signoffs
+                .iter()
+                .map(|s| SignoffStatus {
+                    id: s.id,
+                    stale: t.range_hash(s.r0, s.c0, s.r1, s.c1) != s.hash,
+                })
+                .collect(),
+            None => vec![],
+        }
+    }
+
     // ------------------------------------------------------------------
     // ops
     // ------------------------------------------------------------------
@@ -390,6 +621,115 @@ impl Engine {
             }
             Err(msg) => Changes::err(&msg),
         }
+    }
+
+    /// Apply an op that another client authored: no undo entry is recorded here, and the local
+    /// undo stack is transformed so earlier entries still point at the right cells.
+    pub fn apply_remote(&mut self, op: Op) -> Changes {
+        let transform = match &op {
+            Op::InsertRows { table, at, count } => Some((*table, true, *at, *count as i64)),
+            Op::DeleteRows { table, at, count } => Some((*table, true, *at, -(*count as i64))),
+            Op::InsertCols { table, at, count } => Some((*table, false, *at, *count as i64)),
+            Op::DeleteCols { table, at, count } => Some((*table, false, *at, -(*count as i64))),
+            _ => None,
+        };
+        let drop_table = match &op {
+            Op::DeleteTable { table } => Some(*table),
+            Op::ResizeTable { table, .. } | Op::RenameTable { table, .. } | Op::SetPivot { table, .. } => Some(*table),
+            Op::RestoreTables { tables } => tables.first().map(|t| t.id),
+            _ => None,
+        };
+        let mut changes = Changes::default();
+        let result = self.apply_inner(op, &mut changes);
+        match result {
+            Ok(_) => {
+                if let Some((table, is_rows, at, count)) = transform {
+                    self.transform_undo(table, is_rows, at, count);
+                }
+                if let Some(id) = drop_table {
+                    self.forget_table_undo(id);
+                }
+                changes
+            }
+            Err(msg) => Changes::err(&msg),
+        }
+    }
+
+    /// Shift the cell refs held by undo/redo entries after a remote insert/delete in `table`.
+    fn transform_undo(&mut self, table: TableId, is_rows: bool, at: u32, count: i64) {
+        let shift_ref = |r: &mut CellRef| -> bool {
+            if r.table != table {
+                return true;
+            }
+            let idx = if is_rows { r.row } else { r.col } as i64;
+            if count > 0 {
+                if idx >= at as i64 {
+                    let n = (idx + count) as u32;
+                    if is_rows {
+                        r.row = n;
+                    } else {
+                        r.col = n;
+                    }
+                }
+                true
+            } else {
+                let del = -count;
+                if idx >= at as i64 && idx < at as i64 + del {
+                    return false; // the cell was deleted
+                }
+                if idx >= at as i64 + del {
+                    let n = (idx - del) as u32;
+                    if is_rows {
+                        r.row = n;
+                    } else {
+                        r.col = n;
+                    }
+                }
+                true
+            }
+        };
+        for stack in [&mut self.undo, &mut self.redo] {
+            stack.retain_mut(|inv| match inv {
+                Inverse::Cells(cells) => {
+                    cells.retain_mut(|(r, cell)| {
+                        if let Some(c) = cell {
+                            if let Some(sp) = c.spill_from.as_mut() {
+                                let mut sr = CellRef::new(table, sp.row, sp.col);
+                                if r.table == table && !shift_ref(&mut sr) {
+                                    return false;
+                                }
+                                *sp = sr.key();
+                            }
+                        }
+                        shift_ref(r)
+                    });
+                    !cells.is_empty()
+                }
+                // whole-table snapshots of that table are stale now
+                Inverse::Tables(tables) => !tables.iter().any(|(id, _)| *id == table),
+                _ => true,
+            });
+        }
+    }
+
+    fn forget_table_undo(&mut self, table: TableId) {
+        for stack in [&mut self.undo, &mut self.redo] {
+            stack.retain(|inv| match inv {
+                Inverse::Cells(cells) => !cells.iter().any(|(r, _)| r.table == table),
+                Inverse::Tables(tables) => !tables.iter().any(|(id, _)| *id == table),
+                _ => true,
+            });
+        }
+    }
+
+    /// Refuse edits inside a locked sign-off.
+    fn check_lock(t: &Table, r0: u32, c0: u32, r1: u32, c1: u32) -> Result<(), String> {
+        for s in &t.signoffs {
+            if s.locked && s.r0 <= r1 && r0 <= s.r1 && s.c0 <= c1 && c0 <= s.c1 {
+                return Err(format!("locked: signed off by {}{}", if s.by.is_empty() { "someone" } else { &s.by }, if s.note.is_empty() { String::new() } else { format!(" ({})", s.note) }));
+            }
+        }
+        Ok(())
     }
 
     /// Write one cell's input (shared by SetCell / SetCells / AddTable).
@@ -441,6 +781,12 @@ impl Engine {
                 }
                 if t.pivot.is_some() {
                     return Err("this table is the output of a pivot — edit the pivot settings instead".into());
+                }
+                Self::check_lock(t, row, col, row, col)?;
+                if let Some(m) = t.merge_at(row, col) {
+                    if (m.r0, m.c0) != (row, col) {
+                        return Err("cell is part of a merged block; edit its top-left cell".into());
+                    }
                 }
                 if let Some(c) = t.get(key) {
                     if c.spill_from.is_some() {
@@ -495,6 +841,10 @@ impl Engine {
                 }
                 let need_rows = row + values.len() as u32;
                 let need_cols = col + values.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
+                if need_rows == row || need_cols == col {
+                    return Ok(None);
+                }
+                Self::check_lock(t, row, col, need_rows - 1, need_cols - 1)?;
                 let mut prev_tables = vec![];
                 let grew = need_rows > t.rows || need_cols > t.cols;
                 if grew {
@@ -517,6 +867,9 @@ impl Engine {
                                 continue;
                             }
                         }
+                        if t.merge_at(key.row, key.col).map(|m| (m.r0, m.c0) != (key.row, key.col)).unwrap_or(false) {
+                            continue;
+                        }
                         prev.push((origin, t.cells.get(&key).cloned()));
                         let kind = infer_kind(s);
                         Self::write_input(t, key, s, kind);
@@ -537,6 +890,7 @@ impl Engine {
                 if t.pivot.is_some() {
                     return Err("this table is the output of a pivot — edit the pivot settings instead".into());
                 }
+                Self::check_lock(t, r0, c0, r1, c1)?;
                 let mut prev = vec![];
                 let mut changed = vec![];
                 for r in r0..=r1 {
@@ -754,6 +1108,11 @@ impl Engine {
                 let count = count.min(limit - at);
                 if count >= limit {
                     return Err("a table must keep at least one row and column".into());
+                }
+                if is_rows {
+                    Self::check_lock(t, at, 0, at + count - 1, t.cols.saturating_sub(1))?;
+                } else {
+                    Self::check_lock(t, 0, at, t.rows.saturating_sub(1), at + count - 1)?;
                 }
                 let name = t.name.clone();
                 let snapshot = t.clone();
@@ -977,6 +1336,178 @@ impl Engine {
                 self.recalc_all_into(ch);
                 Ok(Some(Inverse::Names(prev)))
             }
+            Op::AddSignoff {
+                table,
+                r0,
+                c0,
+                r1,
+                c1,
+                by,
+                login,
+                at,
+                note,
+                locked,
+            } => {
+                let t = self.wb.table(table).ok_or("no such table")?;
+                if r0 > r1 || c0 > c1 || r1 >= t.rows || c1 >= t.cols {
+                    return Err("sign-off range outside table".into());
+                }
+                let prev = t.clone();
+                let id = t.signoffs.iter().map(|s| s.id).max().unwrap_or(0) + 1;
+                let hash = t.range_hash(r0, c0, r1, c1);
+                let t = self.wb.table_mut(table).unwrap();
+                t.signoffs.push(Signoff {
+                    id,
+                    r0,
+                    c0,
+                    r1,
+                    c1,
+                    by,
+                    login,
+                    at,
+                    note,
+                    hash,
+                    locked,
+                });
+                ch.push_table(&self.wb, table);
+                Ok(Some(Inverse::Tables(vec![(table, Some(prev))])))
+            }
+            Op::RemoveSignoff { table, id } => {
+                let t = self.wb.table_mut(table).ok_or("no such table")?;
+                let prev = t.clone();
+                let before = t.signoffs.len();
+                t.signoffs.retain(|s| s.id != id);
+                if t.signoffs.len() == before {
+                    return Err("no such sign-off".into());
+                }
+                ch.push_table(&self.wb, table);
+                Ok(Some(Inverse::Tables(vec![(table, Some(prev))])))
+            }
+            Op::SetSignoffLocked { table, id, locked } => {
+                let t = self.wb.table_mut(table).ok_or("no such table")?;
+                let prev = t.clone();
+                let s = t.signoffs.iter_mut().find(|s| s.id == id).ok_or("no such sign-off")?;
+                s.locked = locked;
+                ch.push_table(&self.wb, table);
+                Ok(Some(Inverse::Tables(vec![(table, Some(prev))])))
+            }
+            Op::MergeCells { table, r0, c0, r1, c1 } => {
+                let t = self.wb.table(table).ok_or("no such table")?;
+                if r0 > r1 || c0 > c1 || r1 >= t.rows || c1 >= t.cols {
+                    return Err("merge range outside table".into());
+                }
+                if r0 == r1 && c0 == c1 {
+                    return Err("select at least two cells to merge".into());
+                }
+                if t.pivot.is_some() {
+                    return Err("pivot output cannot be merged".into());
+                }
+                Self::check_lock(t, r0, c0, r1, c1)?;
+                let prev = t.clone();
+                let t = self.wb.table_mut(table).unwrap();
+                t.merges.retain(|m| !m.intersects(r0, c0, r1, c1));
+                t.merges.push(Merge { r0, c0, r1, c1 });
+                // only the top-left value survives; formats are kept
+                let mut changed = vec![];
+                let mut spill_sources = vec![];
+                for r in r0..=r1 {
+                    for c in c0..=c1 {
+                        if (r, c) == (r0, c0) {
+                            continue;
+                        }
+                        let key = CellKey::new(r, c);
+                        if let Some(cell) = t.cells.get_mut(&key) {
+                            if let Some(sp) = cell.spill_from {
+                                spill_sources.push(CellRef::new(table, sp.row, sp.col));
+                            }
+                            if !cell.input.is_empty() || !cell.value.is_empty() {
+                                cell.input.clear();
+                                cell.kind = CellKind::Value;
+                                cell.value = Value::Empty;
+                                cell.spill_from = None;
+                                cell.spill_size = None;
+                                cell.std_out = None;
+                                cell.std_err = None;
+                                cell.deps.clear();
+                                cell.deps_valid = false;
+                                changed.push(CellRef::new(table, r, c));
+                            }
+                            if cell.is_blank() {
+                                t.cells.remove(&key);
+                            }
+                        }
+                    }
+                }
+                changed.extend(spill_sources);
+                ch.push_table(&self.wb, table);
+                self.recalc_from(&changed, ch);
+                Ok(Some(Inverse::Tables(vec![(table, Some(prev))])))
+            }
+            Op::UnmergeCells { table, r0, c0, r1, c1 } => {
+                let t = self.wb.table_mut(table).ok_or("no such table")?;
+                let prev = t.clone();
+                let before = t.merges.len();
+                t.merges.retain(|m| !m.intersects(r0, c0, r1, c1));
+                if t.merges.len() == before {
+                    return Ok(None);
+                }
+                ch.push_table(&self.wb, table);
+                Ok(Some(Inverse::Tables(vec![(table, Some(prev))])))
+            }
+            Op::AddChart { mut chart } => {
+                let prev = self.wb.charts.clone();
+                if chart.id == 0 || self.wb.charts.iter().any(|c| c.id == chart.id) {
+                    chart.id = self.wb.alloc_chart_id();
+                } else if chart.id >= self.wb.next_chart_id {
+                    self.wb.next_chart_id = chart.id + 1;
+                }
+                if chart.kind.is_empty() {
+                    chart.kind = "bar".into();
+                }
+                if chart.w <= 0.0 {
+                    chart.w = 560.0;
+                }
+                if chart.h <= 0.0 {
+                    chart.h = 380.0;
+                }
+                let id = chart.id;
+                self.wb.charts.push(chart);
+                ch.charts = Some(self.wb.charts.clone());
+                ch.created_chart = Some(id);
+                Ok(Some(Inverse::Charts(prev)))
+            }
+            Op::UpdateChart { chart } => {
+                let pos = self.wb.charts.iter().position(|c| c.id == chart.id).ok_or("no such chart")?;
+                let prev = self.wb.charts.clone();
+                self.wb.charts[pos] = chart;
+                ch.charts = Some(self.wb.charts.clone());
+                Ok(Some(Inverse::Charts(prev)))
+            }
+            Op::DeleteChart { id } => {
+                let pos = self.wb.charts.iter().position(|c| c.id == id).ok_or("no such chart")?;
+                let prev = self.wb.charts.clone();
+                self.wb.charts.remove(pos);
+                ch.charts = Some(self.wb.charts.clone());
+                Ok(Some(Inverse::Charts(prev)))
+            }
+            Op::RestoreCells { cells } => {
+                let list: Vec<(CellRef, Option<Cell>)> = cells.into_iter().map(|c| (CellRef::new(c.table, c.row, c.col), c.cell)).collect();
+                let (inv, _) = self.restore_cells(list, ch);
+                Ok(Some(inv))
+            }
+            Op::RestoreTables { tables } => {
+                let list: Vec<(TableId, Option<Table>)> = tables.into_iter().map(|t| (t.id, t.table)).collect();
+                let (inv, _) = self.restore_tables(list, ch);
+                Ok(Some(inv))
+            }
+            Op::RestoreNames { names } => {
+                let (inv, _) = self.restore_names(names, ch);
+                Ok(Some(inv))
+            }
+            Op::RestoreCharts { charts } => {
+                let (inv, _) = self.restore_charts(charts, ch);
+                Ok(Some(inv))
+            }
         }
     }
 
@@ -1199,66 +1730,117 @@ impl Engine {
 
     fn restore(&mut self, inv: Inverse) -> (Inverse, Changes) {
         let mut ch = Changes::default();
-        match inv {
-            Inverse::Cells(cells) => {
-                let mut counter = vec![];
-                let mut changed = vec![];
-                for (r, cell) in cells {
-                    counter.push((r, self.wb.cell(r).cloned()));
-                    if let Some(t) = self.wb.table_mut(r.table) {
-                        match cell {
-                            Some(mut c) => {
-                                c.deps_valid = false;
-                                t.cells.insert(r.key(), c);
-                            }
-                            None => {
-                                t.cells.remove(&r.key());
-                            }
-                        }
-                    }
-                    changed.push(r);
-                }
-                self.recalc_from(&changed, &mut ch);
-                // code cells restored with inputs must be re-run to rebuild outputs
-                for r in &changed {
-                    if let Some(c) = self.wb.cell(*r) {
-                        if c.is_code() && c.spill_from.is_none() {
-                            ch.rerun_code.push(*r);
-                        }
-                    }
-                }
-                (Inverse::Cells(counter), ch)
+        let (counter, op) = match inv {
+            Inverse::Cells(cells) => self.restore_cells(cells, &mut ch),
+            Inverse::Tables(tables) => self.restore_tables(tables, &mut ch),
+            Inverse::Names(names) => self.restore_names(names, &mut ch),
+            Inverse::Charts(charts) => self.restore_charts(charts, &mut ch),
+        };
+        ch.ops.push(op);
+        (counter, ch)
+    }
+
+    fn restore_cells(&mut self, cells: Vec<(CellRef, Option<Cell>)>, ch: &mut Changes) -> (Inverse, Op) {
+        let op = Op::RestoreCells {
+            cells: cells
+                .iter()
+                .map(|(r, c)| RestoredCell {
+                    table: r.table,
+                    row: r.row,
+                    col: r.col,
+                    cell: c.clone(),
+                })
+                .collect(),
+        };
+        let mut counter = vec![];
+        let mut changed = vec![];
+        for (r, cell) in cells {
+            if self.wb.table(r.table).is_none() {
+                continue;
             }
-            Inverse::Tables(tables) => {
-                let mut counter = vec![];
-                for (id, table) in tables {
-                    counter.push((id, self.wb.table(id).cloned()));
-                    let pos = self.wb.tables.iter().position(|t| t.id == id);
-                    match (table, pos) {
-                        (Some(t), Some(p)) => self.wb.tables[p] = t,
-                        (Some(t), None) => self.wb.tables.push(t),
-                        (None, Some(p)) => {
-                            self.wb.tables.remove(p);
-                            ch.removed_tables.push(id);
+            counter.push((r, self.wb.cell(r).cloned()));
+            if let Some(t) = self.wb.table_mut(r.table) {
+                match cell {
+                    Some(mut c) => {
+                        c.deps_valid = false;
+                        if t.in_bounds(r.key()) {
+                            t.cells.insert(r.key(), c);
                         }
-                        (None, None) => {}
                     }
-                    if self.wb.table(id).is_some() {
-                        ch.push_table(&self.wb, id);
-                        ch.reload.push(id);
+                    None => {
+                        t.cells.remove(&r.key());
                     }
                 }
-                self.recalc_all_into(&mut ch);
-                (Inverse::Tables(counter), ch)
             }
-            Inverse::Names(names) => {
-                let counter = self.wb.names.clone();
-                self.wb.names = names;
-                ch.names = Some(self.wb.names.clone());
-                self.recalc_all_into(&mut ch);
-                (Inverse::Names(counter), ch)
+            changed.push(r);
+        }
+        self.recalc_from(&changed, ch);
+        // code cells restored with inputs must be re-run to rebuild outputs
+        for r in &changed {
+            if let Some(c) = self.wb.cell(*r) {
+                if c.is_code() && c.spill_from.is_none() {
+                    ch.rerun_code.push(*r);
+                }
             }
         }
+        (Inverse::Cells(counter), op)
+    }
+
+    fn restore_tables(&mut self, tables: Vec<(TableId, Option<Table>)>, ch: &mut Changes) -> (Inverse, Op) {
+        let op = Op::RestoreTables {
+            tables: tables.iter().map(|(id, t)| RestoredTable { id: *id, table: t.clone() }).collect(),
+        };
+        let mut counter = vec![];
+        for (id, table) in tables {
+            counter.push((id, self.wb.table(id).cloned()));
+            let pos = self.wb.tables.iter().position(|t| t.id == id);
+            match (table, pos) {
+                (Some(mut t), Some(p)) => {
+                    t.normalise_geometry();
+                    self.wb.tables[p] = t;
+                }
+                (Some(mut t), None) => {
+                    t.normalise_geometry();
+                    if t.id >= self.wb.next_table_id {
+                        self.wb.next_table_id = t.id + 1;
+                    }
+                    self.wb.tables.push(t);
+                }
+                (None, Some(p)) => {
+                    self.wb.tables.remove(p);
+                    ch.removed_tables.push(id);
+                }
+                (None, None) => {}
+            }
+            if self.wb.table(id).is_some() {
+                ch.push_table(&self.wb, id);
+                ch.reload.push(id);
+            }
+        }
+        self.recalc_all_into(ch);
+        (Inverse::Tables(counter), op)
+    }
+
+    fn restore_names(&mut self, names: Vec<NamedRange>, ch: &mut Changes) -> (Inverse, Op) {
+        let op = Op::RestoreNames { names: names.clone() };
+        let counter = self.wb.names.clone();
+        self.wb.names = names;
+        ch.names = Some(self.wb.names.clone());
+        self.recalc_all_into(ch);
+        (Inverse::Names(counter), op)
+    }
+
+    fn restore_charts(&mut self, charts: Vec<Chart>, ch: &mut Changes) -> (Inverse, Op) {
+        let op = Op::RestoreCharts { charts: charts.clone() };
+        let counter = self.wb.charts.clone();
+        self.wb.charts = charts;
+        for c in &self.wb.charts {
+            if c.id >= self.wb.next_chart_id {
+                self.wb.next_chart_id = c.id + 1;
+            }
+        }
+        ch.charts = Some(self.wb.charts.clone());
+        (Inverse::Charts(counter), op)
     }
 
     // ------------------------------------------------------------------
@@ -1703,6 +2285,11 @@ fn shift_rules(t: &mut Table, is_rows: bool, at: u32, count: i64) {
     };
     t.cond_formats.retain_mut(|r| if is_rows { shift(&mut r.r0, &mut r.r1) } else { shift(&mut r.c0, &mut r.c1) });
     t.validations.retain_mut(|r| if is_rows { shift(&mut r.r0, &mut r.r1) } else { shift(&mut r.c0, &mut r.c1) });
+    t.signoffs.retain_mut(|r| if is_rows { shift(&mut r.r0, &mut r.r1) } else { shift(&mut r.c0, &mut r.c1) });
+    t.merges.retain_mut(|m| {
+        let keep = if is_rows { shift(&mut m.r0, &mut m.r1) } else { shift(&mut m.c0, &mut m.c1) };
+        keep && !(m.r0 == m.r1 && m.c0 == m.c1)
+    });
     if !is_rows {
         t.filters.retain_mut(|f| {
             let (mut a, mut b) = (f.col, f.col);
@@ -2226,5 +2813,251 @@ mod tests {
         let e2 = Engine::new(serde_json::from_str(&json).unwrap());
         assert_eq!(e2.wb.table(3).unwrap().value_at(CellKey::new(3, 3)), Value::Number(205.0));
         assert_eq!(e2.wb.names.len(), 1);
+    }
+
+    #[test]
+    fn signoffs_lock_and_go_stale() {
+        let mut e = engine();
+        set(&mut e, 1, 0, 0, "100");
+        set(&mut e, 1, 1, 0, "=A1*2");
+        let ch = e.apply(Op::AddSignoff {
+            table: 1,
+            r0: 0,
+            c0: 0,
+            r1: 1,
+            c1: 0,
+            by: "Nuno".into(),
+            login: "nuno@example.com".into(),
+            at: "2026-10-09T10:00:00Z".into(),
+            note: "Q3 close".into(),
+            locked: true,
+        });
+        assert!(ch.error.is_none(), "{:?}", ch.error);
+        let meta = &ch.tables[0];
+        assert_eq!(meta.signoffs.len(), 1);
+        let id = meta.signoffs[0].id;
+        assert!(!e.signoff_status(1)[0].stale);
+        // locked: manual edits are refused, formulas elsewhere still work
+        let ch = set(&mut e, 1, 0, 0, "5");
+        assert!(ch.error.as_deref().unwrap_or("").starts_with("locked"), "{:?}", ch.error);
+        assert_eq!(val(&e, 1, 0, 0), Value::Number(100.0));
+        let ch = e.apply(Op::ClearRange { table: 1, r0: 0, c0: 0, r1: 3, c1: 3 });
+        assert!(ch.error.is_some());
+        let ch = e.apply(Op::DeleteRows { table: 1, at: 1, count: 1 });
+        assert!(ch.error.is_some());
+        // unlocking allows the edit and the sign-off becomes stale
+        e.apply(Op::SetSignoffLocked { table: 1, id, locked: false });
+        let ch = set(&mut e, 1, 0, 0, "5");
+        assert!(ch.error.is_none());
+        assert!(e.signoff_status(1)[0].stale);
+        // the same value again → not stale (hash is on values)
+        set(&mut e, 1, 0, 0, "100");
+        assert!(!e.signoff_status(1)[0].stale);
+        // inserting rows above shifts the range and keeps the hash valid
+        e.apply(Op::InsertRows { table: 1, at: 0, count: 2 });
+        let t = e.wb.table(1).unwrap();
+        assert_eq!((t.signoffs[0].r0, t.signoffs[0].r1), (2, 3));
+        assert!(!e.signoff_status(1)[0].stale);
+        // undo returns restore ops for the other clients
+        let ch = e.undo();
+        assert_eq!(ch.ops.len(), 1);
+        assert!(matches!(ch.ops[0], Op::RestoreTables { .. }));
+        let t = e.wb.table(1).unwrap();
+        assert_eq!((t.signoffs[0].r0, t.signoffs[0].r1), (0, 1));
+        e.apply(Op::RemoveSignoff { table: 1, id });
+        assert!(e.wb.table(1).unwrap().signoffs.is_empty());
+    }
+
+    #[test]
+    fn merges_keep_top_left_and_shift() {
+        let mut e = engine();
+        set(&mut e, 1, 0, 0, "Title");
+        set(&mut e, 1, 0, 1, "gone");
+        set(&mut e, 1, 2, 0, "=A1&\"!\"");
+        let ch = e.apply(Op::MergeCells { table: 1, r0: 0, c0: 0, r1: 1, c1: 2 });
+        assert!(ch.error.is_none(), "{:?}", ch.error);
+        assert_eq!(e.wb.table(1).unwrap().merges.len(), 1);
+        assert_eq!(val(&e, 1, 0, 1), Value::Empty);
+        assert_eq!(val(&e, 1, 2, 0), Value::Text("Title!".into()));
+        let ch = set(&mut e, 1, 1, 1, "x");
+        assert!(ch.error.is_some());
+        e.apply(Op::InsertCols { table: 1, at: 0, count: 1 });
+        let m = e.wb.table(1).unwrap().merges[0];
+        assert_eq!((m.c0, m.c1), (1, 3));
+        e.apply(Op::UnmergeCells { table: 1, r0: 1, c0: 2, r1: 1, c1: 2 });
+        assert!(e.wb.table(1).unwrap().merges.is_empty());
+        e.undo();
+        assert_eq!(e.wb.table(1).unwrap().merges.len(), 1);
+    }
+
+    #[test]
+    fn charts_are_workbook_objects() {
+        let mut e = engine();
+        let ch = e.apply(Op::AddChart {
+            chart: Chart {
+                kind: "bar".into(),
+                title: "Revenue grew 12% in Q3".into(),
+                categories: "Data::A1:A5".into(),
+                series: vec![ChartSeries {
+                    name: "Revenue".into(),
+                    range: "Data::B1:B5".into(),
+                    color: None,
+                }],
+                ..Default::default()
+            },
+        });
+        assert!(ch.error.is_none());
+        assert_eq!(ch.created_chart, Some(1));
+        assert_eq!(ch.charts.as_ref().unwrap().len(), 1);
+        assert_eq!(e.wb.charts[0].w, 560.0);
+        let mut c = e.wb.charts[0].clone();
+        c.title = "Changed".into();
+        e.apply(Op::UpdateChart { chart: c });
+        assert_eq!(e.wb.charts[0].title, "Changed");
+        let ch = e.undo();
+        assert!(matches!(ch.ops[0], Op::RestoreCharts { .. }));
+        assert_eq!(e.wb.charts[0].title, "Revenue grew 12% in Q3");
+        e.apply(Op::DeleteChart { id: 1 });
+        assert!(e.wb.charts.is_empty());
+        // a second chart gets a fresh id even after the first was deleted
+        let ch = e.apply(Op::AddChart { chart: Chart::default() });
+        assert_eq!(ch.created_chart, Some(2));
+        let json = serde_json::to_string(&e.wb).unwrap();
+        let wb: Workbook = serde_json::from_str(&json).unwrap();
+        assert_eq!(wb.charts.len(), 1);
+    }
+
+    #[test]
+    fn remote_ops_skip_undo_and_transform_the_stack() {
+        let mut e = engine();
+        set(&mut e, 1, 3, 0, "1");
+        set(&mut e, 1, 3, 0, "2"); // undo entry points at row 3
+        // another client inserts two rows above: our undo entry must now point at row 5
+        let ch = e.apply_remote(Op::InsertRows { table: 1, at: 0, count: 2 });
+        assert!(ch.error.is_none());
+        assert_eq!(val(&e, 1, 5, 0), Value::Number(2.0));
+        assert!(e.can_undo());
+        let ch = e.undo();
+        assert_eq!(val(&e, 1, 5, 0), Value::Number(1.0));
+        match &ch.ops[0] {
+            Op::RestoreCells { cells } => assert_eq!((cells[0].row, cells[0].col), (5, 0)),
+            other => panic!("unexpected {:?}", other),
+        }
+        // a remote cell edit is not undoable locally
+        let before = e.undo.len();
+        e.apply_remote(Op::SetCell {
+            table: 1,
+            row: 0,
+            col: 0,
+            input: "9".into(),
+            kind: None,
+            conn: None,
+            refresh: None,
+        });
+        assert_eq!(e.undo.len(), before);
+        // restore ops from another client's undo apply like any op
+        let ch = e.apply_remote(Op::RestoreCells {
+            cells: vec![RestoredCell { table: 1, row: 0, col: 0, cell: None }],
+        });
+        assert!(ch.error.is_none());
+        assert_eq!(val(&e, 1, 0, 0), Value::Empty);
+    }
+
+    #[test]
+    fn checks_fx_reconcile_ageing_and_trace() {
+        let mut e = engine();
+        e.wb.now_serial = crate::formula::eval::serial_from_ymd(2026, 10, 9);
+        e.apply(Op::AddTable {
+            id: None,
+            name: Some("FX".into()),
+            x: 0.0,
+            y: 0.0,
+            rows: 5,
+            cols: 4,
+            values: Some(vec![
+                vec!["Date".into(), "From".into(), "To".into(), "Rate".into()],
+                vec!["2026-01-01".into(), "USD".into(), "AOA".into(), "900".into()],
+                vec!["2026-09-01".into(), "USD".into(), "AOA".into(), "920".into()],
+                vec!["2026-09-01".into(), "EUR".into(), "USD".into(), "1.1".into()],
+                vec!["2026-12-01".into(), "USD".into(), "AOA".into(), "950".into()],
+            ]),
+        });
+        set(&mut e, 1, 0, 0, "=FX(10, \"USD\", \"AOA\")");
+        assert_eq!(val(&e, 1, 0, 0), Value::Number(9200.0));
+        set(&mut e, 1, 0, 1, "=FX(9200, \"AOA\", \"USD\")");
+        assert_eq!(val(&e, 1, 0, 1), Value::Number(10.0));
+        set(&mut e, 1, 0, 2, "=ROUND(FX(1, \"EUR\", \"AOA\"), 2)"); // triangulated: 1.1 * 920
+        assert_eq!(val(&e, 1, 0, 2), Value::Number(1012.0));
+        set(&mut e, 1, 0, 3, "=FX(10, \"USD\", \"AOA\", DATE(2026,3,1))");
+        assert_eq!(val(&e, 1, 0, 3), Value::Number(9000.0));
+        // rates changing recalculates FX() cells
+        set(&mut e, 2, 2, 3, "1000");
+        assert_eq!(val(&e, 1, 0, 0), Value::Number(10000.0));
+        // CHECK cells are collected with labels and outcomes
+        set(&mut e, 1, 1, 0, "=CHECK(A1=10000, \"FX applied\")");
+        set(&mut e, 1, 1, 1, "=CHECK(B1>100, \"B1 big\")");
+        let checks = e.checks();
+        assert_eq!(checks.len(), 2);
+        assert!(checks[0].ok && checks[0].label == "FX applied");
+        assert!(!checks[1].ok && checks[1].label == "B1 big");
+        // trace: precedents of the FX cell include the FX table; dependents of FX!D3 include it
+        let tr = e.trace(CellRef::new(1, 0, 0));
+        assert!(tr.precedents.iter().any(|r| r.table == 2));
+        let tr = e.trace(CellRef::new(2, 2, 3));
+        assert!(tr.dependents.contains(&CellRef::new(1, 0, 0)));
+        // RECONCILE spills Key | A | B | Difference | Status
+        e.apply(Op::AddTable {
+            id: None,
+            name: Some("Rec".into()),
+            x: 0.0,
+            y: 0.0,
+            rows: 12,
+            cols: 10,
+            values: Some(vec![
+                vec!["INV1".into(), "100".into(), "INV1".into(), "100".into()],
+                vec!["INV2".into(), "250".into(), "INV3".into(), "75".into()],
+                vec!["INV3".into(), "75.004".into(), "INV4".into(), "10".into()],
+            ]),
+        });
+        set(&mut e, 3, 4, 0, "=RECONCILE(A1:B3, C1:D3)");
+        assert_eq!(val(&e, 3, 4, 0), Value::Text("Key".into()));
+        assert_eq!(val(&e, 3, 5, 0), Value::Text("INV1".into()));
+        assert_eq!(val(&e, 3, 5, 4), Value::Text("Matched".into()));
+        assert_eq!(val(&e, 3, 6, 4), Value::Text("Only in A".into()));
+        assert_eq!(val(&e, 3, 7, 4), Value::Text("Matched".into())); // within tolerance
+        assert_eq!(val(&e, 3, 8, 4), Value::Text("Only in B".into()));
+        set(&mut e, 3, 4, 6, "=RECONCILE(A1:B3, C1:D3, 0)");
+        assert_eq!(val(&e, 3, 7, 10), Value::Text("Difference".into()));
+        // AGEING buckets by days outstanding
+        e.apply(Op::AddTable {
+            id: None,
+            name: Some("AP".into()),
+            x: 0.0,
+            y: 0.0,
+            rows: 12,
+            cols: 8,
+            values: Some(vec![
+                vec!["Due".into(), "Amount".into()],
+                vec!["2026-10-01".into(), "100".into()],
+                vec!["2026-08-20".into(), "200".into()],
+                vec!["2026-05-01".into(), "300".into()],
+                vec!["2026-11-01".into(), "50".into()],
+            ]),
+        });
+        set(&mut e, 4, 0, 3, "=AGEING(A2:A5, B2:B5)");
+        assert_eq!(val(&e, 4, 0, 3), Value::Text("Bucket".into()));
+        assert_eq!(val(&e, 4, 1, 3), Value::Text("Not due".into()));
+        assert_eq!(val(&e, 4, 1, 5), Value::Number(50.0));
+        assert_eq!(val(&e, 4, 2, 3), Value::Text("0-30".into()));
+        assert_eq!(val(&e, 4, 2, 5), Value::Number(100.0));
+        assert_eq!(val(&e, 4, 3, 3), Value::Text("31-60".into()));
+        assert_eq!(val(&e, 4, 3, 5), Value::Number(200.0));
+        assert_eq!(val(&e, 4, 5, 3), Value::Text("91+".into()));
+        assert_eq!(val(&e, 4, 5, 5), Value::Number(300.0));
+        assert_eq!(val(&e, 4, 6, 3), Value::Text("Total".into()));
+        assert_eq!(val(&e, 4, 6, 5), Value::Number(650.0));
+        set(&mut e, 4, 0, 2, "=AGE_BUCKET(A2:A5)");
+        assert_eq!(val(&e, 4, 2, 2), Value::Text("91+".into()));
+        assert_eq!(val(&e, 4, 3, 2), Value::Text("Not due".into()));
     }
 }

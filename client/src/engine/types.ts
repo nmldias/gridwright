@@ -21,6 +21,7 @@ export interface Format {
   number_format?: string;
   fill?: string;
   color?: string;
+  wrap?: boolean;
 }
 
 export interface CellView {
@@ -98,6 +99,77 @@ export interface NamedRange {
   reference: string;
 }
 
+/** A signed-off rectangle (who, when, note, fingerprint of the values at that moment). */
+export interface Signoff {
+  id: number;
+  r0: number;
+  c0: number;
+  r1: number;
+  c1: number;
+  by: string;
+  login: string;
+  at: string;
+  note: string;
+  hash: string;
+  locked: boolean;
+}
+
+export interface Merge {
+  r0: number;
+  c0: number;
+  r1: number;
+  c1: number;
+}
+
+export type ChartKind = 'bar' | 'hbar' | 'line' | 'area' | 'stacked' | 'waterfall';
+export interface ChartSeries {
+  name: string;
+  range: string;
+  color?: string;
+}
+export interface ChartReference {
+  value: number;
+  label: string;
+}
+/** A chart object on the canvas; data comes from the referenced ranges. */
+export interface Chart {
+  id: number;
+  kind: ChartKind;
+  title: string;
+  subtitle: string;
+  exhibit: string;
+  source: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  categories: string;
+  series: ChartSeries[];
+  highlight?: number | null;
+  reference?: ChartReference | null;
+  show_values: boolean;
+  stat_cards: boolean;
+}
+
+export interface Trace {
+  precedents: Rect[];
+  dependents: CellRef[];
+}
+
+export interface CheckView {
+  table: TableId;
+  row: number;
+  col: number;
+  label: string;
+  ok: boolean;
+  error: boolean;
+}
+
+export interface SignoffStatus {
+  id: number;
+  stale: boolean;
+}
+
 export interface TableMeta {
   id: TableId;
   name: string;
@@ -113,6 +185,8 @@ export interface TableMeta {
   hidden_rows: number[];
   cond_formats: CondFormat[];
   validations: Validation[];
+  signoffs: Signoff[];
+  merges: Merge[];
 }
 
 export interface Rect {
@@ -138,6 +212,21 @@ export interface Changes {
   error?: string;
   created: TableId[];
   names?: NamedRange[];
+  charts?: Chart[];
+  created_chart?: number;
+  /** undo/redo: restore ops that reproduce the change on other clients */
+  ops?: Op[];
+}
+
+export interface RestoredCell {
+  table: TableId;
+  row: number;
+  col: number;
+  cell?: unknown | null;
+}
+export interface RestoredTable {
+  id: TableId;
+  table?: unknown | null;
 }
 
 export type Op =
@@ -180,10 +269,27 @@ export type Op =
   | { type: 'set_filters'; table: TableId; filters: ColumnFilter[] }
   | { type: 'set_cond_formats'; table: TableId; rules: CondFormat[] }
   | { type: 'set_validations'; table: TableId; rules: Validation[] }
-  | { type: 'set_name'; name: string; reference: string | null };
+  | { type: 'set_name'; name: string; reference: string | null }
+  | { type: 'add_signoff'; table: TableId; r0: number; c0: number; r1: number; c1: number; by: string; login: string; at: string; note: string; locked: boolean }
+  | { type: 'remove_signoff'; table: TableId; id: number }
+  | { type: 'set_signoff_locked'; table: TableId; id: number; locked: boolean }
+  | { type: 'merge_cells'; table: TableId; r0: number; c0: number; r1: number; c1: number }
+  | { type: 'unmerge_cells'; table: TableId; r0: number; c0: number; r1: number; c1: number }
+  | { type: 'add_chart'; chart: Chart }
+  | { type: 'update_chart'; chart: Chart }
+  | { type: 'delete_chart'; id: number }
+  | { type: 'restore_cells'; cells: RestoredCell[] }
+  | { type: 'restore_tables'; tables: RestoredTable[] }
+  | { type: 'restore_names'; names: NamedRange[] }
+  | { type: 'restore_charts'; charts: Chart[] };
 
 /** Ops that change the shape of a table (row/column indices shift). */
-export const STRUCTURAL_OPS = new Set<Op['type']>(['resize_table', 'insert_rows', 'delete_rows', 'insert_cols', 'delete_cols', 'delete_table', 'add_table', 'set_pivot', 'rename_table', 'set_header_rows']);
+export const STRUCTURAL_OPS = new Set<Op['type']>(['resize_table', 'insert_rows', 'delete_rows', 'insert_cols', 'delete_cols', 'delete_table', 'add_table', 'set_pivot', 'rename_table', 'set_header_rows', 'restore_tables']);
+
+/** Ops that only shift indices (the pending ops of other clients can be transformed against them). */
+export const SHIFT_OPS = new Set<Op['type']>(['insert_rows', 'delete_rows', 'insert_cols', 'delete_cols']);
+
+export const EMPTY_CHART: Chart = { id: 0, kind: 'bar', title: '', subtitle: '', exhibit: '', source: '', x: 0, y: 0, w: 560, h: 380, categories: '', series: [], highlight: null, reference: null, show_values: true, stat_cards: true };
 
 export function valueToString(v: CellValue): string {
   if (v === null || v === undefined) return '';

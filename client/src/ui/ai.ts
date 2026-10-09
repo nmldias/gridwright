@@ -1,7 +1,7 @@
 // Prompt construction and action application for the AI assistant.
 
 import * as book from '../engine/book';
-import { a1, parseA1, type CellKind } from '../engine/types';
+import { EMPTY_CHART, a1, parseA1, type CellKind, type ChartKind } from '../engine/types';
 import { addTable } from '../grid/actions';
 import { cellAt, getState } from '../state/store';
 import { displayOf } from '../grid/format';
@@ -9,7 +9,7 @@ import { displayOf } from '../grid/format';
 export const SYSTEM_PROMPT = `You are the assistant inside Gridwright, a spreadsheet whose documents hold several named tables on a canvas.
 Formulas start with "=" and use A1 references inside the current table; other tables are addressed as Name::A1 or 'Name with spaces'::A1:B5 (ranges A1:B5, whole columns A:A).
 Structured references use the header row: Orders[Amount] is the data column under the header "Amount", [@Amount] the value on the formula's own row. Workbook names (e.g. TaxRate) can be defined by the user. Array results spill: =FILTER(Orders[Amount], Orders[Region]="N"), =SORT(...), =UNIQUE(...), =SEQUENCE(...), =A1:A9*2.
-Functions available: SUM AVERAGE MIN MAX COUNT COUNTA COUNTBLANK PRODUCT MEDIAN STDEV VAR ABS ROUND ROUNDUP ROUNDDOWN INT TRUNC MOD POWER SQRT EXP LN LOG LOG10 PI CEILING FLOOR SIGN ISEVEN ISODD SUMPRODUCT SUMIF SUMIFS COUNTIF COUNTIFS AVERAGEIF AVERAGEIFS MAXIFS MINIFS SUBTOTAL IF IFS IFERROR IFNA SWITCH AND OR XOR NOT ISBLANK ISNUMBER ISTEXT ISERROR LEN UPPER LOWER PROPER TRIM CONCAT CONCATENATE TEXTJOIN LEFT RIGHT MID FIND SEARCH SUBSTITUTE REPT VALUE TEXT EXACT VLOOKUP HLOOKUP XLOOKUP MATCH INDEX CHOOSE ROW COLUMN ROWS COLUMNS TRANSPOSE UNIQUE FILTER SORT SORTBY SEQUENCE TODAY NOW DATE TIME YEAR MONTH DAY HOUR MINUTE SECOND DATEVALUE EDATE EOMONTH WEEKDAY DAYS DATEDIF YEARFRAC NETWORKDAYS WORKDAY NPV IRR XNPV XIRR PMT IPMT PPMT PV FV NPER RATE SLN EFFECT NOMINAL RANK LARGE SMALL N T.
+Functions available: SUM AVERAGE MIN MAX COUNT COUNTA COUNTBLANK PRODUCT MEDIAN STDEV VAR ABS ROUND ROUNDUP ROUNDDOWN INT TRUNC MOD POWER SQRT EXP LN LOG LOG10 PI CEILING FLOOR SIGN ISEVEN ISODD SUMPRODUCT SUMIF SUMIFS COUNTIF COUNTIFS AVERAGEIF AVERAGEIFS MAXIFS MINIFS SUBTOTAL IF IFS IFERROR IFNA SWITCH AND OR XOR NOT ISBLANK ISNUMBER ISTEXT ISERROR LEN UPPER LOWER PROPER TRIM CONCAT CONCATENATE TEXTJOIN LEFT RIGHT MID FIND SEARCH SUBSTITUTE REPT VALUE TEXT EXACT VLOOKUP HLOOKUP XLOOKUP MATCH INDEX CHOOSE ROW COLUMN ROWS COLUMNS TRANSPOSE UNIQUE FILTER SORT SORTBY SEQUENCE TODAY NOW DATE TIME YEAR MONTH DAY HOUR MINUTE SECOND DATEVALUE EDATE EOMONTH WEEKDAY DAYS DATEDIF YEARFRAC NETWORKDAYS WORKDAY NPV IRR XNPV XIRR PMT IPMT PPMT PV FV NPER RATE SLN EFFECT NOMINAL RANK LARGE SMALL N T, plus review and finance primitives: CHECK(condition, "label") (collected in the Review panel), FX(amount, "USD", "AOA", [date]) and FXRATE(from, to, [date]) against a table named FX with columns Date | From | To | Rate (latest rate on or before the date, inverse and triangulated rates work), RECONCILE(rangeA, rangeB, [tolerance]) which spills Key | A | B | Difference | Status, AGEING(dates, amounts, [as_of], [bucket_edges]) which spills Bucket | Count | Amount | Share, and AGE_BUCKET(date, [as_of], [edges]).
 Python cells: the last expression is the output; q.cells("A1:B5") returns values (a DataFrame when pandas is imported), q.cells("Table 2::A1") reads another table, q.df("A1:C20") returns a DataFrame with the first row as header. JavaScript cells: return the value; q.cells(...) as above. SQL cells (language "sql") run a query on a stored connection and spill the result; {{A1}} binds a cell as a parameter. Outputs spill into the cells right/below; the table grows to fit.
 Row 1 of a table is usually its header. Number formats: "#,##0.00", "0%", "yyyy-mm-dd", "€#,##0.00", "#,##0.00 \"Kz\"" (set with the set_format action).
 
@@ -20,8 +20,10 @@ To change the sheet, include one fenced block tagged gridwright-actions containi
  {"action":"code_cell","table":"Table 1","ref":"D1","language":"python","code":"df = q.df(\\"A1:B3\\")\\ndf['Share'] = df['Revenue'] / df['Revenue'].sum()\\ndf"},
  {"action":"add_table","name":"Summary","values":[["Metric","Value"],["Total","=SUM('Table 1'::B2:B3)"]]},
  {"action":"set_format","table":"Table 1","ref":"B2:B9","format":{"number_format":"#,##0.00","bold":false}},
+ {"action":"add_chart","kind":"bar","title":"Revenue grew 12% in Q3","subtitle":"Monthly revenue, AOA millions","categories":"Table 1::A2:A13","series":[{"name":"Revenue","range":"Table 1::B2:B13"}],"highlight":8,"reference":{"value":1000,"label":"Budget"},"source":"Table 1"},
  {"action":"resize_table","table":"Table 1","rows":12,"cols":4}]
 \`\`\`
+Charts are exhibits: give an action title that states the takeaway, a subtitle with dataset and units, and a source. Kinds: bar, hbar, line, area, stacked, waterfall. When tools are available, use run_sql / describe_table to look at real data before writing SQL cells or formulas, and read_history to answer who changed what.
 Rules: refer to tables by their exact names; "ref" is the top-left cell (a range for set_format/clear_range); values are plain strings/numbers or formula strings starting with "="; keep explanations short and put them outside the block; never invent data that is not in the sheet unless the user asks for sample data. The user reviews every change as a diff before it is applied, so prefer precise, minimal actions.`;
 
 function summariseWorkbook(maxRows = 15, maxCols = 12): string {
@@ -76,6 +78,15 @@ export interface Action {
   rows?: number;
   cols?: number;
   format?: Record<string, unknown>;
+  kind?: string;
+  title?: string;
+  subtitle?: string;
+  categories?: string;
+  series?: { name?: string; range?: string }[];
+  highlight?: number | null;
+  reference?: { value: number; label?: string } | null;
+  source?: string;
+  exhibit?: string;
 }
 
 export interface DiffLine {
@@ -169,12 +180,18 @@ export function previewActions(actions: Action[]): { lines: DiffLine[]; errors: 
         lines.push({ where: `${t.name}::${a1(p.r0, p.c0)}:${a1(p.r1, p.c1)}`, before: '', after: JSON.stringify(act.format ?? {}), kind: 'format' });
         break;
       }
+      case 'add_chart': {
+        lines.push({ where: 'chart', before: '', after: `${act.kind ?? 'bar'}: ${act.title ?? ''} (${(act.series ?? []).map((x) => x.range).join(', ')})`, kind: 'table' });
+        break;
+      }
       default:
         errors.push(`unknown action ${act.action}`);
     }
   }
   return { lines, errors };
 }
+
+const CHART_KINDS: ChartKind[] = ['bar', 'hbar', 'line', 'area', 'stacked', 'waterfall'];
 
 export function extractActions(text: string): Action[] {
   const out: Action[] = [];
@@ -279,8 +296,47 @@ export function applyActions(actions: Action[]): { applied: number; errors: stri
           if (!p) throw new Error(`bad ref ${act.ref}`);
           const f = (act.format ?? {}) as Record<string, unknown>;
           const format: Record<string, unknown> = {};
-          for (const k of ['bold', 'italic', 'align', 'number_format', 'fill', 'color']) if (f[k] !== undefined) format[k] = f[k];
+          for (const k of ['bold', 'italic', 'align', 'number_format', 'fill', 'color', 'wrap']) if (f[k] !== undefined) format[k] = f[k];
           const ch = book.apply({ type: 'set_format', table: id, r0: p.r0, c0: p.c0, r1: p.r1, c1: p.c1, format }, opts);
+          if (ch.error) throw new Error(ch.error);
+          applied++;
+          break;
+        }
+        case 'add_chart': {
+          const kind = CHART_KINDS.includes(act.kind as ChartKind) ? (act.kind as ChartKind) : 'bar';
+          const series = (act.series ?? []).filter((x) => x && x.range).map((x, i) => ({ name: str(x.name) || `Series ${i + 1}`, range: str(x.range) }));
+          if (!series.length) throw new Error('a chart needs at least one series');
+          // next to the first referenced table, or below everything
+          let x = 80;
+          let y = 80;
+          for (const t of st.tables.values()) y = Math.max(y, t.y + 40);
+          const ref = parseA1(series[0].range);
+          const near = ref?.table ? book.tableIdByName(ref.table) : 0;
+          const meta = near ? st.tables.get(near) : undefined;
+          if (meta) {
+            x = meta.x + meta.col_widths.reduce((a, b) => a + b, 0) + 40;
+            y = meta.y;
+          }
+          const ch = book.apply(
+            {
+              type: 'add_chart',
+              chart: {
+                ...EMPTY_CHART,
+                kind,
+                title: str(act.title),
+                subtitle: str(act.subtitle),
+                exhibit: str(act.exhibit) || `Exhibit ${st.charts.length + 1}`,
+                source: str(act.source),
+                categories: str(act.categories),
+                series,
+                highlight: typeof act.highlight === 'number' ? act.highlight : null,
+                reference: act.reference && typeof act.reference.value === 'number' ? { value: act.reference.value, label: str(act.reference.label) } : null,
+                x,
+                y,
+              },
+            },
+            opts,
+          );
           if (ch.error) throw new Error(ch.error);
           applied++;
           break;

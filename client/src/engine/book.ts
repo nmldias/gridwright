@@ -3,9 +3,11 @@
 
 import init, { Book } from './pkg/gridwright_core';
 import wasmUrl from './pkg/gridwright_core_bg.wasm?url';
-import type { CellRef, CellValue, CellView, Changes, NamedRange, Op, TableId, TableMeta } from './types';
+import type { CellRef, CellValue, CellView, Changes, Chart, CheckView, NamedRange, Op, SignoffStatus, TableId, TableMeta, Trace } from './types';
 import { cellKey, isCodeKind } from './types';
-import { useStore } from '../state/store';
+import { readOnly, useStore } from '../state/store';
+
+const SIGN_OPS = new Set<Op['type']>(['add_signoff', 'remove_signoff', 'set_signoff_locked']);
 
 /** Where a change came from (recorded in the document's audit log). */
 export type Origin = 'user' | 'ai' | 'code' | 'sql' | 'import' | 'remote' | 'system';
@@ -73,6 +75,9 @@ export async function loadBook(json: string | null, name = 'Untitled', fileId: s
     tables,
     cells,
     names: JSON.parse(book.names()) as NamedRange[],
+    charts: JSON.parse(book.charts()) as Chart[],
+    selectedChart: null,
+    trace: null,
     fileName: json ? book.name() : name,
     fileId,
     dirty: false,
@@ -108,6 +113,11 @@ export function toJson(): string {
 /** Apply an op locally (and notify listeners, e.g. the multiplayer link). */
 export function apply(op: Op, opts: { remote?: boolean; silent?: boolean; origin?: Origin; note?: string } = {}): Changes {
   const b = getBook();
+  if (!opts.remote && readOnly() && op.type !== 'code_result' && !(useStore.getState().permission === 'sign' && SIGN_OPS.has(op.type))) {
+    const msg = useStore.getState().permission === 'sign' ? 'You may sign off on this document but not edit it' : 'This document is read-only for you';
+    if (!opts.silent) useStore.setState({ status: msg });
+    return { cells: {}, tables: [], reload: [], removed_tables: [], rerun_code: [], created: [], error: msg };
+  }
   const changes: Changes = JSON.parse(b.apply(JSON.stringify(op)));
   if (changes.error) {
     if (!opts.silent) useStore.setState({ status: changes.error });
@@ -122,18 +132,29 @@ export function apply(op: Op, opts: { remote?: boolean; silent?: boolean; origin
   return changes;
 }
 
+/** Apply an op authored elsewhere (multiplayer): not recorded for local undo. */
+export function applyRemote(op: Op): Changes {
+  const b = getBook();
+  const changes: Changes = JSON.parse(b.apply_remote(JSON.stringify(op)));
+  if (!changes.error) applyChanges(changes);
+  return changes;
+}
+
 export function undo() {
   const changes: Changes = JSON.parse(getBook().undo());
   applyChanges(changes);
+  if (!changes.ops?.length) return;
   useStore.setState({ dirty: true });
-  opListeners.forEach((l) => l(null, changes, { origin: 'user', note: 'undo' }));
+  // the restore ops travel like any other op, so the other clients replay them in order
+  for (const op of changes.ops) opListeners.forEach((l) => l(op, changes, { origin: 'user', note: 'undo' }));
 }
 
 export function redo() {
   const changes: Changes = JSON.parse(getBook().redo());
   applyChanges(changes);
+  if (!changes.ops?.length) return;
   useStore.setState({ dirty: true });
-  opListeners.forEach((l) => l(null, changes, { origin: 'user', note: 'redo' }));
+  for (const op of changes.ops) opListeners.forEach((l) => l(op, changes, { origin: 'user', note: 'redo' }));
 }
 
 /** Tell listeners the whole document changed (after a restore/import): multiplayer sends a snapshot. */
@@ -206,6 +227,8 @@ export function applyChanges(changes: Changes) {
     canRedo: b.can_redo(),
     cellsVersion: st.cellsVersion + 1,
     ...(changes.names ? { names: changes.names } : {}),
+    ...(changes.charts ? { charts: changes.charts } : {}),
+    ...(changes.created_chart ? { selectedChart: changes.created_chart } : {}),
   });
   requestRedraw();
   if (changes.rerun_code.length) rerunListeners.forEach((l) => l(changes.rerun_code));
@@ -251,6 +274,29 @@ export function listEntries(table: TableId, row: number, col: number): string[] 
 
 export function formatWithEngine(n: number, pattern: string): string {
   return Book.format_number(n, pattern);
+}
+
+export function trace(table: TableId, row: number, col: number): Trace {
+  return JSON.parse(getBook().trace(table, row, col));
+}
+
+export function checks(): CheckView[] {
+  return JSON.parse(getBook().checks());
+}
+
+export function signoffStatus(table: TableId): SignoffStatus[] {
+  return JSON.parse(getBook().signoff_status(table));
+}
+
+export function rangeHash(table: TableId, r0: number, c0: number, r1: number, c1: number): string {
+  return getBook().range_hash(table, r0, c0, r1, c1);
+}
+
+/** Values of a reference text (`Sales::B2:B13`, `Sales[Revenue]`, a name) as a 2-D array, or null when it does not resolve. */
+export function resolveValues(table: TableId, reference: string): (number | string | boolean | null | { e: string })[][] | null {
+  if (!book || !reference.trim()) return null;
+  const out = JSON.parse(book.resolve_values(table, reference));
+  return Array.isArray(out) ? out : null;
 }
 
 /** Build a throw-away Book from a checkpoint and a list of ops (history replay). */

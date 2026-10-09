@@ -204,7 +204,22 @@ fn walk_deps(e: &Expr, wb: &Workbook, current: TableId, out: &mut Vec<Rect>, dep
                 }
             }
         }
-        Expr::Call(_, args) => args.iter().for_each(|a| walk_deps(a, wb, current, out, depth)),
+        Expr::Call(name, args) => {
+            if name.eq_ignore_ascii_case("FX") {
+                if let Some(t) = fx_table(wb) {
+                    if t.rows > 0 && t.cols > 0 {
+                        out.push(Rect {
+                            table: t.id,
+                            r0: 0,
+                            c0: 0,
+                            r1: t.rows - 1,
+                            c1: t.cols - 1,
+                        });
+                    }
+                }
+            }
+            args.iter().for_each(|a| walk_deps(a, wb, current, out, depth))
+        }
         Expr::Neg(x) | Expr::Percent(x) => walk_deps(x, wb, current, out, depth),
         Expr::Binary(_, l, r) => {
             walk_deps(l, wb, current, out, depth);
@@ -866,7 +881,7 @@ const LIFTED: &[&str] = &[
     "ISBLANK", "ISNUMBER", "ISTEXT", "ISLOGICAL", "ISERROR", "ISNA", "ISEVEN", "ISODD", "LEN", "UPPER", "LOWER", "PROPER", "TRIM", "LEFT", "RIGHT", "MID",
     "FIND", "SEARCH", "SUBSTITUTE", "REPT", "VALUE", "TEXT", "EXACT", "N", "T", "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "WEEKDAY", "EDATE",
     "EOMONTH", "DAYS", "DATE", "DATEVALUE", "TIME", "YEARFRAC", "DATEDIF", "WORKDAY", "EFFECT", "NOMINAL", "PMT", "PV", "FV", "NPER", "RATE", "IPMT", "PPMT",
-    "SLN", "SWITCH",
+    "SLN", "SWITCH", "AGE_BUCKET",
 ];
 
 fn call(name: &str, raw_args: &[Expr], ctx: &Ctx, depth: u32) -> Arg {
@@ -2048,6 +2063,227 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
             nums.sort_by(|x, y| x.partial_cmp(y).unwrap());
             n(if name == "SMALL" { nums[k - 1] } else { nums[nums.len() - k] })
         }
+        // ---------------- review & finance primitives ----------------
+        "CHECK" => {
+            // CHECK(condition, [label]) — TRUE/FALSE; collected by the Review panel
+            let c = try_bool!(a(0));
+            b(c)
+        }
+        "FX" => {
+            // FX(amount, from, to, [date]) against a table named "FX" (Date | From | To | Rate)
+            let amount = try_num!(a(0));
+            let from = try_text!(a(1)).trim().to_ascii_uppercase();
+            let to = try_text!(a(2)).trim().to_ascii_uppercase();
+            if from.is_empty() || to.is_empty() {
+                return Arg::err(ErrorKind::Value);
+            }
+            if from == to {
+                return n(amount);
+            }
+            let date = match args.get(3).map(|x| x.clone().scalar()) {
+                None | Some(Value::Empty) => ctx.now,
+                Some(v) => try_num!(v),
+            };
+            match fx_rate(ctx.wb, &from, &to, date) {
+                Some(rate) => n(amount * rate),
+                None => Arg::err(ErrorKind::NA),
+            }
+        }
+        "FXRATE" => {
+            let from = try_text!(a(0)).trim().to_ascii_uppercase();
+            let to = try_text!(a(1)).trim().to_ascii_uppercase();
+            if from == to {
+                return n(1.0);
+            }
+            let date = match args.get(2).map(|x| x.clone().scalar()) {
+                None | Some(Value::Empty) => ctx.now,
+                Some(v) => try_num!(v),
+            };
+            match fx_rate(ctx.wb, &from, &to, date) {
+                Some(rate) => n(rate),
+                None => Arg::err(ErrorKind::NA),
+            }
+        }
+        "RECONCILE" => {
+            // RECONCILE(rangeA, rangeB, [tolerance]) → Key | A | B | Difference | Status
+            let (ra, rb) = match (args.first(), args.get(1)) {
+                (Some(x), Some(y)) => (x.as_array(), y.as_array()),
+                _ => return Arg::err(ErrorKind::Value),
+            };
+            let tol = match args.get(2).map(|x| x.clone().scalar()) {
+                None | Some(Value::Empty) => 0.005,
+                Some(v) => try_num!(v).abs(),
+            };
+            let side = |arr: &Array| -> Vec<(String, f64)> {
+                let mut out = vec![];
+                for r in 0..arr.rows {
+                    let row = arr.row(r);
+                    let (key, amt) = if arr.cols >= 2 {
+                        let amount = row.iter().skip(1).rev().find_map(|v| match v {
+                            Value::Number(x) => Some(*x),
+                            _ => None,
+                        });
+                        (row[0].to_display(), amount)
+                    } else {
+                        match &row[0] {
+                            Value::Number(x) => (row[0].to_display(), Some(*x)),
+                            Value::Empty => (String::new(), None),
+                            v => (v.to_display(), Some(1.0)),
+                        }
+                    };
+                    let key = key.trim().to_string();
+                    if key.is_empty() && amt.is_none() {
+                        continue;
+                    }
+                    if key.is_empty() {
+                        continue;
+                    }
+                    out.push((key, amt.unwrap_or(0.0)));
+                }
+                out
+            };
+            let (la, lb) = (side(&ra), side(&rb));
+            let mut keys: Vec<String> = vec![];
+            let mut sum_a: std::collections::HashMap<String, (f64, u32)> = std::collections::HashMap::new();
+            let mut sum_b: std::collections::HashMap<String, (f64, u32)> = std::collections::HashMap::new();
+            for (k, v) in &la {
+                let e = sum_a.entry(k.clone()).or_insert((0.0, 0));
+                e.0 += v;
+                e.1 += 1;
+                if !keys.contains(k) {
+                    keys.push(k.clone());
+                }
+            }
+            for (k, v) in &lb {
+                let e = sum_b.entry(k.clone()).or_insert((0.0, 0));
+                e.0 += v;
+                e.1 += 1;
+                if !keys.contains(k) {
+                    keys.push(k.clone());
+                }
+            }
+            keys.sort_by(|x, y| compare(&Value::Text(x.clone()), &Value::Text(y.clone())));
+            let mut rows: Vec<Vec<Value>> = vec![vec![
+                Value::Text("Key".into()),
+                Value::Text("A".into()),
+                Value::Text("B".into()),
+                Value::Text("Difference".into()),
+                Value::Text("Status".into()),
+            ]];
+            for k in keys {
+                let a_v = sum_a.get(&k).copied();
+                let b_v = sum_b.get(&k).copied();
+                let (va, vb) = (a_v.map(|x| x.0).unwrap_or(0.0), b_v.map(|x| x.0).unwrap_or(0.0));
+                let diff = ((va - vb) * 1e9).round() / 1e9;
+                let status = match (a_v, b_v) {
+                    (Some(_), None) => "Only in A",
+                    (None, Some(_)) => "Only in B",
+                    _ => {
+                        if diff.abs() <= tol {
+                            "Matched"
+                        } else {
+                            "Difference"
+                        }
+                    }
+                };
+                let key_val = crate::model::parse_number_literal(&k).map(Value::Number).unwrap_or(Value::Text(k.clone()));
+                rows.push(vec![
+                    key_val,
+                    if a_v.is_some() { Value::Number(va) } else { Value::Empty },
+                    if b_v.is_some() { Value::Number(vb) } else { Value::Empty },
+                    Value::Number(diff),
+                    Value::Text(status.into()),
+                ]);
+            }
+            Arg::Array(Array::from_rows(rows))
+        }
+        "AGE_BUCKET" => {
+            // AGE_BUCKET(date, [as_of], [bucket_edges]) → "0-30" | "31-60" | ... | "90+" ("Not due" for future dates)
+            let d = try_num!(a(0));
+            let as_of = match args.get(1).map(|x| x.clone().scalar()) {
+                None | Some(Value::Empty) => ctx.now.floor(),
+                Some(v) => try_num!(v),
+            };
+            let edges = match ageing_edges(args.get(2)) {
+                Ok(e) => e,
+                Err(e) => return Arg::err(e),
+            };
+            let age = (as_of - d).floor() as i64;
+            t(bucket_label(age, &edges))
+        }
+        "AGEING" | "AGING" => {
+            // AGEING(dates, amounts, [as_of], [bucket_edges]) → Bucket | Count | Amount | Share
+            let dates = match args.first() {
+                Some(x) => x.as_array(),
+                None => return Arg::err(ErrorKind::Value),
+            };
+            let amounts = match args.get(1) {
+                Some(x) => x.as_array(),
+                None => Array { rows: dates.rows, cols: dates.cols, data: vec![Value::Number(1.0); (dates.rows * dates.cols) as usize] },
+            };
+            let as_of = match args.get(2).map(|x| x.clone().scalar()) {
+                None | Some(Value::Empty) => ctx.now.floor(),
+                Some(v) => try_num!(v),
+            };
+            let edges = match ageing_edges(args.get(3)) {
+                Ok(e) => e,
+                Err(e) => return Arg::err(e),
+            };
+            let mut labels: Vec<String> = vec!["Not due".into()];
+            let mut lo = 0i64;
+            for e in &edges {
+                labels.push(format!("{}-{}", lo, e));
+                lo = e + 1;
+            }
+            labels.push(format!("{}+", edges.last().copied().unwrap_or(0) + 1));
+            let mut count = vec![0u32; labels.len()];
+            let mut total = vec![0f64; labels.len()];
+            for i in 0..dates.data.len() {
+                let d = match &dates.data[i] {
+                    Value::Number(x) => *x,
+                    Value::Text(s) => match parse_date_time_text(s) {
+                        Some((x, _)) => x,
+                        None => continue,
+                    },
+                    _ => continue,
+                };
+                let amt = match amounts.data.get(i) {
+                    Some(Value::Number(x)) => *x,
+                    Some(Value::Empty) | None => 0.0,
+                    Some(Value::Error(e)) => return Arg::err(e.clone()),
+                    Some(_) => 0.0,
+                };
+                let age = (as_of - d).floor() as i64;
+                let idx = bucket_index(age, &edges);
+                count[idx] += 1;
+                total[idx] += amt;
+            }
+            let grand: f64 = total.iter().sum();
+            let mut rows: Vec<Vec<Value>> = vec![vec![
+                Value::Text("Bucket".into()),
+                Value::Text("Count".into()),
+                Value::Text("Amount".into()),
+                Value::Text("Share".into()),
+            ]];
+            for (i, l) in labels.iter().enumerate() {
+                if i == 0 && count[0] == 0 {
+                    continue; // hide "Not due" when nothing is in the future
+                }
+                rows.push(vec![
+                    Value::Text(l.clone()),
+                    Value::Number(count[i] as f64),
+                    Value::Number(total[i]),
+                    if grand != 0.0 { Value::Number(total[i] / grand) } else { Value::Empty },
+                ]);
+            }
+            rows.push(vec![
+                Value::Text("Total".into()),
+                Value::Number(count.iter().sum::<u32>() as f64),
+                Value::Number(grand),
+                if grand != 0.0 { Value::Number(1.0) } else { Value::Empty },
+            ]);
+            Arg::Array(Array::from_rows(rows))
+        }
         _ => Arg::err(ErrorKind::Name),
     }
 }
@@ -2405,4 +2641,164 @@ pub fn format_text(v: &Value, fmt: &str) -> String {
     let neg = x < 0.0 && num.chars().any(|c| c.is_ascii_digit() && c != '0');
     let pct_s = if pct { "%" } else { "" };
     format!("{}{}{}{}{}", if neg { "-" } else { "" }, prefix, num, pct_s, suffix)
+}
+
+
+// ---------------------------------------------------------------------------
+// FX and ageing helpers
+// ---------------------------------------------------------------------------
+
+/// The workbook's rate table: a table named "FX" (case-insensitive).
+pub fn fx_table(wb: &Workbook) -> Option<&crate::model::Table> {
+    wb.tables.iter().find(|t| t.name.eq_ignore_ascii_case("FX"))
+}
+
+/// Rate `from` → `to` on `date` (latest row on or before the date): direct, inverse, or
+/// triangulated through one common currency. Columns are found by header text
+/// (Date / From / To / Rate), falling back to the first four columns.
+pub fn fx_rate(wb: &Workbook, from: &str, to: &str, date: f64) -> Option<f64> {
+    let t = fx_table(wb)?;
+    if t.rows <= t.header_rows {
+        return None;
+    }
+    let col = |names: &[&str], fallback: u32| -> Option<u32> {
+        for n in names {
+            if let Some(c) = t.column_by_header(n) {
+                return Some(c);
+            }
+        }
+        if fallback < t.cols {
+            Some(fallback)
+        } else {
+            None
+        }
+    };
+    let has_date = ["date", "data", "as of", "asof"].iter().any(|n| t.column_by_header(n).is_some());
+    let (c_date, c_from, c_to, c_rate) = if has_date || t.cols >= 4 {
+        (
+            col(&["date", "data", "as of", "asof"], 0),
+            col(&["from", "de", "base", "ccy", "currency", "moeda"], 1)?,
+            col(&["to", "para", "quote", "counter"], 2)?,
+            col(&["rate", "taxa", "câmbio", "cambio", "fx"], 3)?,
+        )
+    } else {
+        (None, col(&["from", "de", "base", "ccy", "currency", "moeda"], 0)?, col(&["to", "para", "quote", "counter"], 1)?, col(&["rate", "taxa", "câmbio", "cambio", "fx"], 2)?)
+    };
+    // (from, to) → (date, rate) picking the latest date ≤ `date`
+    let mut quotes: Vec<(String, String, f64, f64)> = vec![];
+    for r in t.header_rows..t.rows {
+        let f = t.value_at(CellKey::new(r, c_from)).to_display().trim().to_ascii_uppercase();
+        let q = t.value_at(CellKey::new(r, c_to)).to_display().trim().to_ascii_uppercase();
+        let rate = match t.value_at(CellKey::new(r, c_rate)) {
+            Value::Number(x) if x > 0.0 => x,
+            Value::Text(s) => match crate::model::parse_number_literal(&s) {
+                Some(x) if x > 0.0 => x,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let d = match c_date {
+            Some(c) => match t.value_at(CellKey::new(r, c)) {
+                Value::Number(x) => x,
+                Value::Text(s) => match parse_date_time_text(&s) {
+                    Some((x, _)) => x,
+                    None => 0.0,
+                },
+                _ => 0.0,
+            },
+            None => 0.0,
+        };
+        if f.is_empty() || q.is_empty() || d > date + 1e-9 {
+            continue;
+        }
+        quotes.push((f, q, d, rate));
+    }
+    let best = |f: &str, q: &str| -> Option<f64> {
+        let mut out: Option<(f64, f64)> = None;
+        for (qf, qq, d, rate) in &quotes {
+            if qf == f && qq == q {
+                let better = match out {
+                    None => true,
+                    Some((bd, _)) => *d >= bd,
+                };
+                if better {
+                    out = Some((*d, *rate));
+                }
+            }
+        }
+        out.map(|x| x.1)
+    };
+    if let Some(r) = best(from, to) {
+        return Some(r);
+    }
+    if let Some(r) = best(to, from) {
+        return Some(1.0 / r);
+    }
+    // one hop through a common currency
+    let mut currencies: Vec<String> = quotes.iter().flat_map(|q| [q.0.clone(), q.1.clone()]).collect();
+    currencies.sort();
+    currencies.dedup();
+    for mid in currencies {
+        if mid == from || mid == to {
+            continue;
+        }
+        let leg1 = best(from, &mid).or_else(|| best(&mid, from).map(|r| 1.0 / r));
+        let leg2 = best(&mid, to).or_else(|| best(to, &mid).map(|r| 1.0 / r));
+        if let (Some(a), Some(b)) = (leg1, leg2) {
+            return Some(a * b);
+        }
+    }
+    None
+}
+
+fn ageing_edges(arg: Option<&Arg>) -> Result<Vec<i64>, ErrorKind> {
+    let mut edges: Vec<i64> = match arg {
+        None => vec![30, 60, 90],
+        Some(a) => {
+            let mut v = vec![];
+            for x in a.values() {
+                match x {
+                    Value::Empty => {}
+                    Value::Error(e) => return Err(e),
+                    other => v.push(to_number(&other)? as i64),
+                }
+            }
+            if v.is_empty() {
+                vec![30, 60, 90]
+            } else {
+                v
+            }
+        }
+    };
+    edges.sort();
+    edges.dedup();
+    if edges.iter().any(|e| *e < 0) {
+        return Err(ErrorKind::Value);
+    }
+    Ok(edges)
+}
+
+/// 0 = not due (negative age), 1..=edges.len() = bucket, edges.len()+1 = beyond the last edge.
+fn bucket_index(age: i64, edges: &[i64]) -> usize {
+    if age < 0 {
+        return 0;
+    }
+    for (i, e) in edges.iter().enumerate() {
+        if age <= *e {
+            return i + 1;
+        }
+    }
+    edges.len() + 1
+}
+
+fn bucket_label(age: i64, edges: &[i64]) -> String {
+    let idx = bucket_index(age, edges);
+    if idx == 0 {
+        return "Not due".into();
+    }
+    if idx == edges.len() + 1 {
+        return format!("{}+", edges.last().copied().unwrap_or(0) + 1);
+    }
+    let lo = if idx == 1 { 0 } else { edges[idx - 2] + 1 };
+    format!("{}-{}", lo, edges[idx - 1])
 }

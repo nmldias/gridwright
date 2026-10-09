@@ -13,8 +13,8 @@ export async function saveCurrentFile(): Promise<void> {
       const info = await api.files.save(st.fileId, st.fileName, json, getClientId(), st.seq);
       if (info.seq > getState().seq) useStore.setState({ seq: info.seq });
     } else {
-      const info = await api.files.create(st.fileName, json);
-      useStore.setState({ fileId: info.id, seq: info.seq ?? 0 });
+      const info = await api.files.create(st.fileName, json, getClientId(), st.fileFolder);
+      useStore.setState({ fileId: info.id, seq: info.seq ?? 0, permission: info.permission ?? 'own' });
       joinFile(info.id);
     }
     useStore.setState({ dirty: false });
@@ -28,7 +28,7 @@ export async function openFile(id: string): Promise<void> {
   try {
     const f = await api.files.get(id);
     await book.loadBook(f.json, f.name, f.id);
-    useStore.setState({ seq: f.seq ?? 0 });
+    useStore.setState({ seq: f.seq ?? 0, permission: f.permission ?? 'own', fileFolder: f.folder ?? '' });
     joinFile(f.id);
     setStatus(`Opened ${f.name}`, 1500);
   } catch (e) {
@@ -36,8 +36,9 @@ export async function openFile(id: string): Promise<void> {
   }
 }
 
-export async function newFile(name = 'Untitled'): Promise<void> {
+export async function newFile(name = 'Untitled', folder = ''): Promise<void> {
   await book.loadBook(null, name, null);
+  useStore.setState({ permission: 'own', fileFolder: folder });
   joinFile(null);
 }
 

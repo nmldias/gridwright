@@ -26,6 +26,13 @@ jobs:
         ports: ['54329:5432']
         options: >-
           --health-cmd "pg_isready -U gw" --health-interval 5s --health-timeout 5s --health-retries 20
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: 'Y'
+          MSSQL_SA_PASSWORD: 'Gridwright!2026'
+          MSSQL_PID: Developer
+        ports: ['14333:1433']
     steps:
       - uses: actions/checkout@v4
 
@@ -65,10 +72,14 @@ jobs:
         run: |
           pip install -q playwright && python3 -m playwright install --with-deps chromium >/dev/null
           (cd server && GRIDWRIGHT_DATA=/tmp/gw-data PORT=8787 node dist/index.js > /tmp/server.log 2>&1 &)
+          (cd server && GRIDWRIGHT_DATA=/tmp/gw-acl GRIDWRIGHT_TRUST_TAILSCALE=1 GRIDWRIGHT_ADMINS=boss@example.com PORT=8795 node dist/index.js > /tmp/server-acl.log 2>&1 &)
           node e2e/mock-llm.mjs > /tmp/mock.log 2>&1 &
-          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8787/api/health >/dev/null && break; sleep 1; done
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8787/api/health >/dev/null && curl -fsS http://127.0.0.1:8795/api/health >/dev/null && break; sleep 1; done
           python3 e2e/smoke.py http://127.0.0.1:8787 --python
           python3 e2e/features.py http://127.0.0.1:8787 --pg 127.0.0.1:54329:demo:gw:gw --mock-llm http://127.0.0.1:8899/v1
+          python3 e2e/features2.py http://127.0.0.1:8787 --pg 127.0.0.1:54329:demo:gw:gw --mock-llm http://127.0.0.1:8899/v1 --acl http://127.0.0.1:8795
+      - name: SQL Server driver
+        run: python3 e2e/sqlserver.py http://127.0.0.1:8787 --mssql '127.0.0.1:14333:master:sa:Gridwright!2026'
       - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4

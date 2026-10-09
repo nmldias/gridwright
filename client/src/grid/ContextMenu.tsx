@@ -5,6 +5,8 @@ import { clearSelection, copySelection, deleteSelectedTable, makeCodeCell, paste
 import { colToLetters, refText } from '../engine/types';
 import type { Hit } from './geometry';
 import { exportTableXlsx } from '../ui/xlsx';
+import { insertChart, traceActiveCell } from '../ui/review';
+import { openPrintView } from '../ui/print';
 
 interface MenuState {
   x: number;
@@ -106,9 +108,23 @@ export function ContextMenu({ host }: { host: HTMLElement | null }) {
           })}
           {item('Cell history', () => useStore.setState({ panel: 'history', historyCell: { table: sel.table, row: sel.ar, col: sel.ac } }), !getState().fileId)}
           {sep}
+          {item('Insert chart from selection', () => insertChart())}
+          {item(rows > 1 || cols > 1 ? 'Merge cells' : 'Unmerge cells', () => {
+            const meta = getState().tables.get(sel.table);
+            const hasMerge = meta?.merges?.some((m) => m.r0 <= sel.r1 && sel.r0 <= m.r1 && m.c0 <= sel.c1 && sel.c0 <= m.c1);
+            if (hasMerge) book.apply({ type: 'unmerge_cells', table: sel.table, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 });
+            else book.apply({ type: 'merge_cells', table: sel.table, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 });
+          })}
+          {item('Sign off selection…', () => useStore.setState({ panel: 'review' }))}
+          {item('Trace precedents / dependents', () => {
+            traceActiveCell();
+            useStore.setState({ panel: 'review' });
+          })}
+          {sep}
           {item('Table settings…', () => useStore.setState({ panel: 'table', selectedTable: sel.table }))}
           {item('Export table as CSV', () => exportTableCsv(sel.table))}
           {item('Export table as .xlsx', () => void exportTableXlsx(sel.table))}
+          {item('Print table', () => openPrintView({ tables: [sel.table], charts: [] }))}
           {item('Delete table', () => {
             useStore.setState({ selectedTable: sel.table });
             deleteSelectedTable();

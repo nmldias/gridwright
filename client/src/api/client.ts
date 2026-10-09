@@ -5,6 +5,22 @@ export interface FileInfo {
   name: string;
   updatedAt: string;
   size: number;
+  folder?: string;
+  owner?: string;
+  ownerName?: string;
+  public?: 'edit' | 'view' | 'none';
+  shared?: number;
+  permission?: 'none' | 'view' | 'sign' | 'edit' | 'own';
+}
+
+export interface FileAccess {
+  owner: string;
+  ownerName?: string;
+  public: 'edit' | 'view' | 'none';
+  shares: Record<string, 'view' | 'edit' | 'sign'>;
+  folder: string;
+  permission: 'none' | 'view' | 'sign' | 'edit' | 'own';
+  identity: boolean;
 }
 
 export interface ConnectionInfo {
@@ -46,6 +62,11 @@ export interface HistoryEntry {
 
 export type SqlParam = string | number | boolean | null;
 
+export type ToolEvent =
+  | { kind: 'call'; id: string; name: string; args: Record<string, unknown> }
+  | { kind: 'result'; id: string; name: string; ok: boolean; summary: string; result?: unknown }
+  | { kind: 'notice'; text: string };
+
 async function j<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`;
@@ -71,11 +92,20 @@ export const api = {
     async list(): Promise<FileInfo[]> {
       return j(await fetch('/api/files'));
     },
-    async get(id: string): Promise<{ id: string; name: string; json: string; seq: number }> {
+    async get(id: string): Promise<{ id: string; name: string; json: string; seq: number; permission?: FileInfo['permission']; folder?: string }> {
       return j(await fetch(`/api/files/${encodeURIComponent(id)}`));
     },
-    async create(name: string, json: string, client?: string): Promise<FileInfo & { seq: number }> {
-      return j(await fetch('/api/files', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name, json, client }) }));
+    async create(name: string, json: string, client?: string, folder?: string): Promise<FileInfo & { seq: number }> {
+      return j(await fetch('/api/files', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name, json, client, folder }) }));
+    },
+    async access(id: string): Promise<FileAccess> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/access`));
+    },
+    async setAccess(id: string, patch: Partial<Pick<FileAccess, 'public' | 'shares' | 'folder' | 'owner' | 'ownerName'>>): Promise<FileAccess> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/access`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch) }));
+    },
+    historyCsvUrl(id: string): string {
+      return `/api/files/${encodeURIComponent(id)}/history.csv`;
     },
     async save(id: string, name: string, json: string, client?: string, seq?: number): Promise<FileInfo & { seq: number }> {
       return j(
@@ -139,11 +169,16 @@ export const api = {
       return j(await fetch('/api/ai/models'));
     },
     /** Streams assistant text chunks; resolves with the full text. */
-    async chat(messages: { role: string; content: string }[], onChunk: (text: string) => void, signal?: AbortSignal): Promise<string> {
+    async chat(
+      messages: { role: string; content: string }[],
+      onChunk: (text: string) => void,
+      signal?: AbortSignal,
+      opts: { tools?: boolean; file?: string | null; onTool?: (ev: ToolEvent) => void } = {},
+    ): Promise<string> {
       const res = await fetch('/api/ai/chat', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ messages }),
+        body: JSON.stringify({ messages, tools: !!opts.tools, file: opts.file ?? undefined }),
         signal,
       });
       if (!res.ok || !res.body) {
@@ -173,6 +208,9 @@ export const api = {
           try {
             const obj = JSON.parse(data);
             if (obj.error) throw new Error(obj.error);
+            if (obj.tool) opts.onTool?.({ kind: 'call', id: obj.tool.id, name: obj.tool.name, args: obj.tool.args });
+            if (obj.tool_result) opts.onTool?.({ kind: 'result', id: obj.tool_result.id, name: obj.tool_result.name, ok: obj.tool_result.ok, summary: obj.tool_result.summary, result: obj.tool_result.result });
+            if (obj.notice) opts.onTool?.({ kind: 'notice', text: obj.notice });
             const delta: string = obj.text ?? '';
             if (delta) {
               full += delta;

@@ -5,7 +5,9 @@ import * as book from './engine/book';
 import { GridCanvas } from './grid/GridCanvas';
 import { useStore } from './state/store';
 import { AiPanel } from './ui/AiPanel';
+import { ChartPanel } from './ui/ChartPanel';
 import { CodePanel } from './ui/CodePanel';
+import { ReviewPanel } from './ui/ReviewPanel';
 import { FilesPanel } from './ui/FilesPanel';
 import { FormatPanel } from './ui/FormatPanel';
 import { FormulaBar } from './ui/FormulaBar';
@@ -129,6 +131,8 @@ export function App() {
             {panel === 'table' && <TablePanel />}
             {panel === 'format' && <FormatPanel />}
             {panel === 'history' && <HistoryPanel />}
+            {panel === 'chart' && <ChartPanel />}
+            {panel === 'review' && <ReviewPanel />}
             {panel === 'settings' && <SettingsPanel />}
           </aside>
         )}

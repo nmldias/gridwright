@@ -4,8 +4,10 @@
 
 import type { IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
+import { canEdit, canSign, canView, permissionFor, readAccess, SIGN_OPS, type Permission } from './access.js';
 import { appendEntry, currentSeq, entriesSince, writeCheckpoint, type Author } from './history.js';
 import { identityOf, type Identity } from './identity.js';
+import { readFile } from './storage.js';
 
 interface Peer {
   id: string;
@@ -31,6 +33,12 @@ export function attachMultiplayer(wss: WebSocketServer) {
       return;
     }
     const identity = identityOf(req);
+    // per-document access: the socket of someone who may not even see the document is closed
+    const permission: Permission = readFile(file) ? permissionFor(readAccess(file), identity) : identity.role === 'viewer' ? 'view' : 'own';
+    if (!canView(permission)) {
+      ws.close(1008, 'no access to this document');
+      return;
+    }
     let room = rooms.get(file);
     if (!room) {
       room = new Map();
@@ -52,7 +60,7 @@ export function attachMultiplayer(wss: WebSocketServer) {
     const author = (): Author => ({ id: client, name: peer.name, login: identity.login || undefined });
 
     // tell the client where the log stands so it can catch up after a reconnect
-    send(peer, JSON.stringify({ type: 'welcome', seq: currentSeq(file), you: { name: peer.name, login: identity.login, role: identity.role } }));
+    send(peer, JSON.stringify({ type: 'welcome', seq: currentSeq(file), you: { name: peer.name, login: identity.login, role: identity.role, permission } }));
 
     ws.on('message', (data) => {
       const text = data.toString();
@@ -77,11 +85,12 @@ export function attachMultiplayer(wss: WebSocketServer) {
           broadcastPresence();
           break;
         case 'op': {
-          if (identity.role === 'viewer') {
-            send(peer, JSON.stringify({ type: 'rejected', cid: msg.cid, reason: 'read-only access' }));
+          if (!msg.op || typeof msg.op !== 'object') return;
+          const allowed = canEdit(permission) || (canSign(permission) && SIGN_OPS.has(String(msg.op.type)));
+          if (!allowed) {
+            send(peer, JSON.stringify({ type: 'rejected', cid: msg.cid, reason: canSign(permission) ? 'you may only sign off on this document' : 'read-only access' }));
             return;
           }
-          if (!msg.op || typeof msg.op !== 'object') return;
           const origin = typeof msg.origin === 'string' ? msg.origin.slice(0, 16) : 'user';
           const seq = appendEntry(file, { author: author(), origin, op: msg.op, note: typeof msg.note === 'string' ? msg.note.slice(0, 200) : undefined });
           broadcastAll(JSON.stringify({ type: 'op', seq, client, cid: msg.cid, op: msg.op, origin, author: author() }));
@@ -89,7 +98,7 @@ export function attachMultiplayer(wss: WebSocketServer) {
         }
         case 'snapshot': {
           // undo/redo (or a bulk change) replaced the whole document: checkpoint + broadcast
-          if (identity.role === 'viewer' || typeof msg.json !== 'string') return;
+          if (!canEdit(permission) || typeof msg.json !== 'string') return;
           const seq = appendEntry(file, { author: author(), origin: typeof msg.origin === 'string' ? msg.origin.slice(0, 16) : 'user', checkpoint: true, note: typeof msg.note === 'string' ? msg.note.slice(0, 200) : 'snapshot' });
           writeCheckpoint(file, seq, msg.json);
           const relay = JSON.stringify({ type: 'snapshot', seq, client, json: msg.json });

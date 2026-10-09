@@ -1,6 +1,6 @@
 // Table layout math and hit testing in world (canvas) coordinates.
 
-import type { TableId, TableMeta } from '../engine/types';
+import type { Chart, TableId, TableMeta } from '../engine/types';
 
 export const TITLE_H = 22; // table title bar above the grid
 export const TAB_SIZE = 18; // reference tabs (column letters / row numbers) shown when a table is selected
@@ -8,6 +8,7 @@ export const HANDLE = 12; // resize handle size
 export const HANDLE_GAP = 6; // gap between the table edge and its handles
 export const SNAP = 8; // move snapping grid
 export const FILTER_BTN = 14; // header filter button size
+export const CHART_HANDLE = 12; // chart resize handle size
 
 export interface Layout {
   colX: number[]; // cumulative x offsets, length cols + 1
@@ -72,7 +73,20 @@ export type Hit =
   | { kind: 'row-tab'; table: TableId; r: number }
   | { kind: 'select-all'; table: TableId }
   | { kind: 'fill'; table: TableId }
-  | { kind: 'filter'; table: TableId; c: number };
+  | { kind: 'filter'; table: TableId; c: number }
+  | { kind: 'chart'; id: number }
+  | { kind: 'chart-resize'; id: number };
+
+/** Charts float above tables: the topmost chart under the pointer wins. */
+export function hitChart(charts: Chart[], wx: number, wy: number, selected: number | null, zoom: number, touch = false): Hit | null {
+  const tol = (touch ? 12 : 6) / zoom;
+  for (let i = charts.length - 1; i >= 0; i--) {
+    const c = charts[i];
+    if (selected === c.id && Math.abs(wx - (c.x + c.w)) <= CHART_HANDLE / 2 + tol && Math.abs(wy - (c.y + c.h)) <= CHART_HANDLE / 2 + tol) return { kind: 'chart-resize', id: c.id };
+    if (wx >= c.x && wx <= c.x + c.w && wy >= c.y && wy <= c.y + c.h) return { kind: 'chart', id: c.id };
+  }
+  return null;
+}
 
 export function hitTest(
   tables: Map<TableId, TableMeta>,
@@ -154,6 +168,8 @@ function within(x: number, y: number, x0: number, y0: number, size: number) {
 }
 
 export function cursorFor(h: Hit): string {
+  if (h.kind === 'chart') return 'move';
+  if (h.kind === 'chart-resize') return 'nwse-resize';
   switch (h.kind) {
     case 'cell':
       return 'cell';

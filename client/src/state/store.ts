@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { CellRef, CellView, NamedRange, TableId, TableMeta } from '../engine/types';
+import type { CellRef, CellView, Chart, NamedRange, TableId, TableMeta, Trace } from '../engine/types';
 
 export interface Selection {
   table: TableId;
@@ -24,7 +24,7 @@ export interface Editing {
   source?: 'cell' | 'bar';
 }
 
-export type Panel = 'none' | 'code' | 'ai' | 'sql' | 'files' | 'table' | 'settings' | 'history' | 'format';
+export type Panel = 'none' | 'code' | 'ai' | 'sql' | 'files' | 'table' | 'settings' | 'history' | 'format' | 'chart' | 'review';
 
 export interface Presence {
   id: string;
@@ -46,6 +46,13 @@ export interface Me {
   name: string;
   role: 'admin' | 'editor' | 'viewer';
   identity: boolean;
+}
+
+/** What the current user may do with the open document (server-side sharing). */
+export type Permission = 'none' | 'view' | 'sign' | 'edit' | 'own';
+
+export interface TraceState extends Trace {
+  cell: CellRef;
 }
 
 export interface FilterPopover {
@@ -85,6 +92,13 @@ interface State {
   historyCell: CellRef | null;
   filterPopover: FilterPopover | null;
   touch: boolean;
+  charts: Chart[];
+  selectedChart: number | null;
+  /** precedents/dependents overlay of a cell (Review panel) */
+  trace: TraceState | null;
+  /** sharing level of the open document */
+  permission: Permission;
+  fileFolder: string;
   set: (patch: Partial<State>) => void;
 }
 
@@ -114,6 +128,11 @@ export const useStore = create<State>((set) => ({
   seq: 0,
   historyCell: null,
   filterPopover: null,
+  charts: [],
+  selectedChart: null,
+  trace: null,
+  permission: 'own',
+  fileFolder: '',
   touch: typeof window !== 'undefined' && (navigator.maxTouchPoints > 0 || 'ontouchstart' in window) && !matchMedia('(pointer: fine)').matches,
   set: (patch) => set(patch),
 }));
@@ -122,6 +141,12 @@ export const getState = () => useStore.getState();
 
 export function cellAt(table: TableId, r: number, c: number): CellView | undefined {
   return getState().cells.get(table)?.get(r * 65536 + c);
+}
+
+/** True when the open document cannot be edited by this user. */
+export function readOnly(): boolean {
+  const st = getState();
+  return st.me.role === 'viewer' || st.permission === 'view' || st.permission === 'sign' || st.permission === 'none';
 }
 
 export function setStatus(msg: string, ms = 4000) {

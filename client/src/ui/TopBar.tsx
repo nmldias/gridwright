@@ -4,6 +4,8 @@ import { addTable, applyFormat, makeCodeCell, toggleBold } from '../grid/actions
 import { NUMBER_FORMATS } from '../grid/format';
 import { useStore, type Panel } from '../state/store';
 import { saveCurrentFile } from './files';
+import { openPrintView } from './print';
+import { insertChart } from './review';
 
 const FILLS = ['', '#fef3c7', '#dcfce7', '#dbeafe', '#fce7f3', '#f3f4f6', '#fee2e2'];
 const COLORS = ['', '#111827', '#b91c1c', '#1d4ed8', '#047857', '#6b7280', '#7c3aed'];
@@ -16,6 +18,16 @@ export function TopBar() {
   const panel = useStore((s) => s.panel);
   const me = useStore((s) => s.me);
   const touch = useStore((s) => s.touch);
+  const permission = useStore((s) => s.permission);
+  const selection = useStore((s) => s.selection);
+  const wrapOn = useStore((s) => {
+    const sel = s.selection;
+    return !!sel && !!s.cells.get(sel.table)?.get(sel.ar * 65536 + sel.ac)?.f?.wrap;
+  });
+  const merged = useStore((s) => {
+    const sel = s.selection;
+    return !!sel && !!s.tables.get(sel.table)?.merges?.some((m) => m.r0 <= sel.r1 && sel.r0 <= m.r1 && m.c0 <= sel.c1 && sel.c0 <= m.c1);
+  });
   const [renaming, setRenaming] = useState(false);
   const [nameDraft, setNameDraft] = useState(fileName);
 
@@ -86,6 +98,9 @@ export function TopBar() {
       <button onClick={() => makeCodeCell('sql')} title="Turn the selected cell into a SQL cell (query result spills from it)">
         SQL
       </button>
+      <button onClick={() => insertChart()} title="Insert a chart built from the selection (exhibit style)">
+        + Chart
+      </button>
       <span className="sep" />
       <button onClick={() => toggleBold()} title="Bold (Ctrl+B)">
         <b>B</b>
@@ -98,6 +113,21 @@ export function TopBar() {
       </button>
       <button onClick={() => applyFormat({ align: 'right' })} title="Align right">
         ⇥
+      </button>
+      <button className={wrapOn ? 'active' : ''} onClick={() => applyFormat({ wrap: !wrapOn })} title="Wrap text in the selected cells">
+        ↵
+      </button>
+      <button
+        className={merged ? 'active' : ''}
+        disabled={!selection || (selection.r0 === selection.r1 && selection.c0 === selection.c1 && !merged)}
+        onClick={() => {
+          const sel = selection!;
+          if (merged) book.apply({ type: 'unmerge_cells', table: sel.table, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 });
+          else book.apply({ type: 'merge_cells', table: sel.table, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 });
+        }}
+        title={merged ? 'Unmerge cells' : 'Merge the selected cells (the top-left value is kept)'}
+      >
+        ⊞
       </button>
       <select className="fmt-select" defaultValue="" onChange={(e) => applyFormat({ number_format: e.target.value })} title="Number format">
         {NUMBER_FORMATS.map((f) => (
@@ -121,14 +151,20 @@ export function TopBar() {
         ))}
       </div>
       <span className="grow" />
-      {me.role === 'viewer' && <span className="pill">read-only</span>}
+      {(me.role === 'viewer' || permission === 'view') && <span className="pill">read-only</span>}
+      {permission === 'sign' && me.role !== 'viewer' && <span className="pill">sign-off only</span>}
       {btn('table', 'Table', 'Table inspector: name, size, header row, pivot')}
       {btn('format', 'Rules', 'Conditional formatting, validation, names')}
+      {btn('chart', 'Chart', 'Charts as exhibits: title, series, highlight, benchmark, export')}
+      {btn('review', 'Review', 'Sign-offs, checks and precedent/dependent tracing')}
       {btn('code', 'Code', 'Code editor for Python / JavaScript / SQL cells')}
       {btn('sql', 'DB', 'Database connections and ad-hoc queries')}
       {btn('ai', 'AI', 'AI assistant')}
       {btn('history', 'History', 'Audit trail: every change, by whom, restore versions')}
-      {btn('files', 'Files', 'Open, save, import, export')}
+      {btn('files', 'Files', 'Open, save, import, export, sharing')}
+      <button onClick={() => openPrintView()} title="Print or save as PDF: tables and charts">
+        Print
+      </button>
       {btn('settings', '⚙', 'Settings')}
       {touch && (
         <button className={panel === 'none' ? '' : 'active'} onClick={() => useStore.setState({ panel: 'none' })} title="Close panel">

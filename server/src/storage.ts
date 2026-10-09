@@ -75,7 +75,7 @@ export function listFiles(): FileMeta[] {
   ensureDirs();
   const out: FileMeta[] = [];
   for (const f of readdirSync(FILES_DIR)) {
-    if (!f.endsWith('.json')) continue;
+    if (!f.endsWith('.json') || f.endsWith('.meta.json')) continue;
     const id = f.slice(0, -5);
     const p = join(FILES_DIR, f);
     try {

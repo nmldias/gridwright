@@ -19,12 +19,16 @@ An AI-native spreadsheet with free-floating, resizable tables on an infinite can
 | **Python cells** | Pyodide (WebAssembly) in a web worker; `q.cells("A1:B5")`, `q.df("Table 2::A1:D20")` (pandas), `q.table()`; the last expression spills; packages auto-load from imports; matplotlib figures render on the canvas; cells re-run when the cells they read change. The runtime can be served by the server (`--pyodide`) so nothing is fetched from the internet. |
 | **JavaScript cells** | Isolated worker, `async` allowed, `return` a value / list / 2-D array / array of objects. |
 | **SQL** | PostgreSQL, MySQL/MariaDB and **SQL Server** (Cegid Primavera, Azure SQL) connections, credentials encrypted at rest. **SQL cells** run a query from a cell: `{{A1}}` / `{{Orders::B2}}` bind cell values as parameters (a range becomes a list for `IN (…)`), the result spills, the cell re-runs when its parameters change, and can refresh on a schedule (30 s … 1 h). |
-| **AI assistant** | Any OpenAI-compatible chat endpoint (vLLM, Ollama, llama.cpp, OpenRouter, OpenAI, Anthropic compatibility). Every proposal is shown as a **before → after diff**; nothing is written until you apply it, and applied changes are logged with origin *AI*. |
-| **Audit trail** | The server sequences every change into a per-document log (who, when, from a person / the AI / a code cell / an import), with checkpoints at each save. The History panel lists changes, filters them per cell, and can restore or download any earlier version. |
-| **Multiplayer** | Server-ordered operations: concurrent edits converge on every client (cell-level conflicts rebase, structural conflicts resync from the log), presence cursors with names. |
-| **Identity & roles** | Behind `tailscale serve`, the server trusts Tailscale's identity headers: names in presence and history, `GRIDWRIGHT_ADMINS` (connections, AI settings, backups) and `GRIDWRIGHT_READONLY` (viewers). |
-| **Files** | Saved on the server as JSON, autosave, import CSV/TSV/Excel/JSON, **export to .xlsx** (one sheet per table, formulas, formats, widths), CSV per table, one-click backup of the whole data directory, nightly backup timer. |
-| **Editing** | Excel-like keyboard model, formula bar, number formats, bold/alignment/colours, copy/cut/paste with other apps, fill handle, right-click menu, undo/redo, selection statistics. Touch: drag pans, tap selects, tap again edits, long-press opens the menu, pinch zooms; phone layout. |
+| **Charts (exhibits)** | Charts are objects on the canvas, drawn by the WebGL renderer and exported as SVG/PNG from the same layout. Column, horizontal bar, line, area, stacked and waterfall; an uppercase *EXHIBIT N — TOPIC* tag, an action title that states the takeaway, a grey subtitle with dataset and units, direct series labels (no legend), one highlighted observation in coral, a dashed benchmark line with an inline label, three stat cards and a source footnote. `+ Chart` builds one from the selection (header row → series names); drag to move, corner handle to resize, double-click to edit. The assistant can add charts too (`add_chart`). |
+| **Review: sign-offs** | Select a range → *Sign off*: who, when, a note and a fingerprint of the values are recorded as an operation (so it is in the audit log). The badge turns amber the moment any value inside changes; a locked range refuses manual edits until unlocked. Share a document at *sign off* level to let a reviewer attest without editing. |
+| **Review: checks & trace** | `=CHECK(condition, "label")` cells are collected in the Review panel (passing / failing). *Trace* shows precedents (navy) and dependents (coral) of the active cell on the canvas; Ctrl+[ / Ctrl+] walk through them. |
+| **Finance primitives** | `FX(amount, "USD", "AOA", [date])` and `FXRATE()` against a table named **FX** (Date \| From \| To \| Rate: latest rate on or before the date, inverse and triangulated rates); `RECONCILE(rangeA, rangeB, [tolerance])` spills Key \| A \| B \| Difference \| Status (Matched / Only in A / Only in B / Difference); `AGEING(dates, amounts, [as_of], [edges])` spills Bucket \| Count \| Amount \| Share; `AGE_BUCKET(date)` labels a row. Templates: accounts payable ageing, bank reconciliation, treasury position (with a Primavera SQL placeholder). |
+| **AI assistant** | Any OpenAI-compatible chat endpoint (vLLM, Ollama, llama.cpp, OpenRouter, OpenAI, Anthropic compatibility). Every proposal is shown as a **before → after diff**; nothing is written until you apply it, and applied changes are logged with origin *AI*. With tools on, the model can call read-only server tools — `run_sql` (SELECT only, ≤200 rows), `list_tables`, `describe_table`, `read_history` — and every call and result is shown in the chat. Endpoints without function calling fall back automatically. |
+| **Audit trail** | The server sequences every change into a per-document log (who, when, from a person / the AI / a code cell / an import), with checkpoints at each save (compacted: all from the last day, daily for 30 days, weekly after). The History panel lists changes, filters them per cell, restores or downloads any earlier version, **compares two versions** cell by cell, and exports the trail as **CSV**. |
+| **Multiplayer** | Server-ordered operations: concurrent edits converge on every client. In-flight cell edits are transformed past remote row/column inserts and deletes (operational transform), undo/redo travels as restore operations instead of document snapshots, remote changes never enter your own undo stack, structural conflicts resync from the log; presence cursors with names. |
+| **Identity, roles & sharing** | Behind `tailscale serve`, the server trusts Tailscale's identity headers: names in presence and history, `GRIDWRIGHT_ADMINS` (connections, AI settings, backups) and `GRIDWRIGHT_READONLY` (viewers). Per document: an owner, *everyone can edit / view / nothing*, and shares per login at view / sign-off / edit level, enforced on REST and WebSocket. Folders group documents. |
+| **Files** | Saved on the server as JSON, autosave, import CSV/TSV/Excel/JSON, **export to .xlsx** (one sheet per table, formulas, formats, widths), CSV per table, **print / save as PDF** (tables as HTML, charts as SVG), one-click backup of the whole data directory, nightly backup timer. |
+| **Editing** | Excel-like keyboard model, formula bar, number formats, bold/alignment/colours, **merged cells**, **wrapped text**, header rows that stay visible while scrolling, copy/cut/paste with other apps, fill handle, right-click menu, undo/redo, selection statistics. Touch: drag pans, tap selects, tap again edits, long-press opens the menu, pinch zooms; phone layout. |
 
 ![Python cell spilling a DataFrame](docs/python-cell.png)
 
@@ -34,15 +38,18 @@ An AI-native spreadsheet with free-floating, resizable tables on an infinite can
 core/     Rust crate → WebAssembly (wasm-bindgen). Model (workbook → tables → sparse cells), formula
           lexer/parser/evaluator with array lifting, dependency graph with cached deps and topological
           recalculation (cycles → #CYCLE!), dynamic-array spills, pivots, filters, validation,
-          undo/redo, JSON ops API. 24 unit tests.
+          sign-offs (value fingerprints, locks), merges, charts as workbook objects, precedent/dependent
+          tracing, undo/redo that emits restore operations, JSON ops API. 29 unit tests.
 client/   Vite + React + TypeScript. PixiJS v8 WebGL renderer (viewport culling, pooled bitmap text,
           on-demand frames, conditional formats), pointer/keyboard/touch controller, CodeMirror 6,
           zustand store (cell maps patched in place), workers for Python (Pyodide) and JavaScript,
-          SQL/AI/history/rules panels, SheetJS import/export.
-server/   Node 22 + Express + ws. Static client, documents on disk, the per-document operation log
-          and checkpoints (data/history), SQL connections (pg, mysql2, mssql), streaming AI proxy,
-          identity (Tailscale headers), backups, optional self-hosted Pyodide, WebSocket sequencer.
-          No database required.
+          chart layout shared by the Pixi and SVG backends, Review/Chart/SQL/AI/history/rules panels,
+          print view, SheetJS import/export.
+server/   Node 22 + Express + ws. Static client, documents on disk with per-document access metadata
+          (owner, shares, folder), the per-document operation log, checkpoints and audit CSV
+          (data/history), SQL connections (pg, mysql2, mssql), streaming AI proxy with a server-side
+          tool loop (read-only SQL, schema, history), identity (Tailscale headers), backups, optional
+          self-hosted Pyodide, WebSocket sequencer. No database required.
 ```
 
 Every change is an *operation* (`set_cell`, `resize_table`, `set_pivot`, `set_filters`, …). The client applies it optimistically, the server assigns it a sequence number, appends it to the document's log and broadcasts it; clients apply remote operations in server order and rebase or resync when an in-flight operation crosses a remote one. Code-cell results are derived state: each client recomputes them and they are not logged.
@@ -108,9 +115,15 @@ SELECT region, SUM(amount) AS total FROM orders WHERE invoice_date >= {{B1}} AND
 
 **AI.** AI panel → ⚙ → base URL + model (the model list is fetched from the endpoint). Proposals appear as a diff with Apply/Dismiss; Ctrl+Z reverts applied ones.
 
-**History.** History panel → list of changes with author and origin; *download as of here* builds the document as it was; *restore* makes it the current version (recorded as a new change, undo also works).
+**History.** History panel → list of changes with author and origin; *download as of here* builds the document as it was; *restore* makes it the current version (recorded as a new change, undo also works); *compare…* on two entries lists every cell that differs; *CSV* downloads the audit trail.
 
-**Keyboard.** Enter/F2 edit · typing replaces · Enter ↓ / Tab → · arrows, Shift+arrows, Ctrl+arrows · Ctrl+C/X/V · Ctrl+Z/Y · Ctrl+B bold · Ctrl+D fill down · Ctrl+A select table · Ctrl+Shift+L filter · Delete clears · wheel pans, Ctrl+wheel zooms, Space+drag pans · Ctrl+Enter runs a code cell · Ctrl+S saves.
+**Charts.** Select the data (header row included) → `+ Chart`. The Chart panel sets the exhibit tag, title, subtitle, source, categories and series ranges (`Sales::B2:B13` or `Sales[Revenue]`), the highlighted category, a reference line, value labels and stat cards; *Download SVG / PNG* and *Print* use the same layout as the canvas.
+
+**Review.** Review panel → *Sign off selection* (optionally locking it); the list shows each sign-off with *unchanged* / *changed since*. `=CHECK(D20 = SUM(D2:D19), "Total ties")` cells are listed as checks. *Trace active cell* overlays precedents and dependents; Ctrl+[ and Ctrl+] jump through them.
+
+**Sharing.** Files panel (identity on): everyone-on-this-server *can edit / can view / no access*, plus shares per login at *view*, *sign off* or *edit* level; the owner (document creator, or an admin) changes these. Folders are free text (`Finance/2026`).
+
+**Keyboard.** Enter/F2 edit · typing replaces · Enter ↓ / Tab → · arrows, Shift+arrows, Ctrl+arrows · Ctrl+C/X/V · Ctrl+Z/Y · Ctrl+B bold · Ctrl+D fill down · Ctrl+A select table · Ctrl+Shift+L filter · Ctrl+[ / Ctrl+] trace · Delete clears (or deletes the selected chart) · wheel pans, Ctrl+wheel zooms, Space+drag pans · Ctrl+Enter runs a code cell · Ctrl+S saves.
 
 ![Two clients on one document](docs/multiplayer.png)
 
@@ -121,25 +134,29 @@ Measured in headless Chromium with software WebGL (SwiftShader): filling a 5 000
 ## Tests
 
 ```bash
-cd core && cargo test                                   # engine: 24 tests
-python3 e2e/smoke.py http://localhost:8787 --python     # editing, handles, code cells, save/open (22 checks)
-node e2e/mock-llm.mjs &                                 # mock model for the assistant
+cd core && cargo test                                   # engine: 29 tests
+python3 e2e/smoke.py http://localhost:8787 --python     # editing, handles, code cells, save/open (21 checks)
+node e2e/mock-llm.mjs &                                 # mock model for the assistant (also plays a tool round)
 python3 e2e/features.py http://localhost:8787 --pg host:port:db:user:pass --mock-llm http://127.0.0.1:8899/v1
                                                         # arrays, refs, filters, rules, pivots, SQL cells, history,
                                                         # AI diff, convergence, touch (40 checks)
+python3 e2e/features2.py http://localhost:8787 --pg … --mock-llm … --acl http://127.0.0.1:8795
+                                                        # charts, sign-offs, CHECK/FX/RECONCILE/AGEING, trace, merges,
+                                                        # undo as ops, OT, audit CSV, AI tools, templates, sharing (43 checks)
+python3 e2e/sqlserver.py http://localhost:8787 --mssql host:port:db:user:pass   # SQL Server driver (5 checks)
 python3 e2e/perf.py http://localhost:8787               # fill / edit / frame timings
 ```
 
-CI (`.github/workflows/ci.yml`) runs all of this on every push, publishes the prebuilt tree to the `release` branch and a multi-arch image to GHCR.
+CI (`.github/workflows/ci.yml`) runs all of this on every push against PostgreSQL and SQL Server containers plus a second server with identity on, publishes the prebuilt tree to the `release` branch and a multi-arch image to GHCR.
 
 ## Limitations (honest list)
 
-- No cell merging, text wrapping or freeze panes. Charts come only from Python (matplotlib) cells.
-- Conditional-format *formula* rules are evaluated per visible cell on each redraw (fine up to a few thousand cells per rule).
-- Multiplayer: structural conflicts (two people inserting rows at once) resolve by resyncing from the server's log — correct but visible as a brief reload. Code-cell outputs are recomputed by every client rather than shared.
-- SQL Server support uses the `mssql`/tedious driver with `trustServerCertificate`; it has not been exercised against a Primavera instance here — report the first error you see.
-- The AI assistant needs a model that follows the JSON action format; small local models may need a retry.
-- Single document store, one role model (admin / editor / viewer); put it behind Tailscale or a reverse proxy for anything beyond a trusted network.
+- No freeze panes beyond the sticky header row of the selected table; merged cells cannot span a header/body boundary meaningfully; row heights do not auto-grow for wrapped text.
+- Charts cover the exhibit styles above (no pie, scatter or secondary axes); a chart reads its ranges on every change, so keep series under a few thousand points.
+- Multiplayer: two people changing the *structure* of the same table at once (inserting rows while another resizes) still resolve by resyncing from the server's log — correct but visible as a brief reload. Code-cell outputs are recomputed by every client rather than shared.
+- SQL Server is exercised in CI against the official container, not yet against a Primavera instance — report the first error you see.
+- The AI assistant needs a model that follows the JSON action format and, for tools, OpenAI-style function calling; small local models may need a retry.
+- Sharing is enforced by the server only when identity is on (Tailscale headers); without identity every document is open to whoever reaches the server. Put it behind Tailscale or a reverse proxy for anything beyond a trusted network.
 
 ## Licence
 

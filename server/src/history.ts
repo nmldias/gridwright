@@ -30,7 +30,6 @@ export interface LogEntry {
 }
 
 const HISTORY_DIR = () => join(DATA_DIR, 'history');
-const MAX_CHECKPOINTS = 40;
 const safeId = (id: string) => /^[a-zA-Z0-9_-]{1,64}$/.test(id);
 
 const seqCache = new Map<string, number>();
@@ -139,17 +138,134 @@ export function checkpointSeqs(fileId: string): number[] {
     .sort((a, b) => a - b);
 }
 
-function pruneCheckpoints(fileId: string) {
+const DAY = 86_400_000;
+
+/**
+ * Checkpoint retention: everything from the last 24 h, one per day for 30 days, one per week
+ * after that, and always the first and the latest. Ages come from the files' mtimes.
+ */
+export function compactCheckpoints(fileId: string, now = Date.now()): number[] {
   const seqs = checkpointSeqs(fileId);
-  if (seqs.length <= MAX_CHECKPOINTS) return;
-  // keep the first one and the most recent ones
-  const drop = seqs.slice(1, seqs.length - (MAX_CHECKPOINTS - 1));
-  for (const s of drop) {
+  if (seqs.length <= 2) return [];
+  const dir = cpDir(fileId);
+  const aged = seqs.map((seq) => {
+    let age = 0;
     try {
-      unlinkSync(join(cpDir(fileId), `${s}.json`));
+      age = now - statSync(join(dir, `${seq}.json`)).mtimeMs;
+    } catch {
+      /* treat as new */
+    }
+    return { seq, age };
+  });
+  const keep = new Set<number>([seqs[0], seqs[seqs.length - 1]]);
+  const buckets = new Set<string>();
+  // newest first so the most recent checkpoint of each day / week is the one kept
+  for (const { seq, age } of [...aged].sort((a, b) => a.age - b.age)) {
+    if (age < DAY) {
+      keep.add(seq);
+      continue;
+    }
+    const key = age < 30 * DAY ? `d${Math.floor(age / DAY)}` : `w${Math.floor(age / (7 * DAY))}`;
+    if (!buckets.has(key)) {
+      buckets.add(key);
+      keep.add(seq);
+    }
+  }
+  const dropped: number[] = [];
+  for (const s of seqs) {
+    if (keep.has(s)) continue;
+    try {
+      unlinkSync(join(dir, `${s}.json`));
+      dropped.push(s);
     } catch {
       /* ignore */
     }
+  }
+  return dropped;
+}
+
+function pruneCheckpoints(fileId: string) {
+  compactCheckpoints(fileId);
+}
+
+/** Audit trail as CSV (one line per log entry). */
+export function historyCsv(fileId: string): string {
+  const esc = (v: unknown) => {
+    const s = v === undefined || v === null ? '' : String(v);
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = ['seq,timestamp,author,login,origin,type,table,range,detail,note'];
+  for (const e of readAll(fileId)) {
+    const op = e.op ?? {};
+    const type = e.checkpoint && !e.op ? 'checkpoint' : String(op.type ?? '');
+    const d = describeOp(op);
+    lines.push([e.seq, e.ts, e.author?.name ?? '', e.author?.login ?? '', e.origin, type, op.table ?? '', d.range, d.detail, e.note ?? ''].map(esc).join(','));
+  }
+  return lines.join('\n') + '\n';
+}
+
+export function colLetters(col: number): string {
+  let s = '';
+  let c = col + 1;
+  while (c > 0) {
+    const r = (c - 1) % 26;
+    s = String.fromCharCode(65 + r) + s;
+    c = Math.floor((c - 1) / 26);
+  }
+  return s;
+}
+const a1 = (r: unknown, c: unknown) => `${colLetters(Number(c))}${Number(r) + 1}`;
+
+/** Human-readable range and detail of an op (for the CSV and the history panel). */
+export function describeOp(op: Record<string, unknown>): { range: string; detail: string } {
+  const n = (k: string) => Number(op[k]);
+  const rect = () => `${a1(op.r0, op.c0)}:${a1(op.r1, op.c1)}`;
+  switch (op.type) {
+    case 'set_cell':
+      return { range: a1(op.row, op.col), detail: String(op.input ?? '').slice(0, 500) };
+    case 'set_cells': {
+      const values = (op.values as unknown[][]) ?? [];
+      const cols = Math.max(1, ...values.map((r) => r.length));
+      return { range: `${a1(op.row, op.col)}:${a1(n('row') + values.length - 1, n('col') + cols - 1)}`, detail: `${values.length}×${cols} values` };
+    }
+    case 'clear_range':
+      return { range: rect(), detail: 'cleared' };
+    case 'set_format':
+      return { range: rect(), detail: JSON.stringify(op.format ?? {}).slice(0, 300) };
+    case 'insert_rows':
+    case 'delete_rows':
+      return { range: `row ${n('at') + 1}`, detail: `${op.count} row(s)` };
+    case 'insert_cols':
+    case 'delete_cols':
+      return { range: `column ${colLetters(n('at'))}`, detail: `${op.count} column(s)` };
+    case 'add_table':
+      return { range: '', detail: `${op.name ?? 'table'} ${op.rows}×${op.cols}` };
+    case 'rename_table':
+      return { range: '', detail: `→ ${op.name}` };
+    case 'add_signoff':
+      return { range: rect(), detail: `${op.by ?? ''}${op.locked ? ' (locked)' : ''}${op.note ? ': ' + op.note : ''}` };
+    case 'remove_signoff':
+      return { range: '', detail: `sign-off #${op.id} removed` };
+    case 'set_signoff_locked':
+      return { range: '', detail: `sign-off #${op.id} ${op.locked ? 'locked' : 'unlocked'}` };
+    case 'merge_cells':
+    case 'unmerge_cells':
+      return { range: rect(), detail: op.type === 'merge_cells' ? 'merged' : 'unmerged' };
+    case 'add_chart':
+    case 'update_chart': {
+      const c = (op.chart as Record<string, unknown>) ?? {};
+      return { range: '', detail: `${c.kind ?? 'chart'}: ${String(c.title ?? '').slice(0, 120)}` };
+    }
+    case 'delete_chart':
+      return { range: '', detail: `chart #${op.id} deleted` };
+    case 'set_name':
+      return { range: '', detail: `${op.name} = ${op.reference ?? '(removed)'}` };
+    case 'restore_cells':
+      return { range: '', detail: `${(op.cells as unknown[])?.length ?? 0} cell(s) restored (undo/redo)` };
+    case 'restore_tables':
+      return { range: '', detail: `${(op.tables as unknown[])?.length ?? 0} table(s) restored (undo/redo)` };
+    default:
+      return { range: '', detail: '' };
   }
 }
 
@@ -165,7 +281,8 @@ export function replayBundle(fileId: string, seq: number): { checkpointSeq: numb
 
 /** Does an op touch a given cell? (used for per-cell history) */
 export function opTouchesCell(op: Record<string, unknown>, table: number, row: number, col: number): boolean {
-  if (op.table !== table && op.type !== 'add_table') return false;
+  if (op.table !== table && op.type !== 'add_table' && op.type !== 'restore_cells' && op.type !== 'restore_tables') return false;
+  if (op.type === 'restore_tables') return ((op.tables as { id: number }[]) ?? []).some((t) => t.id === table);
   const num = (k: string) => Number(op[k]);
   switch (op.type) {
     case 'set_cell':
@@ -191,7 +308,14 @@ export function opTouchesCell(op: Record<string, unknown>, table: number, row: n
     case 'resize_table':
     case 'delete_table':
     case 'set_pivot':
+    case 'restore_tables':
       return true;
+    case 'merge_cells':
+    case 'unmerge_cells':
+    case 'add_signoff':
+      return row >= num('r0') && row <= num('r1') && col >= num('c0') && col <= num('c1');
+    case 'restore_cells':
+      return ((op.cells as { table: number; row: number; col: number }[]) ?? []).some((c) => c.table === table && c.row === row && c.col === col);
     default:
       return false;
   }

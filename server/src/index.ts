@@ -8,8 +8,9 @@ import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
+import { canEdit, canManage, canSign, canView, deleteAccess, normalise, permissionFor, readAccess, writeAccess, type FileAccess } from './access.js';
 import { chat } from './ai.js';
-import { appendEntry, checkpointSeqs, currentSeq, deleteHistory, opTouchesCell, readAll, recentEntries, replayBundle, writeCheckpoint } from './history.js';
+import { appendEntry, checkpointSeqs, compactCheckpoints, currentSeq, deleteHistory, historyCsv, opTouchesCell, readAll, recentEntries, replayBundle, writeCheckpoint } from './history.js';
 import { identityEnabled, identityOf } from './identity.js';
 import { attachMultiplayer, notifySaved } from './multiplayer.js';
 import { runQuery, testConnection, type Param } from './sql.js';
@@ -30,7 +31,7 @@ import {
   type StoredConnection,
 } from './storage.js';
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? '0.0.0.0';
 const TOKEN = process.env.GRIDWRIGHT_TOKEN ?? '';
@@ -74,7 +75,7 @@ const requireRole = (min: 'editor' | 'admin') => (req: Request, res: Response, n
 };
 
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, version: VERSION, multiplayer: true, pyodide: !!pyodideDir(), identity: identityEnabled, token: !!TOKEN });
+  res.json({ ok: true, version: VERSION, multiplayer: true, pyodide: !!pyodideDir(), identity: identityEnabled, token: !!TOKEN, tools: true });
 });
 app.get('/api/me', (req, res) => {
   const id = identityOf(req);
@@ -82,30 +83,64 @@ app.get('/api/me', (req, res) => {
 });
 
 // --- documents --------------------------------------------------------------------
-app.get('/api/files', (_req, res) => res.json(listFiles()));
+/** Permission of the caller on a document, or a 403/404 already sent. */
+function docPermission(req: Request, res: Response, need: 'view' | 'sign' | 'edit' | 'own'): { access: FileAccess; permission: ReturnType<typeof permissionFor> } | null {
+  const id = req.params.id;
+  if (!readFile(id)) {
+    res.status(404).json({ error: 'not found' });
+    return null;
+  }
+  const access = readAccess(id);
+  const permission = permissionFor(access, identityOf(req));
+  const ok = need === 'view' ? canView(permission) : need === 'sign' ? canSign(permission) : need === 'edit' ? canEdit(permission) : canManage(permission);
+  if (!ok) {
+    res.status(permission === 'none' ? 404 : 403).json({ error: permission === 'none' ? 'not found' : need === 'own' ? 'only the owner can do that' : 'read-only access to this document' });
+    return null;
+  }
+  return { access, permission };
+}
+
+app.get('/api/files', (req, res) => {
+  const id = identityOf(req);
+  const out = [];
+  for (const f of listFiles()) {
+    const access = readAccess(f.id);
+    const permission = permissionFor(access, id);
+    if (!canView(permission)) continue;
+    out.push({ ...f, folder: access.folder, owner: access.owner, ownerName: access.ownerName, public: access.public, shared: Object.keys(access.shares).length, permission });
+  }
+  res.json(out);
+});
 app.get('/api/files/:id', (req, res) => {
-  const f = readFile(req.params.id);
-  if (!f) return res.status(404).json({ error: 'not found' });
-  res.json({ ...f, seq: currentSeq(req.params.id) });
+  const p = docPermission(req, res, 'view');
+  if (!p) return;
+  const f = readFile(req.params.id)!;
+  res.json({ ...f, seq: currentSeq(req.params.id), permission: p.permission, folder: p.access.folder });
 });
 app.post('/api/files', requireRole('editor'), (req, res) => {
   try {
-    const { name, json, client } = req.body ?? {};
+    const { name, json, client, folder } = req.body ?? {};
     if (typeof json !== 'string') return res.status(400).json({ error: 'json (string) required' });
     const meta = writeFile(null, String(name || 'Untitled').slice(0, 120), json);
     const id = identityOf(req);
+    // with identity on, the creator owns the document (open to everyone on the server until restricted)
+    writeAccess(meta.id, normalise({ owner: identityEnabled ? id.login : '', ownerName: id.name || undefined, public: 'edit', shares: {}, folder: typeof folder === 'string' ? folder : '' }));
     const seq = appendEntry(meta.id, { author: { id: typeof client === 'string' ? client : 'api', name: id.name || 'Guest', login: id.login || undefined }, origin: 'user', checkpoint: true, note: 'created' });
     writeCheckpoint(meta.id, seq, json);
-    res.json({ ...meta, seq });
+    res.json({ ...meta, seq, permission: 'own' });
   } catch (e) {
     res.status(400).json({ error: (e as Error).message });
   }
 });
 app.put('/api/files/:id', requireRole('editor'), (req, res) => {
   try {
+    const p = docPermission(req, res, 'sign');
+    if (!p) return;
     const { name, json, client, seq } = req.body ?? {};
     if (typeof json !== 'string') return res.status(400).json({ error: 'json (string) required' });
-    const meta = writeFile(req.params.id, String(name || 'Untitled').slice(0, 120), json);
+    const current = readFile(req.params.id)!;
+    // a sign-only peer may only persist sign-offs: keep the stored name
+    const meta = writeFile(req.params.id, canEdit(p.permission) ? String(name || 'Untitled').slice(0, 120) : current.name, json);
     // checkpoint the saved state at the log position the client had applied (falls back to the current seq)
     const at = Number.isFinite(Number(seq)) && Number(seq) > 0 ? Number(seq) : currentSeq(req.params.id);
     if (!checkpointSeqs(req.params.id).includes(at)) {
@@ -124,18 +159,56 @@ app.put('/api/files/:id', requireRole('editor'), (req, res) => {
   }
 });
 app.delete('/api/files/:id', requireRole('editor'), (req, res) => {
+  const p = docPermission(req, res, 'own');
+  if (!p) return;
   if (!deleteFile(req.params.id)) return res.status(404).json({ error: 'not found' });
   deleteHistory(req.params.id);
+  deleteAccess(req.params.id);
   res.json({ ok: true });
+});
+// sharing & folders: {public, shares, folder}; folder alone may be changed by editors
+app.get('/api/files/:id/access', (req, res) => {
+  const p = docPermission(req, res, 'view');
+  if (!p) return;
+  res.json({ ...p.access, permission: p.permission, identity: identityEnabled });
+});
+app.put('/api/files/:id/access', requireRole('editor'), (req, res) => {
+  const p = docPermission(req, res, 'edit');
+  if (!p) return;
+  const b = req.body ?? {};
+  const next: FileAccess = { ...p.access };
+  if (typeof b.folder === 'string') next.folder = b.folder;
+  const managing = b.public !== undefined || b.shares !== undefined || b.owner !== undefined;
+  if (managing) {
+    if (!canManage(p.permission)) return res.status(403).json({ error: 'only the owner can change sharing' });
+    if (b.public !== undefined) next.public = b.public;
+    if (b.shares !== undefined && typeof b.shares === 'object') next.shares = b.shares;
+    if (typeof b.owner === 'string') {
+      next.owner = b.owner;
+      next.ownerName = typeof b.ownerName === 'string' ? b.ownerName : undefined;
+    }
+  }
+  const saved = normalise(next);
+  writeAccess(req.params.id, saved);
+  res.json({ ...saved, permission: permissionFor(saved, identityOf(req)), identity: identityEnabled });
 });
 
 // --- history (audit trail) ---------------------------------------------------------------
 app.get('/api/files/:id/history', (req, res) => {
+  if (!docPermission(req, res, 'view')) return;
   const limit = Math.min(1000, Math.max(1, Number(req.query.limit ?? 200)));
   const before = req.query.before ? Number(req.query.before) : undefined;
   res.json({ seq: currentSeq(req.params.id), entries: recentEntries(req.params.id, limit, before) });
 });
+app.get('/api/files/:id/history.csv', (req, res) => {
+  if (!docPermission(req, res, 'view')) return;
+  const name = (readFile(req.params.id)?.name ?? req.params.id).replace(/[^\w.-]+/g, '_');
+  res.setHeader('content-type', 'text/csv; charset=utf-8');
+  res.setHeader('content-disposition', `attachment; filename="${name}-audit.csv"`);
+  res.send('\ufeff' + historyCsv(req.params.id));
+});
 app.get('/api/files/:id/history/cell', (req, res) => {
+  if (!docPermission(req, res, 'view')) return;
   const table = Number(req.query.table);
   const row = Number(req.query.row);
   const col = Number(req.query.col);
@@ -147,11 +220,16 @@ app.get('/api/files/:id/history/cell', (req, res) => {
   res.json({ entries });
 });
 app.get('/api/files/:id/history/replay', (req, res) => {
+  if (!docPermission(req, res, 'view')) return;
   const seq = Number(req.query.seq);
   if (!Number.isFinite(seq)) return res.status(400).json({ error: 'seq required' });
   const bundle = replayBundle(req.params.id, seq);
   if (!bundle) return res.status(404).json({ error: 'no history' });
   res.json(bundle);
+});
+app.post('/api/files/:id/history/compact', requireRole('admin'), (req, res) => {
+  if (!docPermission(req, res, 'view')) return;
+  res.json({ dropped: compactCheckpoints(req.params.id), kept: checkpointSeqs(req.params.id) });
 });
 
 // --- connections --------------------------------------------------------------------
