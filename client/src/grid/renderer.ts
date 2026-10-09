@@ -69,6 +69,13 @@ function fit(s: string, maxW: number, bold: boolean): string {
   return s.slice(0, lo);
 }
 
+function luminance(rgb: number): number {
+  const r = ((rgb >> 16) & 255) / 255;
+  const g = ((rgb >> 8) & 255) / 255;
+  const b = (rgb & 255) / 255;
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
 function hexToNum(hex?: string): number | null {
   if (!hex) return null;
   const m = hex.trim().replace('#', '');
@@ -457,7 +464,9 @@ export class GridRenderer {
           const fitted = fit(text, maxW, bold);
           if (t.text !== fitted) t.text = fitted;
           const isErr = !!cell.v && typeof cell.v === 'object' && 'e' in cell.v;
-          const color = hexToNum(cond?.color ?? cell?.f?.color);
+          let color = hexToNum(cond?.color ?? cell?.f?.color);
+          // dark conditional fills get light text
+          if (color === null && cond?.fill && fill !== null && luminance(fill) < 0.45) color = 0xffffff;
           t.tint = isErr ? COLORS.error : color !== null ? color : cell.s ? 0x1e3a8a : COLORS.text;
           const tw = Math.min(t.width, maxW);
           t.x = align === 'right' ? x0 + w - PAD - tw - (avail === w ? headerReserve : 0) : align === 'center' ? x0 + (w - tw) / 2 : x0 + PAD;

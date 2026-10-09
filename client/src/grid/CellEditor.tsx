@@ -83,7 +83,9 @@ export function CellEditor({ renderer, tick }: { renderer: GridRenderer; tick: n
   };
 
   const minWidth = Math.max(w, 60);
-  const filtered = entries.filter((x) => !editorText || x.toLowerCase().includes(editorText.toLowerCase())).slice(0, 12);
+  // show every entry until the user types something new; then narrow the list
+  const typed = editing.replace || editorText !== editing.initial;
+  const filtered = (typed ? entries.filter((x) => !editorText || x.toLowerCase().includes(editorText.toLowerCase())) : entries).slice(0, 12);
   return (
     <div className="cell-editor-wrap" style={{ left: p.x, top: p.y }}>
       <textarea

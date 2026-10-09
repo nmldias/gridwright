@@ -139,8 +139,16 @@ export class GridController {
       if (!(h.kind === 'cell' && h.table === ed.table && h.r === ed.r && h.c === ed.c)) commitEdit(st.editorText, null);
     }
     const h = this.hit(x, y);
-    this.host.setPointerCapture(e.pointerId);
+    this.capture(e);
     this.beginHit(h, e, x, y, false);
+  }
+
+  private capture(e: PointerEvent) {
+    try {
+      this.host.setPointerCapture(e.pointerId);
+    } catch {
+      /* synthetic or already-released pointer */
+    }
   }
 
   /** Start the interaction for a hit (shared by mouse and touch). */
@@ -163,6 +171,8 @@ export class GridController {
         this.lastClick = { t: now, table: h.table, r: h.r, c: h.c };
         if (getState().selectedTable !== null && getState().selectedTable !== h.table) useStore.setState({ selectedTable: null });
         if (dbl) {
+          // keep the browser from moving focus to the canvas after the editor took it
+          e.preventDefault();
           selectCell(h.table, h.r, h.c);
           startEdit();
           this.mode = { kind: 'idle' };
@@ -225,7 +235,8 @@ export class GridController {
 
   // ---- touch ----------------------------------------------------------------
   private onTouchDown(e: PointerEvent) {
-    this.host.setPointerCapture(e.pointerId);
+    e.preventDefault(); // no synthetic mouse events / focus changes behind our back
+    this.capture(e);
     if (this.pointers.size >= 2) {
       // second finger: pinch zoom
       if (this.mode.kind === 'touch-wait') clearTimeout(this.mode.timer);
@@ -265,11 +276,7 @@ export class GridController {
   private beginPan(e: PointerEvent) {
     const rect = this.host.getBoundingClientRect();
     this.mode = { kind: 'pan', sx: e.clientX - rect.left, sy: e.clientY - rect.top, px: this.renderer.pan.x, py: this.renderer.pan.y };
-    try {
-      this.host.setPointerCapture(e.pointerId);
-    } catch {
-      /* ignore */
-    }
+    this.capture(e);
     this.host.style.cursor = 'grabbing';
   }
 

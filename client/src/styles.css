@@ -805,9 +805,16 @@ table.diff .arrow {
     min-height: 34px;
   }
   .topbar {
-    flex-wrap: wrap;
-    row-gap: 4px;
+    flex-wrap: nowrap;
     overflow-x: auto;
+    scrollbar-width: thin;
+    -webkit-overflow-scrolling: touch;
+  }
+  .topbar > * {
+    flex: none;
+  }
+  .topbar .swatches {
+    display: none;
   }
   .side {
     position: absolute;
