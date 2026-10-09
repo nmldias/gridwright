@@ -73,9 +73,10 @@ def main():
     else:
         print("SKIP network isolation (sandbox: none)")
     secret = os.path.join(DATA, "secret.key")
-    r = run("import os\nos.path.exists(%r), os.path.exists(%r)" % (secret, DATA))
+    # the directory name may survive as an empty mountpoint (when it lives under /tmp); its contents never do
+    r = run("import os\nos.path.exists(%r), (os.listdir(%r) if os.path.isdir(%r) else [])" % (secret, DATA, DATA))
     if sandbox == "bwrap":
-        check("the data directory (secrets, documents) is hidden from sandboxed code", r["ok"] and r["output"] == [[False], [False]], f"{r.get('output')} for {DATA}")
+        check("the data directory (secrets, documents) is hidden from sandboxed code", r["ok"] and r["output"] == [[False], ["[]"]], f"{r.get('output')} for {DATA}")
     else:
         print(f"SKIP data-directory hiding (sandbox: {sandbox})")
     r = run("while True: pass")
