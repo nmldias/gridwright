@@ -16,6 +16,7 @@ import { attachMultiplayer, notifyProposal as notifyProposalRoom, notifySaved } 
 import { handleMcp, setProposalNotifier } from './mcp.js';
 import { engineAvailable, errorMessage } from './headless.js';
 import { createProposal, decideProposal, getProposal, listProposals } from './proposals.js';
+import { probeGpu, probePython, pythonStatus, runPython, type Snapshot } from './pyrun.js';
 import { runQuery, testConnection, type Param } from './sql.js';
 import { authorizeQuery, canSeeConnection, SqlRefused } from './sqlpolicy.js';
 import {
@@ -35,7 +36,7 @@ import {
   type StoredConnection,
 } from './storage.js';
 
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? '0.0.0.0';
 const TOKEN = process.env.GRIDWRIGHT_TOKEN ?? '';
@@ -88,8 +89,32 @@ const requireRole = (min: 'editor' | 'admin') => (req: Request, res: Response, n
   next();
 };
 
+const publicPython = () => {
+  const p = pythonStatus();
+  return p.available ? { version: p.version, sandbox: p.sandbox, gpu: p.gpu, timeoutMs: p.limits.timeoutMs, memoryMb: p.limits.memoryMb } : null;
+};
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, version: VERSION, multiplayer: true, pyodide: !!pyodideDir(), identity: identityEnabled, token: !!TOKEN, tools: true, defaultSharing: DEFAULT_SHARING, mcp: engineAvailable() });
+  res.json({ ok: true, version: VERSION, multiplayer: true, pyodide: !!pyodideDir(), identity: identityEnabled, token: !!TOKEN, tools: true, defaultSharing: DEFAULT_SHARING, mcp: engineAvailable(), python: publicPython() });
+});
+
+// --- server-side Python cells -------------------------------------------------------------
+app.get('/api/python', (_req, res) => {
+  const p = pythonStatus();
+  res.json({ available: p.available, version: p.version, sandbox: p.sandbox, gpu: p.gpu, reason: p.reason, limits: p.limits, interpreter: p.interpreter });
+});
+// re-probe (after installing python, bubblewrap or cuDF) — administrators only
+app.post('/api/python/probe', requireRole('admin'), async (_req, res) => {
+  const p = await probePython(true);
+  if (p.available) await probeGpu();
+  res.json(pythonStatus());
+});
+// the client sends the code and a snapshot of the workbook (what the browser runtime would see)
+app.post('/api/python/run', requireRole('editor'), async (req, res) => {
+  const b = req.body ?? {};
+  const code = typeof b.code === 'string' ? b.code : '';
+  const snapshot = b.snapshot && Array.isArray(b.snapshot.tables) ? (b.snapshot as Snapshot) : { tables: [], current: { table: 0, row: 0, col: 0 } };
+  const r = await runPython(code, snapshot, b.gpu === true);
+  res.json(r);
 });
 app.get('/api/me', (req, res) => {
   const id = identityOf(req);
@@ -493,6 +518,7 @@ server.on('upgrade', (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
 });
 
+void probePython().then((p) => console.log(p.available ? `server-side Python: ${p.interpreter} ${p.version}, sandbox ${p.sandbox}` : `server-side Python off: ${p.reason}`));
 server.listen(PORT, HOST, () => {
   console.log(
     `gridwright ${VERSION} listening on http://${HOST}:${PORT}  data=${DATA_DIR}  client=${CLIENT_DIR}${TOKEN ? '  (token required)' : ''}${identityEnabled ? '  (trusting Tailscale identity headers)' : ''}${pyDir ? `  pyodide=${pyDir}` : ''}`,

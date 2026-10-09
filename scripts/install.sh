@@ -13,6 +13,12 @@
 #                      certificates enabled in the Tailscale admin console (DNS → HTTPS Certificates).
 #   --pyodide          download the Pyodide 0.27.5 distribution (~300 MB) into the data directory
 #                      so Python cells work without internet access.
+#   --python           create a Python virtual environment in the data directory (pandas, numpy,
+#                      matplotlib, openpyxl) for server-side Python cells. Without it the host's
+#                      python3 is used as it is. For GPU cells install RAPIDS into that venv:
+#                      ~/gridwright-data/pyenv/bin/pip install --extra-index-url=https://pypi.nvidia.com "cudf-cu13"
+#                      (pick the cuXX that matches `nvidia-smi`; see rapids.ai/start). Sandboxing is
+#                      strongest with bubblewrap: sudo apt install bubblewrap.
 #   --no-backup        do not install the nightly backup timer.
 #
 # Environment:
@@ -22,6 +28,10 @@
 #   GW_ADMINS    comma-separated Tailscale logins allowed to manage connections/AI/backups (with --tailscale)
 #   GW_READONLY  comma-separated Tailscale logins that may only view (with --tailscale)
 #   GW_DEFAULT_SHARING  sharing level of new documents: none (private, default with --tailscale), view or edit
+#   GW_PYTHON           interpreter for server-side Python cells (default: the --python venv, else python3); "off" disables
+#   GW_PYTHON_SANDBOX   auto (default: bubblewrap → user namespace → none), bwrap, unshare, none, or require
+#                       (refuse to run cells without a namespace sandbox)
+#   GW_PYTHON_TIMEOUT_MS, GW_PYTHON_MEMORY_MB, GW_PYTHON_CONCURRENCY   per-run limits (60000, 2048, 2)
 #   GW_BACKUP_DIR    where nightly backups go (default ~/gridwright-backups, 14 kept)
 #   GW_BACKUP_TARGET optional rsync destination for the backups, e.g. nmldias@100.78.161.2:gridwright-backups/
 #   AI_BASE_URL, AI_MODEL, AI_API_KEY   defaults for the assistant (also editable in the UI)
@@ -36,11 +46,13 @@ NODE_FALLBACK="v22.23.3"
 PYODIDE_VERSION="0.27.5"
 TAILSCALE=0
 PYODIDE=0
+PYVENV=0
 BACKUP=1
 for a in "$@"; do
   case "$a" in
     --tailscale) TAILSCALE=1 ;;
     --pyodide) PYODIDE=1 ;;
+    --python) PYVENV=1 ;;
     --no-backup) BACKUP=0 ;;
     -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
@@ -107,6 +119,22 @@ if [ "$TAILSCALE" = 1 ]; then
   TRUST=1
 fi
 
+# --- Python for server-side cells -----------------------------------------------------------
+if [ "$PYVENV" = 1 ]; then
+  command -v python3 >/dev/null 2>&1 || die "--python needs python3 on this host (sudo apt install python3 python3-venv)"
+  if [ -x "$DATA/pyenv/bin/python" ]; then
+    say "Python venv already present in $DATA/pyenv (upgrading packages)"
+  else
+    say "creating a Python venv in $DATA/pyenv"
+    python3 -m venv "$DATA/pyenv" || die "python3 -m venv failed (sudo apt install python3-venv)"
+  fi
+  "$DATA/pyenv/bin/pip" install -q --upgrade pip pandas numpy matplotlib openpyxl || die "pip install failed (is the internet reachable?)"
+  say "venv ready: $("$DATA/pyenv/bin/python" --version) with pandas $("$DATA/pyenv/bin/python" -c 'import pandas; print(pandas.__version__)')"
+fi
+if ! command -v bwrap >/dev/null 2>&1; then
+  echo "note: bubblewrap is not installed; server-side Python cells fall back to a user namespace (no network) or a plain process. Strongest isolation: sudo apt install bubblewrap" >&2
+fi
+
 # --- run it: systemd user service when available, nohup otherwise --------------------------
 unit_env() {
   cat <<EOF
@@ -120,6 +148,11 @@ Environment=GRIDWRIGHT_TRUST_TAILSCALE=$TRUST
 Environment=GRIDWRIGHT_ADMINS=${GW_ADMINS:-}
 Environment=GRIDWRIGHT_READONLY=${GW_READONLY:-}
 Environment=GRIDWRIGHT_DEFAULT_SHARING=${GW_DEFAULT_SHARING:-}
+Environment=GRIDWRIGHT_PYTHON=${GW_PYTHON:-}
+Environment=GRIDWRIGHT_PYTHON_SANDBOX=${GW_PYTHON_SANDBOX:-}
+Environment=GRIDWRIGHT_PYTHON_TIMEOUT_MS=${GW_PYTHON_TIMEOUT_MS:-}
+Environment=GRIDWRIGHT_PYTHON_MEMORY_MB=${GW_PYTHON_MEMORY_MB:-}
+Environment=GRIDWRIGHT_PYTHON_CONCURRENCY=${GW_PYTHON_CONCURRENCY:-}
 Environment=AI_BASE_URL=${AI_BASE_URL:-}
 Environment=AI_MODEL=${AI_MODEL:-}
 Environment=AI_API_KEY=${AI_API_KEY:-}
@@ -130,6 +163,7 @@ start_nohup() {
   pkill -f "$ROOT/server/dist/index.js" 2>/dev/null || true
   (cd server && PORT="$PORT" HOST="$HOST_BIND" GRIDWRIGHT_DATA="$DATA" CLIENT_DIR="$ROOT/client/dist" \
     GRIDWRIGHT_TOKEN="${GW_TOKEN:-}" GRIDWRIGHT_TRUST_TAILSCALE="$TRUST" GRIDWRIGHT_ADMINS="${GW_ADMINS:-}" GRIDWRIGHT_READONLY="${GW_READONLY:-}" GRIDWRIGHT_DEFAULT_SHARING="${GW_DEFAULT_SHARING:-}" \
+    GRIDWRIGHT_PYTHON="${GW_PYTHON:-}" GRIDWRIGHT_PYTHON_SANDBOX="${GW_PYTHON_SANDBOX:-}" GRIDWRIGHT_PYTHON_TIMEOUT_MS="${GW_PYTHON_TIMEOUT_MS:-}" GRIDWRIGHT_PYTHON_MEMORY_MB="${GW_PYTHON_MEMORY_MB:-}" GRIDWRIGHT_PYTHON_CONCURRENCY="${GW_PYTHON_CONCURRENCY:-}" \
     AI_BASE_URL="${AI_BASE_URL:-}" AI_MODEL="${AI_MODEL:-}" AI_API_KEY="${AI_API_KEY:-}" \
     setsid -f nohup "$NODE_BIN" "$ROOT/server/dist/index.js" > "$DATA/server.log" 2>&1 < /dev/null)
   say "started with nohup (no systemd user session); log: $DATA/server.log"
@@ -168,7 +202,7 @@ if [ "$BACKUP" = 1 ]; then
 set -euo pipefail
 stamp="\$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BACKUP_DIR"
-tar -czf "$BACKUP_DIR/gridwright-\$stamp.tar.gz" -C "$DATA" --exclude=./pyodide --exclude=./server.log --exclude=./backup.sh .
+tar -czf "$BACKUP_DIR/gridwright-\$stamp.tar.gz" -C "$DATA" --exclude=./pyodide --exclude=./pyenv --exclude=./server.log --exclude=./backup.sh .
 ls -1t "$BACKUP_DIR"/gridwright-*.tar.gz 2>/dev/null | tail -n +15 | xargs -r rm -f
 ${GW_BACKUP_TARGET:+rsync -a --delete "$BACKUP_DIR/" "$GW_BACKUP_TARGET" || echo "rsync to $GW_BACKUP_TARGET failed" >&2}
 echo "backup written: $BACKUP_DIR/gridwright-\$stamp.tar.gz"
@@ -208,6 +242,9 @@ for i in $(seq 1 30); do
   sleep 0.5
   [ "$i" -eq 30 ] && { [ -f "$DATA/server.log" ] && tail -n 30 "$DATA/server.log"; journalctl --user -u gridwright --no-pager -n 30 2>/dev/null || true; die "server did not answer on port $PORT"; }
 done
+
+py_line="$(curl -fsS -H "Authorization: Bearer ${GW_TOKEN:-}" "http://127.0.0.1:$PORT/api/health" 2>/dev/null | "$NODE_BIN" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const p=JSON.parse(s).python;process.stdout.write(p?`CPython ${p.version}, sandbox: ${p.sandbox}${p.gpu&&p.gpu.startsWith("cudf")?", GPU: "+p.gpu:", no GPU (cuDF not installed)"}`:"off — no python3 found (run with --python or set GW_PYTHON)")}catch{process.stdout.write("unknown")}})')"
+say "server-side Python cells: $py_line"
 
 if [ "$TAILSCALE" = 1 ]; then
   if tailscale serve --bg --https=443 "http://127.0.0.1:$PORT" >/dev/null 2>&1; then

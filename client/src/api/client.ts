@@ -108,9 +108,35 @@ async function j<T>(res: Response): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/** What /api/health says about server-side Python (null = off). */
+export interface ServerPython {
+  version: string;
+  sandbox: 'bwrap' | 'unshare' | 'none' | null;
+  gpu: string | null;
+  timeoutMs: number;
+  memoryMb: number;
+}
+export interface ServerPythonResult {
+  ok: boolean;
+  output?: unknown;
+  error?: string;
+  std_out: string;
+  deps: { table: number; r0: number; c0: number; r1: number; c1: number }[];
+  runtime: { name: string; version: string; packages: Record<string, string> };
+  ms: number;
+}
+
 export const api = {
-  async health(): Promise<{ ok: boolean; version: string; multiplayer: boolean; pyodide?: boolean; identity?: boolean }> {
+  async health(): Promise<{ ok: boolean; version: string; multiplayer: boolean; pyodide?: boolean; identity?: boolean; python?: ServerPython | null }> {
     return j(await fetch('/api/health'));
+  },
+  python: {
+    async run(code: string, snapshot: unknown, gpu: boolean): Promise<ServerPythonResult> {
+      return j(await fetch('/api/python/run', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code, snapshot, gpu }) }));
+    },
+    async status(): Promise<ServerPython & { available: boolean; reason?: string }> {
+      return j(await fetch('/api/python'));
+    },
   },
   async me(): Promise<{ login: string; name: string; role: 'admin' | 'editor' | 'viewer'; identity: boolean }> {
     return j(await fetch('/api/me'));

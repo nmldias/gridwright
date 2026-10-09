@@ -166,6 +166,22 @@ async function runSqlCell(ref: CellRef, id: number, code: string, conn: string |
   }
 }
 
+// --- Python on the server -------------------------------------------------------------------
+// Same snapshot the browser worker gets, same `q` API, same output shape; the run record says
+// "python-server" with the sandbox level and the packages the host used.
+async function runServerPython(ref: CellRef, id: number, code: string, gpu: boolean) {
+  const finish = (d: any) => handleResult({ data: { id, ...d } } as MessageEvent);
+  const snapshot = buildSnapshot(ref);
+  try {
+    const res = await api.python.run(code, snapshot, gpu);
+    const runtime: RunRuntime = res.runtime ?? { name: 'python-server', version: '', packages: {} };
+    if (res.ok) finish({ ok: true, output: res.output ?? null, std_out: res.std_out, deps: res.deps, runtime });
+    else finish({ ok: false, error: res.error || 'error', std_out: res.std_out, deps: res.deps, runtime });
+  } catch (e) {
+    finish({ ok: false, error: (e as Error).message, deps: [], runtime: { name: 'python-server', version: '', packages: {} } });
+  }
+}
+
 function getJsWorker(): Worker {
   if (!jsWorker) {
     jsWorker = new JsWorker();
@@ -229,6 +245,10 @@ export function runCell(ref: CellRef) {
   useStore.setState({ runs });
   if (cell.k === 'sql') {
     void runSqlCell(ref, id, cell.i, cell.conn);
+    return;
+  }
+  if (cell.k === 'python' && cell.runtime === 'server') {
+    void runServerPython(ref, id, cell.i, !!cell.gpu);
     return;
   }
   const snapshot = buildSnapshot(ref);

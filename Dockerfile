@@ -49,10 +49,13 @@ RUN npx tsc -p tsconfig.json && npm prune --omit=dev
 # 4. Runtime
 # ---------------------------------------------------------------------------
 FROM node:22-bookworm-slim
-ENV NODE_ENV=production PORT=8787 HOST=0.0.0.0 GRIDWRIGHT_DATA=/data CLIENT_DIR=/app/client
+ENV NODE_ENV=production PORT=8787 HOST=0.0.0.0 GRIDWRIGHT_DATA=/data CLIENT_DIR=/app/client GRIDWRIGHT_PYTHON_SANDBOX=none
+# python3 + pandas for server-side Python cells (the container is the sandbox: no namespaces inside Docker)
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pandas python3-matplotlib && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=server /src/server/dist ./server/dist
 COPY --from=server /src/server/engine ./server/engine
+COPY --from=server /src/server/runner ./server/runner
 COPY --from=server /src/server/node_modules ./server/node_modules
 COPY --from=server /src/server/package.json ./server/package.json
 COPY --from=client /src/client/dist ./client

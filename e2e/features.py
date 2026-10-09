@@ -218,7 +218,12 @@ def main():
         # History panel renders the entries
         page.evaluate("() => window.__gw.getState().set({ panel: 'history' })")
         page.wait_for_selector(".history-list li", timeout=5000)
-        txt = page.inner_text(".history-panel")
+        txt = ""
+        for _ in range(50):  # the list refreshes from the server shortly after the panel opens
+            txt = page.inner_text(".history-panel")
+            if "audited" in txt:
+                break
+            time.sleep(0.1)
         check("History panel shows the change list", "audited" in txt and "#" in txt, txt[:120].replace("\n", " "))
         page.screenshot(path=f"{OUT}/f04-history.png")
         page.evaluate("() => window.__gw.getState().set({ panel: 'none' })")

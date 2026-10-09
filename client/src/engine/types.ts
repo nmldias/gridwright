@@ -37,6 +37,8 @@ export interface CellView {
   err?: string;
   conn?: string; // SQL cells: connection id
   refresh?: number; // code/SQL cells: refresh interval (s)
+  runtime?: string; // Python cells: 'server' runs on the host's CPython; absent = browser (Pyodide)
+  gpu?: boolean; // Python cells on the server: ask for cuDF
   inv?: boolean; // breaks a validation rule
 }
 
@@ -230,7 +232,7 @@ export interface RestoredTable {
 }
 
 export type Op =
-  | { type: 'set_cell'; table: TableId; row: number; col: number; input: string; kind?: CellKind; conn?: string | null; refresh?: number | null }
+  | { type: 'set_cell'; table: TableId; row: number; col: number; input: string; kind?: CellKind; conn?: string | null; refresh?: number | null; runtime?: string | null; gpu?: boolean | null }
   | { type: 'set_cells'; table: TableId; row: number; col: number; values: string[][] }
   | { type: 'clear_range'; table: TableId; r0: number; c0: number; r1: number; c1: number }
   | { type: 'set_format'; table: TableId; r0: number; c0: number; r1: number; c1: number; format: Format }

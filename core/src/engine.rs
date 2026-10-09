@@ -21,6 +21,12 @@ pub enum Op {
         /// Code/SQL cells: refresh interval in seconds (0 = none).
         #[serde(default)]
         refresh: Option<u32>,
+        /// Python cells: "server" to run on the host's CPython, anything else = browser.
+        #[serde(default)]
+        runtime: Option<String>,
+        /// Python cells on the server: request GPU acceleration.
+        #[serde(default)]
+        gpu: Option<bool>,
     },
     /// Paste a block of literal/formula strings starting at (row, col).
     SetCells {
@@ -278,6 +284,10 @@ pub struct CellView {
     pub conn: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<bool>,
     /// true when the cell breaks a validation rule
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub inv: bool,
@@ -299,6 +309,8 @@ impl CellView {
                 err: None,
                 conn: None,
                 refresh: None,
+                runtime: None,
+                gpu: None,
                 inv: false,
             },
             Some(c) => CellView {
@@ -314,6 +326,8 @@ impl CellView {
                 err: c.std_err.clone(),
                 conn: c.conn.clone(),
                 refresh: c.refresh,
+                runtime: c.runtime.clone(),
+                gpu: c.gpu,
                 inv: c.invalid,
             },
         }
@@ -758,6 +772,10 @@ impl Engine {
         if !matches!(kind, CellKind::Python | CellKind::Javascript | CellKind::Sql) {
             entry.refresh = None;
         }
+        if kind != CellKind::Python {
+            entry.runtime = None;
+            entry.gpu = None;
+        }
         if entry.is_blank() {
             t.cells.remove(&key);
         }
@@ -773,6 +791,8 @@ impl Engine {
                 kind,
                 conn,
                 refresh,
+                runtime,
+                gpu,
             } => {
                 let key = CellKey::new(row, col);
                 let t = self.wb.table(table).ok_or("no such table")?;
@@ -819,6 +839,10 @@ impl Engine {
                         }
                         if entry.is_code() {
                             entry.refresh = refresh.filter(|s| *s > 0);
+                        }
+                        if kind == CellKind::Python {
+                            entry.runtime = runtime.filter(|r| r == "server");
+                            entry.gpu = gpu.filter(|g| *g);
                         }
                     }
                 }
@@ -2387,6 +2411,8 @@ mod tests {
             kind: None,
             conn: None,
             refresh: None,
+            runtime: None,
+            gpu: None,
         })
     }
 
@@ -2406,6 +2432,42 @@ mod tests {
             values: None,
         });
         e
+    }
+
+    #[test]
+    fn python_cell_runtime_and_gpu_flags() {
+        let mut e = engine();
+        let ch = e.apply(Op::SetCell {
+            table: 1,
+            row: 0,
+            col: 0,
+            input: "q.cells('A2')".into(),
+            kind: Some(CellKind::Python),
+            conn: None,
+            refresh: None,
+            runtime: Some("server".into()),
+            gpu: Some(true),
+        });
+        assert_eq!(ch.rerun_code, vec![CellRef::new(1, 0, 0)]);
+        let c = e.wb.cell(CellRef::new(1, 0, 0)).unwrap();
+        assert_eq!(c.runtime.as_deref(), Some("server"));
+        assert_eq!(c.gpu, Some(true));
+        let view = CellView::from_cell(CellKey::new(0, 0), Some(c));
+        assert_eq!(view.runtime.as_deref(), Some("server"));
+        assert_eq!(view.gpu, Some(true));
+        // the flags survive a JSON round trip of the workbook
+        let json = serde_json::to_string(&e.wb).unwrap();
+        let e2 = Engine::new(serde_json::from_str(&json).unwrap());
+        assert_eq!(e2.wb.cell(CellRef::new(1, 0, 0)).unwrap().runtime.as_deref(), Some("server"));
+        // "browser" (or anything but "server") and gpu=false are stored as absent
+        e.apply(Op::SetCell { table: 1, row: 0, col: 0, input: "1".into(), kind: Some(CellKind::Python), conn: None, refresh: None, runtime: Some("browser".into()), gpu: Some(false) });
+        let c = e.wb.cell(CellRef::new(1, 0, 0)).unwrap();
+        assert_eq!(c.runtime, None);
+        assert_eq!(c.gpu, None);
+        // turning the cell into a formula clears them
+        e.apply(Op::SetCell { table: 1, row: 0, col: 0, input: "=1".into(), kind: None, conn: None, refresh: None, runtime: Some("server".into()), gpu: Some(true) });
+        let c = e.wb.cell(CellRef::new(1, 0, 0)).unwrap();
+        assert_eq!((c.runtime.clone(), c.gpu), (None, None));
     }
 
     #[test]
@@ -2538,6 +2600,8 @@ mod tests {
             kind: Some(CellKind::Python),
             conn: None,
             refresh: None,
+            runtime: None,
+            gpu: None,
         });
         assert_eq!(ch.rerun_code, vec![CellRef::new(1, 0, 1)]);
         let ch = e.apply(Op::CodeResult {
@@ -2999,6 +3063,8 @@ mod tests {
             kind: None,
             conn: None,
             refresh: None,
+            runtime: None,
+            gpu: None,
         });
         assert_eq!(e.undo.len(), before);
         // restore ops from another client's undo apply like any op

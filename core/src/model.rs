@@ -404,6 +404,12 @@ pub struct Cell {
     /// Code/SQL cells: re-run every N seconds while the document is open (0/None = never).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh: Option<u32>,
+    /// Python cells: where the code runs — None/"browser" (Pyodide) or "server" (the host's CPython).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    /// Python cells on the server: ask for GPU acceleration (cudf.pandas) when the host has it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<bool>,
     /// Formula cells: cached dependency rectangles (rebuilt by the engine, never stored).
     #[serde(skip)]
     pub deps: Vec<Rect>,

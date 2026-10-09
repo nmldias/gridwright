@@ -1,3 +1,4 @@
+import type { ServerPython } from '../api/client';
 import { create } from 'zustand';
 import type { CellRef, CellView, Chart, NamedRange, TableId, TableMeta, Trace } from '../engine/types';
 
@@ -85,6 +86,8 @@ interface State {
   runs: Map<string, CodeRunState>;
   zoom: number;
   pythonStatus: 'idle' | 'loading' | 'ready' | 'error';
+  /** server-side Python as reported by /api/health (null = not available) */
+  serverPython: ServerPython | null;
   me: Me;
   /** last log position applied from the server (0 = none) */
   seq: number;
@@ -128,6 +131,7 @@ export const useStore = create<State>((set) => ({
   runs: new Map(),
   zoom: 1,
   pythonStatus: 'idle',
+  serverPython: null,
   me: { login: '', name: '', role: 'admin', identity: false },
   seq: 0,
   historyCell: null,

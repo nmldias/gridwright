@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { appendEntry, type Author } from './history.js';
 import { a1, diffBooks, engine, nowSerial, openDocument, parseA1, tableByName, type DiffLine, errorMessage } from './headless.js';
 import { DATA_DIR } from './storage.js';
+import { pythonStatus } from './pyrun.js';
 
 export interface Action {
   action: string;
@@ -18,6 +19,9 @@ export interface Action {
   input?: string;
   language?: string;
   code?: string;
+  /** code_cell (python): "server" | "browser" */
+  runtime?: string;
+  gpu?: boolean;
   name?: string;
   rows?: number;
   cols?: number;
@@ -139,7 +143,8 @@ export function actionsToOps(book: ReturnType<typeof openDocument>['book'], acti
           const p = ref(act);
           const l = (act.language ?? 'python').toLowerCase();
           const kind = l.startsWith('j') ? 'javascript' : l.startsWith('s') ? 'sql' : 'python';
-          ops.push({ type: 'set_cell', table, row: p.r0, col: p.c0, input: str(act.code), kind });
+          const runtime = kind === 'python' ? (act.runtime === 'browser' ? null : act.runtime === 'server' || pythonStatus().available ? 'server' : null) : undefined;
+          ops.push({ type: 'set_cell', table, row: p.r0, col: p.c0, input: str(act.code), kind, runtime, gpu: runtime === 'server' && act.gpu === true ? true : undefined });
           break;
         }
         case 'add_table': {

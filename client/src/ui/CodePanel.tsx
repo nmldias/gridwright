@@ -27,6 +27,7 @@ export function CodePanel() {
   const cellsVersion = useStore((s) => s.cellsVersion);
   const runs = useStore((s) => s.runs);
   const pythonStatus = useStore((s) => s.pythonStatus);
+  const serverPython = useStore((s) => s.serverPython);
   const host = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const langRef = useRef(new Compartment());
@@ -46,17 +47,29 @@ export function CodePanel() {
     if (!codeCell || !viewRef.current || !lang) return;
     const text = viewRef.current.state.doc.toString();
     if (text !== cell?.i) {
-      book.apply({ type: 'set_cell', table: codeCell.table, row: codeCell.row, col: codeCell.col, input: text, kind: lang, conn: cell?.conn ?? null, refresh: cell?.refresh ?? 0 });
+      book.apply({ type: 'set_cell', table: codeCell.table, row: codeCell.row, col: codeCell.col, input: text, kind: lang, conn: cell?.conn ?? null, refresh: cell?.refresh ?? 0, runtime: cell?.runtime ?? null, gpu: cell?.gpu ?? null });
     } else if (run) {
       runCell(codeCell);
     }
   };
 
-  const setMeta = (patch: { conn?: string | null; refresh?: number }) => {
+  const setMeta = (patch: { conn?: string | null; refresh?: number; runtime?: string | null; gpu?: boolean }) => {
     if (!codeCell || !cell || !lang) return;
     const text = viewRef.current?.state.doc.toString() ?? cell.i;
-    book.apply({ type: 'set_cell', table: codeCell.table, row: codeCell.row, col: codeCell.col, input: text, kind: lang, conn: patch.conn !== undefined ? patch.conn : (cell.conn ?? null), refresh: patch.refresh !== undefined ? patch.refresh : (cell.refresh ?? 0) });
+    book.apply({
+      type: 'set_cell',
+      table: codeCell.table,
+      row: codeCell.row,
+      col: codeCell.col,
+      input: text,
+      kind: lang,
+      conn: patch.conn !== undefined ? patch.conn : (cell.conn ?? null),
+      refresh: patch.refresh !== undefined ? patch.refresh : (cell.refresh ?? 0),
+      runtime: patch.runtime !== undefined ? patch.runtime : (cell.runtime ?? null),
+      gpu: patch.gpu !== undefined ? patch.gpu : (cell.gpu ?? null),
+    });
   };
+  const onServer = lang === 'python' && cell?.runtime === 'server';
 
   // (re)create the editor when the target cell changes
   useEffect(() => {
@@ -121,12 +134,31 @@ export function CodePanel() {
           {title} · {meta?.name}::{a1(codeCell.row, codeCell.col)}
         </span>
         <span className="grow" />
-        {lang === 'python' && <span className={`pill ${pythonStatus}`}>{pythonStatus === 'ready' ? 'runtime ready' : pythonStatus === 'loading' ? 'loading Pyodide…' : pythonStatus === 'error' ? 'runtime error' : 'runtime idle'}</span>}
+        {lang === 'python' && !onServer && <span className={`pill ${pythonStatus}`}>{pythonStatus === 'ready' ? 'runtime ready' : pythonStatus === 'loading' ? 'loading Pyodide…' : pythonStatus === 'error' ? 'runtime error' : 'runtime idle'}</span>}
+        {onServer && <span className={`pill ${serverPython ? 'ready' : 'error'}`} title={serverPython ? `CPython ${serverPython.version} on the server · sandbox: ${serverPython.sandbox} · ${serverPython.gpu?.startsWith('cudf') ? 'GPU: ' + serverPython.gpu : 'no GPU'}` : 'the server has no Python runtime'}>{serverPython ? `server · ${serverPython.sandbox === 'bwrap' ? 'sandboxed' : serverPython.sandbox === 'unshare' ? 'no network' : 'unsandboxed'}` : 'server runtime off'}</span>}
         <button className="primary" disabled={!!running} onClick={() => save(true)} title="Run (Ctrl+Enter)">
           {running ? 'Running…' : '▶ Run'}
         </button>
       </div>
       <div className="row wrap small-row">
+        {lang === 'python' && (
+          <select
+            className="runtime-select"
+            value={onServer ? 'server' : 'browser'}
+            onChange={(e) => setMeta({ runtime: e.target.value === 'server' ? 'server' : null, gpu: e.target.value === 'server' ? (cell.gpu ?? false) : false })}
+            title={serverPython ? `Where this cell runs. Server: CPython ${serverPython.version} (${serverPython.memoryMb} MB, ${Math.round(serverPython.timeoutMs / 1000)} s per run)` : 'This server has no Python runtime; the browser runs the cell'}
+          >
+            <option value="browser">run in the browser (Pyodide)</option>
+            <option value="server" disabled={!serverPython}>
+              {serverPython ? `run on the server (CPython ${serverPython.version})` : 'run on the server (not available)'}
+            </option>
+          </select>
+        )}
+        {onServer && (
+          <label className="check" title={serverPython?.gpu?.startsWith('cudf') ? `cudf.pandas on ${serverPython.gpu} — pandas code runs on the GPU when the data is large` : `GPU not available on the server: ${serverPython?.gpu ?? 'unknown'}. The cell runs on the CPU.`}>
+            <input type="checkbox" checked={!!cell.gpu} onChange={(e) => setMeta({ gpu: e.target.checked })} /> GPU{serverPython?.gpu?.startsWith('cudf') ? '' : ' (unavailable)'}
+          </label>
+        )}
         {lang === 'sql' && (
           <select value={cell.conn ?? ''} onChange={(e) => setMeta({ conn: e.target.value || null })} title="Connection">
             <option value="">— choose a connection —</option>
@@ -151,7 +183,10 @@ export function CodePanel() {
         {cell.out && <pre className="out">{cell.out}</pre>}
         {!cell.err && !cell.out && <div className="muted">Output: {cell.v && 's' in cell.v && cell.v.s.startsWith('data:image/') ? `picture (${cell.ss?.[0]} × ${cell.ss?.[1]} cells)` : cell.ss ? `${cell.ss[0]} × ${cell.ss[1]} cells` : cell.v ? 'single value' : 'nothing yet'}</div>}
       </div>
-      <div className="muted small">Ctrl+Enter runs · Ctrl+S saves without running · results spill from this cell; the table grows to fit{lang === 'sql' ? ' · {{A1}} and {{Table::B2}} bind cell values as query parameters; a range becomes a list for IN (…)' : ''}.</div>
+      <div className="muted small">
+        Ctrl+Enter runs · Ctrl+S saves without running · results spill from this cell; the table grows to fit{lang === 'sql' ? ' · {{A1}} and {{Table::B2}} bind cell values as query parameters; a range becomes a list for IN (…)' : ''}
+        {onServer ? ' · on the server the code runs as a fresh process with no network and no access to the data directory; every run is logged with the sandbox level' : ''}.
+      </div>
     </div>
   );
 }

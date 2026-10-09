@@ -15,6 +15,15 @@ import { createProposal, listProposals, type Action } from './proposals.js';
 import { runQuery } from './sql.js';
 import { authorizeQuery, canSeeConnection, isReadOnlySql } from './sqlpolicy.js';
 import { listConnections, listFiles, readFile } from './storage.js';
+import { createRequire } from 'node:module';
+
+const MCP_VERSION: string = (() => {
+  try {
+    return String((createRequire(import.meta.url)('../package.json') as { version?: string }).version ?? '0');
+  } catch {
+    return '0';
+  }
+})();
 
 const MAX_TOOL_ROWS = 200;
 
@@ -39,6 +48,8 @@ const ActionSchema = z
     input: z.string().optional().describe('set_cell: literal or "=formula"'),
     language: z.string().optional().describe('code_cell: python | javascript | sql'),
     code: z.string().optional(),
+    runtime: z.enum(['server', 'browser']).optional().describe('code_cell (python): where it runs; default = the server when it has a Python runtime'),
+    gpu: z.boolean().optional().describe('code_cell (python, server): ask for cuDF GPU acceleration'),
     name: z.string().optional().describe('add_table / rename_table: table name'),
     rows: z.number().int().optional(),
     cols: z.number().int().optional(),
@@ -56,7 +67,7 @@ const ActionSchema = z
   .passthrough();
 
 export function buildServer(who: Identity): McpServer {
-  const server = new McpServer({ name: 'gridwright', version: '0.4.0' }, { capabilities: { tools: {} } });
+  const server = new McpServer({ name: 'gridwright', version: MCP_VERSION }, { capabilities: { tools: {} } });
 
   server.registerTool(
     'list_documents',

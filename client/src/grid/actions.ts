@@ -192,7 +192,9 @@ export function makeCodeCell(kind: CellKind, conn?: string) {
   };
   const template = existing && cell?.k === kind ? existing : templates[kind] ?? '';
   if (!cell || cell.k !== kind) {
-    book.apply({ type: 'set_cell', table: sel.table, row: sel.ar, col: sel.ac, input: template, kind, conn: kind === 'sql' ? (conn ?? null) : undefined });
+    // new Python cells run on the server when the host offers it (faster, real CPython); existing cells keep their choice
+    const runtime = kind === 'python' && getState().serverPython ? 'server' : undefined;
+    book.apply({ type: 'set_cell', table: sel.table, row: sel.ar, col: sel.ac, input: template, kind, conn: kind === 'sql' ? (conn ?? null) : undefined, runtime });
   }
   openCodeCell(sel.table, sel.ar, sel.ac);
 }

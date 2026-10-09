@@ -19,6 +19,11 @@ services:
       GRIDWRIGHT_READONLY: ${GRIDWRIGHT_READONLY:-}
       # Sharing level of new documents: none (private; the default when identity is on), view or edit.
       GRIDWRIGHT_DEFAULT_SHARING: ${GRIDWRIGHT_DEFAULT_SHARING:-}
+      # Server-side Python cells: the image ships python3 + pandas; the container is the sandbox.
+      # Limits per run (ms, MB, parallel runs); GRIDWRIGHT_PYTHON=off disables the runtime.
+      GRIDWRIGHT_PYTHON_TIMEOUT_MS: ${GRIDWRIGHT_PYTHON_TIMEOUT_MS:-60000}
+      GRIDWRIGHT_PYTHON_MEMORY_MB: ${GRIDWRIGHT_PYTHON_MEMORY_MB:-2048}
+      GRIDWRIGHT_PYTHON_CONCURRENCY: ${GRIDWRIGHT_PYTHON_CONCURRENCY:-2}
       # Optional defaults for the AI assistant (can also be set in the UI).
       AI_BASE_URL: ${AI_BASE_URL:-}
       AI_MODEL: ${AI_MODEL:-}

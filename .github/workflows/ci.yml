@@ -71,10 +71,15 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client >/dev/null
           PGPASSWORD=gw psql -h 127.0.0.1 -p 54329 -U gw -d demo -c "CREATE TABLE orders(id serial primary key, region text, product text, amount numeric); INSERT INTO orders(region,product,amount) VALUES ('North','A',10),('South','A',20),('North','B',30),('South','B',40),('North','A',5);"
 
+      - name: Python runtime for server-side cells (venv + bubblewrap)
+        run: |
+          sudo apt-get install -y -qq bubblewrap >/dev/null
+          python3 -m venv /tmp/gw-py && /tmp/gw-py/bin/pip install -q pandas matplotlib
+          /tmp/gw-py/bin/python -c "import pandas, matplotlib; print('pandas', pandas.__version__)"
       - name: Browser tests
         run: |
           pip install -q playwright && python3 -m playwright install --with-deps chromium >/dev/null
-          (cd server && GRIDWRIGHT_DATA=/tmp/gw-data PORT=8787 node dist/index.js > /tmp/server.log 2>&1 &)
+          (cd server && GRIDWRIGHT_DATA=/tmp/gw-data PORT=8787 GRIDWRIGHT_PYTHON=/tmp/gw-py/bin/python GRIDWRIGHT_PYTHON_TIMEOUT_MS=5000 node dist/index.js > /tmp/server.log 2>&1 &)
           (cd server && GRIDWRIGHT_DATA=/tmp/gw-acl GRIDWRIGHT_TRUST_TAILSCALE=1 GRIDWRIGHT_ADMINS=boss@example.com PORT=8795 node dist/index.js > /tmp/server-acl.log 2>&1 &)
           node e2e/mock-llm.mjs > /tmp/mock.log 2>&1 &
           for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8787/api/health >/dev/null && curl -fsS http://127.0.0.1:8795/api/health >/dev/null && break; sleep 1; done
@@ -82,8 +87,11 @@ jobs:
           python3 e2e/features.py http://127.0.0.1:8787 --pg 127.0.0.1:54329:demo:gw:gw --mock-llm http://127.0.0.1:8899/v1
           python3 e2e/features2.py http://127.0.0.1:8787 --pg 127.0.0.1:54329:demo:gw:gw --mock-llm http://127.0.0.1:8899/v1 --acl http://127.0.0.1:8795
           python3 e2e/features3.py http://127.0.0.1:8787 --pg 127.0.0.1:54329:demo:gw:gw --acl http://127.0.0.1:8795
+          python3 e2e/features4.py http://127.0.0.1:8787 --data /tmp/gw-data
       - name: MCP and SQL policy from the command line
         run: |
+          # the strongest sandbox must be the one in use on an Ubuntu 24.04 host (bubblewrap under AppArmor)
+          curl -fsS http://127.0.0.1:8787/api/health | tee /dev/stderr | grep -q '"sandbox":"bwrap"'
           # the MCP endpoint answers JSON-RPC without a browser, and the health endpoint reports it
           curl -fsS http://127.0.0.1:8787/api/health | grep -q '"mcp":true'
           curl -fsS -X POST http://127.0.0.1:8787/mcp -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
