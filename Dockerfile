@@ -20,7 +20,8 @@ RUN rustup target add wasm32-unknown-unknown \
 WORKDIR /src/core
 COPY core/Cargo.toml core/Cargo.lock ./
 COPY core/src ./src
-RUN wasm-pack build --release --target web --out-dir /out --out-name gridwright_core
+RUN wasm-pack build --release --target web --out-dir /out --out-name gridwright_core \
+ && wasm-pack build --release --target nodejs --out-dir /out-node --out-name gridwright_core
 
 # ---------------------------------------------------------------------------
 # 2. Client (Vite + React + PixiJS)
@@ -41,6 +42,7 @@ WORKDIR /src/server
 COPY server/package.json server/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY server/ ./
+COPY --from=wasm /out-node ./engine
 RUN npx tsc -p tsconfig.json && npm prune --omit=dev
 
 # ---------------------------------------------------------------------------
@@ -50,6 +52,7 @@ FROM node:22-bookworm-slim
 ENV NODE_ENV=production PORT=8787 HOST=0.0.0.0 GRIDWRIGHT_DATA=/data CLIENT_DIR=/app/client
 WORKDIR /app
 COPY --from=server /src/server/dist ./server/dist
+COPY --from=server /src/server/engine ./server/engine
 COPY --from=server /src/server/node_modules ./server/node_modules
 COPY --from=server /src/server/package.json ./server/package.json
 COPY --from=client /src/client/dist ./client

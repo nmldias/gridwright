@@ -149,6 +149,14 @@ export interface StoredConnection {
   user: string;
   ssl: boolean;
   passwordEnc?: string;
+  /** only SELECT statements are accepted and the session runs read-only where the database supports it (default true) */
+  readOnly?: boolean;
+  /** logins allowed to query this connection (empty = every editor); admins are always allowed */
+  allowed?: string[];
+  /** rows a single query may return to a client (default 5000, hard cap 50 000) */
+  maxRows?: number;
+  /** statement timeout in milliseconds (default 30 000, cap 300 000) */
+  timeoutMs?: number;
 }
 
 const CONN_PATH = () => join(DATA_DIR, 'connections.json');

@@ -81,8 +81,11 @@ export async function chat(req: Request, res: Response) {
     try {
       upstream = await request(useTools);
     } catch (e) {
-      if (!started) res.status(502).json({ error: `cannot reach ${baseUrl}: ${(e as Error).message}` });
-      else send({ error: `cannot reach ${baseUrl}: ${(e as Error).message}` });
+      if (!started) {
+        res.status(502).json({ error: `cannot reach ${baseUrl}: ${(e as Error).message}` });
+        return;
+      }
+      send({ error: `cannot reach ${baseUrl}: ${(e as Error).message}` });
       break;
     }
     if (!upstream.ok || !upstream.body) {
@@ -94,8 +97,11 @@ export async function chat(req: Request, res: Response) {
         round--;
         continue;
       }
-      if (!started) res.status(502).json({ error: `model endpoint returned ${upstream.status}: ${text.slice(0, 500)}` });
-      else send({ error: `model endpoint returned ${upstream.status}: ${text.slice(0, 500)}` });
+      if (!started) {
+        res.status(502).json({ error: `model endpoint returned ${upstream.status}: ${text.slice(0, 500)}` });
+        return;
+      }
+      send({ error: `model endpoint returned ${upstream.status}: ${text.slice(0, 500)}` });
       break;
     }
     let r: Round;
@@ -122,7 +128,7 @@ export async function chat(req: Request, res: Response) {
       send({ tool: { id: call.id, name: call.name, args } });
       let content: string;
       try {
-        const { result, summary } = await runTool(call.name, args, { fileId });
+        const { result, summary } = await runTool(call.name, args, { fileId, who: identity });
         content = JSON.stringify(result);
         if (content.length > 60_000) content = content.slice(0, 60_000) + '…(truncated)';
         send({ tool_result: { id: call.id, name: call.name, ok: true, summary, result } });

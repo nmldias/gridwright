@@ -5,3 +5,4 @@ dist/
 data/
 .env
 client/src/engine/pkg/
+server/engine/

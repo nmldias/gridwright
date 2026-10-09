@@ -6,11 +6,12 @@ import wasmUrl from './pkg/gridwright_core_bg.wasm?url';
 import type { CellRef, CellValue, CellView, Changes, Chart, CheckView, NamedRange, Op, SignoffStatus, TableId, TableMeta, Trace } from './types';
 import { cellKey, isCodeKind } from './types';
 import { readOnly, useStore } from '../state/store';
+import { clearRecords } from '../workers/runs';
 
 const SIGN_OPS = new Set<Op['type']>(['add_signoff', 'remove_signoff', 'set_signoff_locked']);
 
 /** Where a change came from (recorded in the document's audit log). */
-export type Origin = 'user' | 'ai' | 'code' | 'sql' | 'import' | 'remote' | 'system';
+export type Origin = 'user' | 'ai' | 'agent' | 'code' | 'sql' | 'import' | 'remote' | 'system';
 
 export interface ApplyMeta {
   origin: Origin;
@@ -59,6 +60,7 @@ export function nowSerial(): number {
 export async function loadBook(json: string | null, name = 'Untitled', fileId: string | null = null, opts: { keepView?: boolean } = {}) {
   await ensureEngine();
   if (book) book.free();
+  if (!opts.keepView) clearRecords();
   book = json ? Book.from_json(json) : new Book(name);
   book.set_now(nowSerial());
   const metas: TableMeta[] = JSON.parse(book.tables());

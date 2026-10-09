@@ -27,6 +27,59 @@ export interface LogEntry {
   /** present when a checkpoint was written at this seq (undo/redo or save) */
   checkpoint?: boolean;
   note?: string;
+  /** a code-cell execution: hashes of code, inputs and output plus the runtime (not an op) */
+  run?: RunRecord;
+}
+
+export interface RunRecord {
+  table: number;
+  row: number;
+  col: number;
+  kind: string;
+  codeHash: string;
+  inputsHash: string;
+  deps: { table: number; r0: number; c0: number; r1: number; c1: number }[];
+  outputHash: string;
+  ok: boolean;
+  error?: string;
+  ms: number;
+  runtime: { name: string; version: string; packages: Record<string, string> };
+  at: string;
+}
+
+/** Validate a run record sent by a client (shape only; hashes are the client's statement). */
+export function sanitiseRun(raw: unknown): RunRecord | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  const num = (k: string) => (Number.isFinite(Number(r[k])) ? Number(r[k]) : null);
+  const table = num('table');
+  const row = num('row');
+  const col = num('col');
+  if (table === null || row === null || col === null) return null;
+  const hex = (k: string) => (typeof r[k] === 'string' && /^[0-9a-f]{8,64}$/.test(r[k] as string) ? (r[k] as string) : '');
+  const rt = (r.runtime && typeof r.runtime === 'object' ? (r.runtime as Record<string, unknown>) : {}) as Record<string, unknown>;
+  const packages: Record<string, string> = {};
+  if (rt.packages && typeof rt.packages === 'object') {
+    for (const [k, v] of Object.entries(rt.packages as Record<string, unknown>).slice(0, 200)) packages[String(k).slice(0, 80)] = String(v).slice(0, 80);
+  }
+  const deps = Array.isArray(r.deps)
+    ? (r.deps as Record<string, unknown>[]).slice(0, 500).map((d) => ({ table: Number(d.table), r0: Number(d.r0), c0: Number(d.c0), r1: Number(d.r1), c1: Number(d.c1) })).filter((d) => [d.table, d.r0, d.c0, d.r1, d.c1].every(Number.isFinite))
+    : [];
+  return {
+    table,
+    row,
+    col,
+    kind: String(r.kind ?? '').slice(0, 20),
+    codeHash: hex('codeHash'),
+    inputsHash: hex('inputsHash'),
+    deps,
+    outputHash: hex('outputHash'),
+    ok: !!r.ok,
+    error: typeof r.error === 'string' ? r.error.slice(0, 500) : undefined,
+    ms: Math.max(0, num('ms') ?? 0),
+    runtime: { name: String(rt.name ?? '').slice(0, 40), version: String(rt.version ?? '').slice(0, 200), packages },
+    at: typeof r.at === 'string' ? r.at.slice(0, 40) : new Date().toISOString(),
+  };
 }
 
 const HISTORY_DIR = () => join(DATA_DIR, 'history');
@@ -196,6 +249,12 @@ export function historyCsv(fileId: string): string {
   };
   const lines = ['seq,timestamp,author,login,origin,type,table,range,detail,note'];
   for (const e of readAll(fileId)) {
+    if (e.run) {
+      const r = e.run;
+      const pk = Object.entries(r.runtime?.packages ?? {}).map(([k, v]) => `${k}=${v}`).join(' ');
+      lines.push([e.seq, e.ts, e.author?.name ?? '', e.author?.login ?? '', e.origin, 'code_run', r.table, a1(r.row, r.col), `${r.kind} ${r.ok ? 'ok' : 'failed'} ${r.ms} ms; code ${r.codeHash}; inputs ${r.inputsHash}; output ${r.outputHash}; ${r.runtime?.name} ${r.runtime?.version}${pk ? '; ' + pk : ''}${r.error ? '; ' + r.error : ''}`, e.note ?? ''].map(esc).join(','));
+      continue;
+    }
     const op = e.op ?? {};
     const type = e.checkpoint && !e.op ? 'checkpoint' : String(op.type ?? '');
     const d = describeOp(op);

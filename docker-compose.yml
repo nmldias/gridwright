@@ -17,6 +17,8 @@ services:
       GRIDWRIGHT_TRUST_TAILSCALE: ${GRIDWRIGHT_TRUST_TAILSCALE:-0}
       GRIDWRIGHT_ADMINS: ${GRIDWRIGHT_ADMINS:-}
       GRIDWRIGHT_READONLY: ${GRIDWRIGHT_READONLY:-}
+      # Sharing level of new documents: none (private; the default when identity is on), view or edit.
+      GRIDWRIGHT_DEFAULT_SHARING: ${GRIDWRIGHT_DEFAULT_SHARING:-}
       # Optional defaults for the AI assistant (can also be set in the UI).
       AI_BASE_URL: ${AI_BASE_URL:-}
       AI_MODEL: ${AI_MODEL:-}

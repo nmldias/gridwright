@@ -9,6 +9,7 @@ import { api } from './client';
 import * as book from '../engine/book';
 import { SHIFT_OPS, STRUCTURAL_OPS, type Op } from '../engine/types';
 import { getState, setStatus, useStore, type Presence } from '../state/store';
+import { lastRecord, onRecord } from '../workers/runs';
 
 let ws: WebSocket | null = null;
 let fileId: string | null = null;
@@ -16,6 +17,7 @@ let clientId = '';
 let reconnectTimer: number | null = null;
 let unsubOp: (() => void) | null = null;
 let unsubSel: (() => void) | null = null;
+let unsubRun: (() => void) | null = null;
 let retry = 0;
 let nextCid = 1;
 let resyncing = false;
@@ -131,6 +133,19 @@ function connect() {
           void book.loadBook(msg.json, st.fileName, st.fileId, { keepView: true });
         }
         break;
+      case 'run_ack': {
+        // the server logged a run record: remember its log position
+        const r = lastRecord({ table: msg.table, row: msg.row, col: msg.col });
+        if (r && r.at === msg.at) r.seq = msg.seq;
+        if (typeof msg.seq === 'number') useStore.setState({ seq: Math.max(getState().seq, msg.seq), runsVersion: getState().runsVersion + 1 });
+        break;
+      }
+      case 'proposal': {
+        const p = msg.proposal as { status?: string; title?: string; by?: { name?: string } } | undefined;
+        useStore.setState({ proposalsVersion: getState().proposalsVersion + 1 });
+        if (p?.status === 'pending') setStatus(`Proposal from ${p.by?.name ?? 'an agent'}: “${p.title ?? ''}” — review it in the Review panel`, 8000);
+        break;
+      }
       case 'reload':
         // another client saved; edits are already relayed live, nothing to do
         break;
@@ -158,6 +173,12 @@ function connect() {
       const cid = nextCid++;
       pending.push({ cid, op });
       send({ type: 'op', client: clientId, cid, op, origin: meta.origin, note: meta.note });
+    });
+  }
+  if (!unsubRun) {
+    unsubRun = onRecord((r) => {
+      if (!fileId) return;
+      send({ type: 'run', client: clientId, run: r });
     });
   }
   if (!unsubSel) {

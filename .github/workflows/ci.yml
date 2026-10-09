@@ -48,8 +48,11 @@ jobs:
 
       - name: wasm-pack
         run: curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
-      - name: Build engine → WebAssembly
-        run: cd core && wasm-pack build --release --target web --out-dir ../client/src/engine/pkg --out-name gridwright_core
+      - name: Build engine → WebAssembly (browser and Node)
+        run: |
+          cd core
+          wasm-pack build --release --target web --out-dir ../client/src/engine/pkg --out-name gridwright_core
+          wasm-pack build --release --target nodejs --out-dir ../server/engine --out-name gridwright_core
 
       - uses: actions/setup-node@v4
         with:
@@ -78,6 +81,19 @@ jobs:
           python3 e2e/smoke.py http://127.0.0.1:8787 --python
           python3 e2e/features.py http://127.0.0.1:8787 --pg 127.0.0.1:54329:demo:gw:gw --mock-llm http://127.0.0.1:8899/v1
           python3 e2e/features2.py http://127.0.0.1:8787 --pg 127.0.0.1:54329:demo:gw:gw --mock-llm http://127.0.0.1:8899/v1 --acl http://127.0.0.1:8795
+          python3 e2e/features3.py http://127.0.0.1:8787 --pg 127.0.0.1:54329:demo:gw:gw --acl http://127.0.0.1:8795
+      - name: MCP and SQL policy from the command line
+        run: |
+          # the MCP endpoint answers JSON-RPC without a browser, and the health endpoint reports it
+          curl -fsS http://127.0.0.1:8787/api/health | grep -q '"mcp":true'
+          curl -fsS -X POST http://127.0.0.1:8787/mcp -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | grep -q '"propose_edit"'
+          # a write through the REST query endpoint is refused before it reaches the database
+          CONN=$(curl -fsS -X POST http://127.0.0.1:8787/api/connections -H 'content-type: application/json' \
+            -d '{"name":"ci","kind":"postgres","host":"127.0.0.1","port":54329,"database":"demo","user":"gw","password":"gw","ssl":false}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:8787/api/connections/$CONN/query" -H 'content-type: application/json' -d '{"sql":"DELETE FROM orders"}')
+          test "$CODE" = 400
+          curl -fsS -X DELETE "http://127.0.0.1:8787/api/connections/$CONN" >/dev/null
       - name: SQL Server driver
         run: python3 e2e/sqlserver.py http://127.0.0.1:8787 --mssql '127.0.0.1:14333:master:sa:Gridwright!2026'
       - name: Upload screenshots
@@ -106,6 +122,7 @@ jobs:
             client/dist
             client/src/engine/pkg
             server/dist
+            server/engine
 
   release-branch:
     needs: test
@@ -122,7 +139,7 @@ jobs:
           git config user.email "ci@users.noreply.github.com"
           git checkout --orphan release-build
           git add -A
-          git add -f client/dist client/src/engine/pkg server/dist
+          git add -f client/dist client/src/engine/pkg server/dist server/engine
           git commit -qm "release: prebuilt from ${GITHUB_SHA::7}"
           git push -f origin HEAD:release
 

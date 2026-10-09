@@ -21,6 +21,7 @@
 #   GW_TOKEN     optional shared access token (empty = open to anyone who can reach the port)
 #   GW_ADMINS    comma-separated Tailscale logins allowed to manage connections/AI/backups (with --tailscale)
 #   GW_READONLY  comma-separated Tailscale logins that may only view (with --tailscale)
+#   GW_DEFAULT_SHARING  sharing level of new documents: none (private, default with --tailscale), view or edit
 #   GW_BACKUP_DIR    where nightly backups go (default ~/gridwright-backups, 14 kept)
 #   GW_BACKUP_TARGET optional rsync destination for the backups, e.g. nmldias@100.78.161.2:gridwright-backups/
 #   AI_BASE_URL, AI_MODEL, AI_API_KEY   defaults for the assistant (also editable in the UI)
@@ -50,6 +51,7 @@ say() { printf '\033[32m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[31mERROR\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ -f server/dist/index.js ] && [ -f client/dist/index.html ] || die "this is not the prebuilt release (server/dist or client/dist missing) — run scripts/build.sh first"
+[ -f server/engine/gridwright_core.js ] || echo "note: server/engine is missing, so the MCP server and proposals will be off (rebuild with scripts/build.sh or fetch a newer release)" >&2
 command -v curl >/dev/null 2>&1 || die "curl is required"
 
 # --- Node ≥ 20 ---------------------------------------------------------------------
@@ -117,6 +119,7 @@ Environment=GRIDWRIGHT_TOKEN=${GW_TOKEN:-}
 Environment=GRIDWRIGHT_TRUST_TAILSCALE=$TRUST
 Environment=GRIDWRIGHT_ADMINS=${GW_ADMINS:-}
 Environment=GRIDWRIGHT_READONLY=${GW_READONLY:-}
+Environment=GRIDWRIGHT_DEFAULT_SHARING=${GW_DEFAULT_SHARING:-}
 Environment=AI_BASE_URL=${AI_BASE_URL:-}
 Environment=AI_MODEL=${AI_MODEL:-}
 Environment=AI_API_KEY=${AI_API_KEY:-}
@@ -126,7 +129,7 @@ EOF
 start_nohup() {
   pkill -f "$ROOT/server/dist/index.js" 2>/dev/null || true
   (cd server && PORT="$PORT" HOST="$HOST_BIND" GRIDWRIGHT_DATA="$DATA" CLIENT_DIR="$ROOT/client/dist" \
-    GRIDWRIGHT_TOKEN="${GW_TOKEN:-}" GRIDWRIGHT_TRUST_TAILSCALE="$TRUST" GRIDWRIGHT_ADMINS="${GW_ADMINS:-}" GRIDWRIGHT_READONLY="${GW_READONLY:-}" \
+    GRIDWRIGHT_TOKEN="${GW_TOKEN:-}" GRIDWRIGHT_TRUST_TAILSCALE="$TRUST" GRIDWRIGHT_ADMINS="${GW_ADMINS:-}" GRIDWRIGHT_READONLY="${GW_READONLY:-}" GRIDWRIGHT_DEFAULT_SHARING="${GW_DEFAULT_SHARING:-}" \
     AI_BASE_URL="${AI_BASE_URL:-}" AI_MODEL="${AI_MODEL:-}" AI_API_KEY="${AI_API_KEY:-}" \
     setsid -f nohup "$NODE_BIN" "$ROOT/server/dist/index.js" > "$DATA/server.log" 2>&1 < /dev/null)
   say "started with nohup (no systemd user session); log: $DATA/server.log"

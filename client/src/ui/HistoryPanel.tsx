@@ -7,6 +7,11 @@ import { selectCell } from '../grid/actions';
 import { diffDocuments, type VersionDiff } from './compare';
 
 function describe(e: HistoryEntry, tableName: (id: number) => string): string {
+  if (e.run) {
+    const r = e.run;
+    const pk = Object.keys(r.runtime?.packages ?? {}).filter((k) => k !== 'connection');
+    return `${tableName(r.table)}::${a1(r.row, r.col)} ${r.kind} cell ${r.ok ? 'ran' : 'failed'} in ${r.ms} ms · ${r.runtime?.name}${r.runtime?.version ? ' ' + r.runtime.version.slice(0, 24) : ''}${pk.length ? ` · ${pk.length} package${pk.length === 1 ? '' : 's'}` : ''} · code ${r.codeHash.slice(0, 8)} inputs ${r.inputsHash.slice(0, 8)} output ${r.outputHash.slice(0, 8)}${r.error ? ' · ' + r.error.slice(0, 80) : ''}`;
+  }
   if (!e.op) return e.note ?? (e.checkpoint ? 'snapshot' : '');
   const op = e.op as unknown as Op & Record<string, any>;
   const t = () => tableName(Number(op.table));
@@ -91,6 +96,8 @@ function originLabel(o: string): string {
   switch (o) {
     case 'ai':
       return 'AI';
+    case 'agent':
+      return 'agent';
     case 'code':
       return 'code';
     case 'sql':

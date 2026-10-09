@@ -8,7 +8,7 @@ import { addTable } from '../grid/actions';
 import * as book from '../engine/book';
 import { getState, setStatus, useStore } from '../state/store';
 
-const EMPTY: Partial<ConnectionInfo> & { password?: string } = { name: '', kind: 'postgres', host: 'localhost', port: 5432, database: '', user: '', ssl: false, password: '' };
+const EMPTY: Partial<ConnectionInfo> & { password?: string } = { name: '', kind: 'postgres', host: 'localhost', port: 5432, database: '', user: '', ssl: false, password: '', readOnly: true, allowed: [], maxRows: 5000, timeoutMs: 30000 };
 
 export function SqlPanel() {
   const [conns, setConns] = useState<ConnectionInfo[]>([]);
@@ -123,6 +123,25 @@ export function SqlPanel() {
           <input type="checkbox" checked={!!c.ssl} onChange={(e) => upd({ ssl: e.target.checked })} />
           <span>Use SSL</span>
         </label>
+        <label className="field check">
+          <input type="checkbox" checked={c.readOnly !== false} onChange={(e) => upd({ readOnly: e.target.checked })} />
+          <span>Read-only: only SELECT statements, run inside a read-only transaction where the database supports it (recommended — pair it with a read-only database login)</span>
+        </label>
+        {c.readOnly === false && <div className="err small">Read-write: anyone allowed to use this connection can change the database. Keep this for admin work only.</div>}
+        <label className="field">
+          <span>Allowed logins (comma-separated; empty = every editor; administrators always)</span>
+          <input value={(c.allowed ?? []).join(', ')} onKeyDown={stop} placeholder="ana@example.com, rui@example.com" onChange={(e) => upd({ allowed: e.target.value.split(/[,\s]+/).map((x) => x.trim()).filter(Boolean) })} />
+        </label>
+        <div className="row">
+          <label className="field">
+            <span>Row limit per query</span>
+            <input type="number" value={c.maxRows ?? 5000} onKeyDown={stop} onChange={(e) => upd({ maxRows: Number(e.target.value) || 5000 })} />
+          </label>
+          <label className="field">
+            <span>Statement timeout (ms)</span>
+            <input type="number" value={c.timeoutMs ?? 30000} onKeyDown={stop} onChange={(e) => upd({ timeoutMs: Number(e.target.value) || 30000 })} />
+          </label>
+        </div>
         <div className="row">
           <button
             className="primary"
@@ -154,7 +173,7 @@ export function SqlPanel() {
         <select value={current} onChange={(e) => setCurrent(e.target.value)}>
           {conns.map((c) => (
             <option key={c.id} value={c.id}>
-              {c.name} ({c.kind})
+              {c.name} ({c.kind}{c.readOnly === false ? ', read-write' : ''})
             </option>
           ))}
           {!conns.length && <option value="">No connections</option>}
@@ -197,6 +216,8 @@ export function SqlPanel() {
           ×
         </button>
       </div>
+      {conns.find((x) => x.id === current)?.readOnly === false && <div className="err small">This connection is read-write: statements here change the database.</div>}
+      {conns.find((x) => x.id === current)?.readOnly !== false && current && <div className="muted small">Read-only connection: SELECT statements only, up to {conns.find((x) => x.id === current)?.maxRows ?? 5000} rows.</div>}
       <div className="code-editor sql" ref={host} />
       <div className="row">
         <select value={target} onChange={(e) => setTarget(e.target.value as 'new' | 'selection')}>

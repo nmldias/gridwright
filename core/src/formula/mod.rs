@@ -27,6 +27,7 @@ pub fn evaluate_full(wb: &Workbook, table: TableId, at: Option<CellKey>, src: &s
                 table,
                 now: wb.now_serial,
                 at,
+                locals: vec![],
             };
             eval(&expr, &ctx)
         }
@@ -478,5 +479,472 @@ mod tests {
         assert_eq!(evaluate(&wb, 1, None, "SUM(A1:A4) + #REF!"), Value::Error(ErrorKind::Ref));
         assert_eq!(adjust_for_insert_delete("A1+B1", true, "Table 1", false, 1, 2), "A1 + D1");
         assert_eq!(adjust_for_insert_delete("Sales::B1", true, "Table 1", false, 0, 1), "Sales::B1");
+    }
+}
+
+#[cfg(test)]
+mod extended_tests {
+    use super::*;
+    use crate::model::{Cell, Table};
+
+    fn book() -> Workbook {
+        let mut wb = Workbook::new("t");
+        let mut t1 = Table::new(1, "Table 1", 0.0, 0.0, 5, 3);
+        for (r, v) in [10.0, 20.0, 30.0, 40.0].iter().enumerate() {
+            t1.cells.insert(CellKey::new(r as u32, 0), Cell { input: v.to_string(), value: Value::Number(*v), ..Default::default() });
+        }
+        for (r, s) in ["apple", "Banana"].iter().enumerate() {
+            t1.cells.insert(CellKey::new(r as u32, 1), Cell { input: s.to_string(), value: Value::Text(s.to_string()), ..Default::default() });
+        }
+        wb.tables.push(t1);
+        wb.next_table_id = 2;
+        wb.now_serial = 46000.5;
+        wb
+    }
+
+    fn ev(wb: &Workbook, f: &str) -> Value {
+        evaluate(wb, 1, Some(CellKey::new(4, 2)), f)
+    }
+
+    fn close(wb: &Workbook, f: &str, want: f64, tol: f64) {
+        match ev(wb, f) {
+            Value::Number(got) => assert!((got - want).abs() <= tol, "{f}: got {got}, want {want}"),
+            other => panic!("{f} gave {other:?}, want {want}"),
+        }
+    }
+
+    #[test]
+    fn let_and_lazy_references() {
+        let wb = book();
+        assert_eq!(ev(&wb, "LET(x,5,x*2)"), Value::Number(10.0));
+        assert_eq!(ev(&wb, "LET(a,2,b,a+1,a*b)"), Value::Number(6.0));
+        assert_eq!(ev(&wb, "LET(x,1,LET(x,x+1,x))"), Value::Number(2.0));
+        assert_eq!(ev(&wb, "OFFSET(A1,1,0)"), Value::Number(20.0));
+        assert_eq!(ev(&wb, "SUM(OFFSET(A1,1,0,2,1))"), Value::Number(50.0));
+        assert_eq!(ev(&wb, "OFFSET(A1,9,0)"), Value::Error(ErrorKind::Ref));
+        assert_eq!(ev(&wb, "INDIRECT(\"A2\")"), Value::Number(20.0));
+        assert_eq!(ev(&wb, "SUM(INDIRECT(\"A1:A4\"))"), Value::Number(100.0));
+        assert_eq!(ev(&wb, "ISFORMULA(A1)"), Value::Bool(false));
+        assert_eq!(ev(&wb, "ISREF(A1)"), Value::Bool(true));
+        assert_eq!(ev(&wb, "ISREF(5)"), Value::Bool(false));
+    }
+
+    #[test]
+    fn maths_and_combinatorics() {
+        let wb = book();
+        assert_eq!(ev(&wb, "QUOTIENT(7,2)"), Value::Number(3.0));
+        assert_eq!(ev(&wb, "GCD(12,18)"), Value::Number(6.0));
+        assert_eq!(ev(&wb, "LCM(4,6)"), Value::Number(12.0));
+        assert_eq!(ev(&wb, "FACT(5)"), Value::Number(120.0));
+        assert_eq!(ev(&wb, "COMBIN(5,2)"), Value::Number(10.0));
+        assert_eq!(ev(&wb, "PERMUT(5,2)"), Value::Number(20.0));
+        assert_eq!(ev(&wb, "MROUND(10,3)"), Value::Number(9.0));
+        assert_eq!(ev(&wb, "EVEN(3)"), Value::Number(4.0));
+        assert_eq!(ev(&wb, "ODD(2)"), Value::Number(3.0));
+        assert_eq!(ev(&wb, "SUMSQ(1,2,3)"), Value::Number(14.0));
+        assert_eq!(ev(&wb, "CEILING.MATH(5.2)"), Value::Number(6.0));
+        assert_eq!(ev(&wb, "FLOOR.MATH(5.8)"), Value::Number(5.0));
+        assert_eq!(ev(&wb, "FLOOR.MATH(-5.5,2)"), Value::Number(-6.0));
+        assert_eq!(ev(&wb, "BASE(255,16)"), Value::Text("FF".into()));
+        assert_eq!(ev(&wb, "BASE(5,2,8)"), Value::Text("00000101".into()));
+        assert_eq!(ev(&wb, "DECIMAL(\"FF\",16)"), Value::Number(255.0));
+        close(&wb, "ATAN2(1,1)", std::f64::consts::FRAC_PI_4, 1e-12);
+        close(&wb, "RADIANS(180)", std::f64::consts::PI, 1e-12);
+    }
+
+    #[test]
+    fn statistics() {
+        let wb = book();
+        assert_eq!(ev(&wb, "MAXA(A1:A4)"), Value::Number(40.0));
+        assert_eq!(ev(&wb, "MINA(B1:B2,A1)"), Value::Number(0.0));
+        assert_eq!(ev(&wb, "AVERAGEA(A1:A2)"), Value::Number(15.0));
+        assert_eq!(ev(&wb, "MODE(1,2,2,3)"), Value::Number(2.0));
+        assert_eq!(ev(&wb, "MODE(1,2,3)"), Value::Error(ErrorKind::NA));
+        assert_eq!(ev(&wb, "PERCENTILE(A1:A4,0.5)"), Value::Number(25.0));
+        close(&wb, "QUARTILE(A1:A4,1)", 17.5, 1e-9);
+        close(&wb, "PERCENTILE.EXC(A1:A4,0.5)", 25.0, 1e-9);
+        assert_eq!(ev(&wb, "RANK.AVG(20,A1:A4)"), Value::Number(3.0));
+        close(&wb, "CORREL(A1:A4,A1:A4)", 1.0, 1e-9);
+        close(&wb, "SLOPE(A1:A4,A1:A4)", 1.0, 1e-9);
+        close(&wb, "INTERCEPT(A1:A4,A1:A4)", 0.0, 1e-9);
+        close(&wb, "FORECAST(5,A1:A4,A1:A4)", 5.0, 1e-9);
+        close(&wb, "GEOMEAN(1,4)", 2.0, 1e-9);
+        close(&wb, "HARMEAN(1,4)", 1.6, 1e-9);
+        close(&wb, "DEVSQ(1,2,3)", 2.0, 1e-9);
+        close(&wb, "AVEDEV(1,2,3)", 2.0 / 3.0, 1e-9);
+        close(&wb, "TRIMMEAN(A1:A4,0.5)", 25.0, 1e-9);
+        assert_eq!(ev(&wb, "COUNTUNIQUE(A1:A4,A1:A4)"), Value::Number(4.0));
+        close(&wb, "NORM.S.DIST(0,TRUE)", 0.5, 1e-6);
+        close(&wb, "NORM.DIST(0,0,1,FALSE)", 0.398942280, 1e-6);
+        close(&wb, "NORM.S.INV(0.975)", 1.959964, 1e-5);
+        close(&wb, "STANDARDIZE(15,10,5)", 1.0, 1e-12);
+    }
+
+    #[test]
+    fn text_and_regex() {
+        let wb = book();
+        assert_eq!(ev(&wb, "CHAR(65)"), Value::Text("A".into()));
+        assert_eq!(ev(&wb, "CODE(\"A\")"), Value::Number(65.0));
+        assert_eq!(ev(&wb, "FIXED(1234.567,2)"), Value::Text("1,234.57".into()));
+        assert_eq!(ev(&wb, "FIXED(1234.567,1,TRUE)"), Value::Text("1234.6".into()));
+        assert_eq!(ev(&wb, "NUMBERVALUE(\"1.234,5\",\",\",\".\")"), Value::Number(1234.5));
+        assert_eq!(ev(&wb, "REPLACE(\"abcdef\",2,3,\"X\")"), Value::Text("aXef".into()));
+        assert_eq!(ev(&wb, "TEXTBEFORE(\"a-b-c\",\"-\",2)"), Value::Text("a-b".into()));
+        assert_eq!(ev(&wb, "TEXTAFTER(\"a-b-c\",\"-\")"), Value::Text("b-c".into()));
+        assert_eq!(ev(&wb, "TEXTAFTER(\"a-b-c\",\"-\",-1)"), Value::Text("c".into()));
+        assert_eq!(ev(&wb, "JOIN(\"-\",\"a\",\"b\")"), Value::Text("a-b".into()));
+        assert_eq!(ev(&wb, "REGEXMATCH(\"abc123\",\"[0-9]+\")"), Value::Bool(true));
+        assert_eq!(ev(&wb, "REGEXEXTRACT(\"abc123\",\"([0-9]+)\")"), Value::Text("123".into()));
+        assert_eq!(ev(&wb, "REGEXREPLACE(\"a1b22\",\"[0-9]+\",\"#\")"), Value::Text("a#b#".into()));
+        assert_eq!(ev(&wb, "COUNTA(TEXTSPLIT(\"a-b-c\",\"-\"))"), Value::Number(3.0));
+    }
+
+    #[test]
+    fn lookup_and_shaping() {
+        let wb = book();
+        assert_eq!(ev(&wb, "LOOKUP(25,A1:A4)"), Value::Number(20.0));
+        assert_eq!(ev(&wb, "XMATCH(30,A1:A4)"), Value::Number(3.0));
+        assert_eq!(ev(&wb, "XMATCH(25,A1:A4,-1)"), Value::Number(2.0));
+        assert_eq!(ev(&wb, "XMATCH(25,A1:A4,1)"), Value::Number(3.0));
+        assert_eq!(ev(&wb, "COUNTA(VSTACK(A1:A2,A1:A4))"), Value::Number(6.0));
+        assert_eq!(ev(&wb, "COUNTA(HSTACK(A1:A2,B1:B2))"), Value::Number(4.0));
+        assert_eq!(ev(&wb, "COUNTA(TAKE(A1:A4,2))"), Value::Number(2.0));
+        assert_eq!(ev(&wb, "COUNTA(DROP(A1:A4,1))"), Value::Number(3.0));
+        assert_eq!(ev(&wb, "COUNTA(TOCOL(A1:A4))"), Value::Number(4.0));
+        assert_eq!(ev(&wb, "COUNTA(WRAPROWS(A1:A4,2))"), Value::Number(4.0));
+        assert_eq!(ev(&wb, "COUNTA(CHOOSECOLS(A1:B2,2))"), Value::Number(2.0));
+        assert_eq!(ev(&wb, "ADDRESS(2,3)"), Value::Text("$C$2".into()));
+        assert_eq!(ev(&wb, "ADDRESS(2,3,4)"), Value::Text("C2".into()));
+        assert_eq!(ev(&wb, "TYPE(1)"), Value::Number(1.0));
+        assert_eq!(ev(&wb, "TYPE(\"a\")"), Value::Number(2.0));
+        assert_eq!(ev(&wb, "TYPE(TRUE)"), Value::Number(4.0));
+        assert_eq!(ev(&wb, "ERROR.TYPE(1/0)"), Value::Number(2.0));
+    }
+
+    #[test]
+    fn dates_and_finance() {
+        let wb = book();
+        // serial 43831 is 2020-01-01, a Wednesday
+        assert_eq!(ev(&wb, "WEEKNUM(43831)"), Value::Number(1.0));
+        assert_eq!(ev(&wb, "WEEKNUM(43838)"), Value::Number(2.0));
+        assert_eq!(ev(&wb, "ISOWEEKNUM(43831)"), Value::Number(1.0));
+        assert_eq!(ev(&wb, "ISOWEEKNUM(43830)"), Value::Number(1.0));
+        assert_eq!(ev(&wb, "DAYS360(43831,43861)"), Value::Number(30.0));
+        assert_eq!(ev(&wb, "NETWORKDAYS.INTL(43831,43837,1)"), Value::Number(5.0));
+        assert_eq!(ev(&wb, "WORKDAY.INTL(43831,1)"), Value::Number(43832.0));
+        close(&wb, "SYD(30000,7500,10,1)", 22500.0 * 10.0 * 2.0 / 110.0, 1e-9);
+        close(&wb, "DDB(2400,300,10,1)", 480.0, 1e-9);
+        close(&wb, "DB(1000000,100000,6,1,7)", 186083.33, 0.01);
+        close(&wb, "RRI(10,1000,2000)", 2f64.powf(0.1) - 1.0, 1e-9);
+        close(&wb, "PDURATION(0.025,2000,2200)", 1.1f64.ln() / 1.025f64.ln(), 1e-9);
+        close(&wb, "ISPMT(0.1/12,1,36,8000000)", -66666.67, 0.01);
+        close(&wb, "CUMIPMT(0.09/12,360,125000,13,24,0)", -11135.23, 0.01);
+        close(&wb, "CUMPRINC(0.09/12,360,125000,13,24,0)", -934.11, 0.01);
+        close(&wb, "FVSCHEDULE(1000,{0.09,0.11,0.1})", 1000.0 * 1.09 * 1.11 * 1.1, 1e-6);
+        close(&wb, "MIRR({-120000,39000,30000,21000,37000,46000},0.1,0.12)", 0.126, 0.001);
+    }
+}
+
+#[cfg(test)]
+mod name_coverage {
+    use super::*;
+    use crate::model::Table;
+
+    /// Every uppercase name the evaluator mentions must resolve to a function (anything but #NAME?).
+    #[test]
+    fn every_listed_name_is_implemented() {
+        let mut wb = Workbook::new("t");
+        wb.tables.push(Table::new(1, "Table 1", 0.0, 0.0, 5, 3));
+        wb.next_table_id = 2;
+        wb.now_serial = 46000.5;
+        let cases: &[(&str, &str)] = &[
+        ("A", "A()"),
+        ("ABS", "ABS()"),
+        ("ACOS", "ACOS()"),
+        ("ADDRESS", "ADDRESS()"),
+        ("AGEING", "AGEING()"),
+        ("AGE_BUCKET", "AGE_BUCKET()"),
+        ("AGING", "AGING()"),
+        ("AND", "AND()"),
+        ("ARRAYTOTEXT", "ARRAYTOTEXT()"),
+        ("ASIN", "ASIN()"),
+        ("ATAN", "ATAN()"),
+        ("ATAN2", "ATAN2()"),
+        ("AVEDEV", "AVEDEV()"),
+        ("AVERAGE", "AVERAGE()"),
+        ("AVERAGEA", "AVERAGEA()"),
+        ("AVERAGEIF", "AVERAGEIF()"),
+        ("AVERAGEIFS", "AVERAGEIFS()"),
+        ("B", "B()"),
+        ("BASE", "BASE()"),
+        ("CEILING", "CEILING()"),
+        ("CEILING.MATH", "CEILING.MATH()"),
+        ("CHAR", "CHAR()"),
+        ("CHECK", "CHECK()"),
+        ("CHOOSE", "CHOOSE()"),
+        ("CHOOSECOLS", "CHOOSECOLS()"),
+        ("CHOOSEROWS", "CHOOSEROWS()"),
+        ("CLEAN", "CLEAN()"),
+        ("CODE", "CODE()"),
+        ("COLUMN", "COLUMN()"),
+        ("COLUMNS", "COLUMNS()"),
+        ("COMBIN", "COMBIN()"),
+        ("CONCAT", "CONCAT()"),
+        ("CONCATENATE", "CONCATENATE()"),
+        ("CORREL", "CORREL()"),
+        ("COS", "COS()"),
+        ("COSH", "COSH()"),
+        ("COUNT", "COUNT()"),
+        ("COUNTA", "COUNTA()"),
+        ("COUNTBLANK", "COUNTBLANK()"),
+        ("COUNTIF", "COUNTIF()"),
+        ("COUNTIFS", "COUNTIFS()"),
+        ("COUNTUNIQUE", "COUNTUNIQUE()"),
+        ("COVAR", "COVAR()"),
+        ("COVARIANCE.P", "COVARIANCE.P()"),
+        ("COVARIANCE.S", "COVARIANCE.S()"),
+        ("CUMIPMT", "CUMIPMT()"),
+        ("CUMPRINC", "CUMPRINC()"),
+        ("D", "D()"),
+        ("DATE", "DATE()"),
+        ("DATEDIF", "DATEDIF()"),
+        ("DATEVALUE", "DATEVALUE()"),
+        ("DAY", "DAY()"),
+        ("DAYS", "DAYS()"),
+        ("DAYS360", "DAYS360()"),
+        ("DB", "DB()"),
+        ("DDB", "DDB()"),
+        ("DECIMAL", "DECIMAL()"),
+        ("DEGREES", "DEGREES()"),
+        ("DEVSQ", "DEVSQ()"),
+        ("DROP", "DROP()"),
+        ("EDATE", "EDATE()"),
+        ("EFFECT", "EFFECT()"),
+        ("EOMONTH", "EOMONTH()"),
+        ("ERROR.TYPE", "ERROR.TYPE()"),
+        ("EVEN", "EVEN()"),
+        ("EXACT", "EXACT()"),
+        ("EXP", "EXP()"),
+        ("EXPAND", "EXPAND()"),
+        ("FACT", "FACT()"),
+        ("FALSE", "FALSE()"),
+        ("FILTER", "FILTER()"),
+        ("FIND", "FIND()"),
+        ("FIXED", "FIXED()"),
+        ("FLOOR", "FLOOR()"),
+        ("FLOOR.MATH", "FLOOR.MATH()"),
+        ("FORECAST", "FORECAST()"),
+        ("FORECAST.LINEAR", "FORECAST.LINEAR()"),
+        ("FORMULATEXT", "FORMULATEXT()"),
+        ("FV", "FV()"),
+        ("FVSCHEDULE", "FVSCHEDULE()"),
+        ("FX", "FX()"),
+        ("FXRATE", "FXRATE()"),
+        ("GCD", "GCD()"),
+        ("GEOMEAN", "GEOMEAN()"),
+        ("HARMEAN", "HARMEAN()"),
+        ("HLOOKUP", "HLOOKUP()"),
+        ("HOUR", "HOUR()"),
+        ("HSTACK", "HSTACK()"),
+        ("IF", "IF()"),
+        ("IFERROR", "IFERROR()"),
+        ("IFNA", "IFNA()"),
+        ("IFS", "IFS()"),
+        ("INDEX", "INDEX()"),
+        ("INDIRECT", "INDIRECT()"),
+        ("INT", "INT()"),
+        ("INTERCEPT", "INTERCEPT()"),
+        ("IPMT", "IPMT()"),
+        ("IRR", "IRR()"),
+        ("ISBLANK", "ISBLANK()"),
+        ("ISERR", "ISERR()"),
+        ("ISERROR", "ISERROR()"),
+        ("ISEVEN", "ISEVEN()"),
+        ("ISFORMULA", "ISFORMULA()"),
+        ("ISLOGICAL", "ISLOGICAL()"),
+        ("ISNA", "ISNA()"),
+        ("ISNONTEXT", "ISNONTEXT()"),
+        ("ISNUMBER", "ISNUMBER()"),
+        ("ISODD", "ISODD()"),
+        ("ISOWEEKNUM", "ISOWEEKNUM()"),
+        ("ISPMT", "ISPMT()"),
+        ("ISREF", "ISREF()"),
+        ("ISTEXT", "ISTEXT()"),
+        ("JOIN", "JOIN()"),
+        ("LARGE", "LARGE()"),
+        ("LCM", "LCM()"),
+        ("LEFT", "LEFT()"),
+        ("LEN", "LEN()"),
+        ("LET", "LET()"),
+        ("LN", "LN()"),
+        ("LOG", "LOG()"),
+        ("LOG10", "LOG10()"),
+        ("LOOKUP", "LOOKUP()"),
+        ("LOWER", "LOWER()"),
+        ("M", "M()"),
+        ("MATCH", "MATCH()"),
+        ("MAX", "MAX()"),
+        ("MAXA", "MAXA()"),
+        ("MAXIFS", "MAXIFS()"),
+        ("MD", "MD()"),
+        ("MEDIAN", "MEDIAN()"),
+        ("MID", "MID()"),
+        ("MIN", "MIN()"),
+        ("MINA", "MINA()"),
+        ("MINIFS", "MINIFS()"),
+        ("MINUTE", "MINUTE()"),
+        ("MIRR", "MIRR()"),
+        ("MOD", "MOD()"),
+        ("MODE", "MODE()"),
+        ("MODE.SNGL", "MODE.SNGL()"),
+        ("MONTH", "MONTH()"),
+        ("MROUND", "MROUND()"),
+        ("N", "N()"),
+        ("NA", "NA()"),
+        ("NETWORKDAYS", "NETWORKDAYS()"),
+        ("NETWORKDAYS.INTL", "NETWORKDAYS.INTL()"),
+        ("NOMINAL", "NOMINAL()"),
+        ("NORM.DIST", "NORM.DIST()"),
+        ("NORM.INV", "NORM.INV()"),
+        ("NORM.S.DIST", "NORM.S.DIST()"),
+        ("NORM.S.INV", "NORM.S.INV()"),
+        ("NORMDIST", "NORMDIST()"),
+        ("NORMINV", "NORMINV()"),
+        ("NORMSDIST", "NORMSDIST()"),
+        ("NORMSINV", "NORMSINV()"),
+        ("NOT", "NOT()"),
+        ("NOW", "NOW()"),
+        ("NPER", "NPER()"),
+        ("NPV", "NPV()"),
+        ("NUMBERVALUE", "NUMBERVALUE()"),
+        ("ODD", "ODD()"),
+        ("OFFSET", "OFFSET()"),
+        ("OR", "OR()"),
+        ("PDURATION", "PDURATION()"),
+        ("PEARSON", "PEARSON()"),
+        ("PERCENTILE", "PERCENTILE()"),
+        ("PERCENTILE.EXC", "PERCENTILE.EXC()"),
+        ("PERCENTILE.INC", "PERCENTILE.INC()"),
+        ("PERCENTRANK", "PERCENTRANK()"),
+        ("PERCENTRANK.INC", "PERCENTRANK.INC()"),
+        ("PERMUT", "PERMUT()"),
+        ("PI", "PI()"),
+        ("PMT", "PMT()"),
+        ("POWER", "POWER()"),
+        ("PPMT", "PPMT()"),
+        ("PRODUCT", "PRODUCT()"),
+        ("PROPER", "PROPER()"),
+        ("PV", "PV()"),
+        ("QUARTILE", "QUARTILE()"),
+        ("QUARTILE.EXC", "QUARTILE.EXC()"),
+        ("QUARTILE.INC", "QUARTILE.INC()"),
+        ("QUOTIENT", "QUOTIENT()"),
+        ("RADIANS", "RADIANS()"),
+        ("RAND", "RAND()"),
+        ("RANDBETWEEN", "RANDBETWEEN()"),
+        ("RANK", "RANK()"),
+        ("RANK.AVG", "RANK.AVG()"),
+        ("RANK.EQ", "RANK.EQ()"),
+        ("RATE", "RATE()"),
+        ("RECONCILE", "RECONCILE()"),
+        ("REGEXEXTRACT", "REGEXEXTRACT()"),
+        ("REGEXMATCH", "REGEXMATCH()"),
+        ("REGEXREPLACE", "REGEXREPLACE()"),
+        ("REPLACE", "REPLACE()"),
+        ("REPT", "REPT()"),
+        ("RIGHT", "RIGHT()"),
+        ("ROUND", "ROUND()"),
+        ("ROUNDDOWN", "ROUNDDOWN()"),
+        ("ROUNDUP", "ROUNDUP()"),
+        ("ROW", "ROW()"),
+        ("ROWS", "ROWS()"),
+        ("RRI", "RRI()"),
+        ("RSQ", "RSQ()"),
+        ("SEARCH", "SEARCH()"),
+        ("SECOND", "SECOND()"),
+        ("SEQUENCE", "SEQUENCE()"),
+        ("SIGN", "SIGN()"),
+        ("SIN", "SIN()"),
+        ("SINH", "SINH()"),
+        ("SLN", "SLN()"),
+        ("SLOPE", "SLOPE()"),
+        ("SMALL", "SMALL()"),
+        ("SORT", "SORT()"),
+        ("SORTBY", "SORTBY()"),
+        ("SPLIT", "SPLIT()"),
+        ("SQRT", "SQRT()"),
+        ("SQRTPI", "SQRTPI()"),
+        ("STANDARDIZE", "STANDARDIZE()"),
+        ("STDEV", "STDEV()"),
+        ("STDEV.P", "STDEV.P()"),
+        ("STDEV.S", "STDEV.S()"),
+        ("STDEVP", "STDEVP()"),
+        ("STEYX", "STEYX()"),
+        ("SUBSTITUTE", "SUBSTITUTE()"),
+        ("SUBTOTAL", "SUBTOTAL()"),
+        ("SUM", "SUM()"),
+        ("SUMIF", "SUMIF()"),
+        ("SUMIFS", "SUMIFS()"),
+        ("SUMPRODUCT", "SUMPRODUCT()"),
+        ("SUMSQ", "SUMSQ()"),
+        ("SWITCH", "SWITCH()"),
+        ("SYD", "SYD()"),
+        ("T", "T()"),
+        ("TAKE", "TAKE()"),
+        ("TAN", "TAN()"),
+        ("TANH", "TANH()"),
+        ("TEXT", "TEXT()"),
+        ("TEXTAFTER", "TEXTAFTER()"),
+        ("TEXTBEFORE", "TEXTBEFORE()"),
+        ("TEXTJOIN", "TEXTJOIN()"),
+        ("TEXTSPLIT", "TEXTSPLIT()"),
+        ("TIME", "TIME()"),
+        ("TIMEVALUE", "TIMEVALUE()"),
+        ("TOCOL", "TOCOL()"),
+        ("TODAY", "TODAY()"),
+        ("TOROW", "TOROW()"),
+        ("TRANSPOSE", "TRANSPOSE()"),
+        ("TRIM", "TRIM()"),
+        ("TRIMMEAN", "TRIMMEAN()"),
+        ("TRUE", "TRUE()"),
+        ("TRUNC", "TRUNC()"),
+        ("TYPE", "TYPE()"),
+        ("UNICHAR", "UNICHAR()"),
+        ("UNICODE", "UNICODE()"),
+        ("UNIQUE", "UNIQUE()"),
+        ("UPPER", "UPPER()"),
+        ("VALUE", "VALUE()"),
+        ("VALUETOTEXT", "VALUETOTEXT()"),
+        ("VAR", "VAR()"),
+        ("VAR.P", "VAR.P()"),
+        ("VAR.S", "VAR.S()"),
+        ("VARP", "VARP()"),
+        ("VLOOKUP", "VLOOKUP()"),
+        ("VSTACK", "VSTACK()"),
+        ("WEEKDAY", "WEEKDAY()"),
+        ("WEEKNUM", "WEEKNUM()"),
+        ("WORKDAY", "WORKDAY()"),
+        ("WORKDAY.INTL", "WORKDAY.INTL()"),
+        ("WRAPCOLS", "WRAPCOLS()"),
+        ("WRAPROWS", "WRAPROWS()"),
+        ("XIRR", "XIRR()"),
+        ("XLOOKUP", "XLOOKUP()"),
+        ("XMATCH", "XMATCH()"),
+        ("XNPV", "XNPV()"),
+        ("XOR", "XOR()"),
+        ("Y", "Y()"),
+        ("YD", "YD()"),
+        ("YEAR", "YEAR()"),
+        ("YEARFRAC", "YEARFRAC()"),
+        ("YM", "YM()"),
+        ];
+        let mut missing = vec![];
+        for (name, call) in cases {
+            if evaluate(&wb, 1, Some(CellKey::new(4, 2)), call) == Value::Error(ErrorKind::Name) {
+                missing.push(*name);
+            }
+        }
+        println!("implemented: {} of {}", cases.len() - missing.len(), cases.len());
+        println!("not functions or unimplemented: {:?}", missing);
     }
 }

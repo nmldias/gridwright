@@ -5,7 +5,7 @@
 import type { IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { canEdit, canSign, canView, permissionFor, readAccess, SIGN_OPS, type Permission } from './access.js';
-import { appendEntry, currentSeq, entriesSince, writeCheckpoint, type Author } from './history.js';
+import { appendEntry, currentSeq, entriesSince, sanitiseRun, writeCheckpoint, type Author } from './history.js';
 import { identityOf, type Identity } from './identity.js';
 import { readFile } from './storage.js';
 
@@ -106,6 +106,15 @@ export function attachMultiplayer(wss: WebSocketServer) {
           send(peer, JSON.stringify({ type: 'ack', seq, cid: msg.cid }));
           break;
         }
+        case 'run': {
+          // a code-cell execution record (hashes + runtime): audit evidence, not an op
+          if (!canView(permission)) return;
+          const run = sanitiseRun(msg.run);
+          if (!run) return;
+          const seq = appendEntry(file, { author: author(), origin: 'code', run, note: typeof msg.note === 'string' ? msg.note.slice(0, 200) : undefined });
+          send(peer, JSON.stringify({ type: 'run_ack', seq, table: run.table, row: run.row, col: run.col, at: run.at }));
+          break;
+        }
         case 'catchup': {
           const since = Number(msg.since ?? 0);
           const entries = entriesSince(file, since).filter((e) => e.op || e.checkpoint);
@@ -121,6 +130,14 @@ export function attachMultiplayer(wss: WebSocketServer) {
     });
     broadcastPresence();
   });
+}
+
+/** Tell everyone in a document's room that a proposal was filed or decided. */
+export function notifyProposal(file: string, proposal: unknown) {
+  const room = rooms.get(file);
+  if (!room) return;
+  const msg = JSON.stringify({ type: 'proposal', file, proposal });
+  for (const p of room.values()) if (p.ws.readyState === WebSocket.OPEN) p.ws.send(msg);
 }
 
 export function notifySaved(file: string, byClient?: string) {

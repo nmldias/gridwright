@@ -200,13 +200,25 @@ self.onmessage = async (e: MessageEvent<InitMsg | RunMsg>) => {
     const json: string = convert(result);
     convert.destroy?.();
     if (result && typeof result.destroy === 'function') result.destroy();
-    self.postMessage({ id, ok: true, output: JSON.parse(json), std_out: out.join('\n'), deps: q.deps });
+    self.postMessage({ id, ok: true, output: JSON.parse(json), std_out: out.join('\n'), deps: q.deps, runtime: runtimeInfo() });
   } catch (err) {
     let msg = String(err);
     // keep only the useful tail of Pyodide tracebacks
     const idx = msg.lastIndexOf('File "<exec>"');
     if (idx >= 0) msg = msg.slice(idx);
     if (errOut.length) msg = errOut.join('\n') + '\n' + msg;
-    self.postMessage({ id, ok: false, error: msg, std_out: out.join('\n'), deps: q.deps });
+    self.postMessage({ id, ok: false, error: msg, std_out: out.join('\n'), deps: q.deps, runtime: runtimeInfo() });
   }
 };
+
+/** Pyodide version and the packages loaded so far (name → version/channel), for run records. */
+function runtimeInfo(): { name: string; version: string; packages: Record<string, string> } {
+  const packages: Record<string, string> = {};
+  try {
+    const loaded = pyodide?.loadedPackages ?? {};
+    for (const k of Object.keys(loaded)) packages[k] = String(loaded[k]);
+  } catch {
+    /* ignore */
+  }
+  return { name: 'pyodide', version: String(pyodide?.version ?? ''), packages };
+}

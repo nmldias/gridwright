@@ -8,6 +8,7 @@ import { cellAt, getState, useStore } from '../state/store';
 import type { Plain, Snapshot } from './q';
 import JsWorker from './js.worker?worker';
 import PyWorker from './python.worker?worker';
+import { fnv, inputsHash, outputHash, record as recordRun, type RunRuntime } from './runs';
 
 const PY_INDEX_KEY = 'gridwright.pyodideIndexURL';
 export const DEFAULT_PYODIDE_INDEX = 'https://cdn.jsdelivr.net/pyodide/v0.27.5/full/';
@@ -36,6 +37,7 @@ let jsWorker: Worker | null = null;
 let pyWorker: Worker | null = null;
 let nextId = 1;
 const pending = new Map<number, CellRef>();
+const started = new Map<number, number>();
 const queue = new Map<string, CellRef>();
 const lastRun = new Map<string, number[]>();
 let flushTimer: number | null = null;
@@ -62,12 +64,33 @@ function handleResult(e: MessageEvent) {
   const ref = pending.get(d.id);
   if (!ref) return;
   pending.delete(d.id);
+  const t0 = started.get(d.id) ?? Date.now();
+  started.delete(d.id);
   const runs = new Map(getState().runs);
   runs.delete(keyOf(ref));
   useStore.setState({ runs });
   const cell = cellAt(ref.table, ref.row, ref.col);
   if (!cell || !isCodeKind(cell.k)) return; // cell changed meanwhile
   const deps: Rect[] = (d.deps ?? []).map((x: Rect) => ({ table: x.table, r0: x.r0, c0: x.c0, r1: x.r1, c1: x.c1 }));
+  const runtime: RunRuntime = d.runtime ?? { name: cell.k, version: '', packages: {} };
+  // the run record is computed before the result is written, over the inputs the run actually read
+  const inHash = inputsHash(deps);
+  const finishRecord = (ok: boolean, output: CellValue[][] | null, error?: string) =>
+    recordRun({
+      table: ref.table,
+      row: ref.row,
+      col: ref.col,
+      kind: cell.k,
+      codeHash: fnv(cell.i),
+      inputsHash: inHash,
+      deps,
+      outputHash: outputHash(output),
+      ok,
+      error,
+      ms: Date.now() - t0,
+      runtime,
+      at: new Date().toISOString(),
+    });
   if (d.ok) {
     let output: CellValue[][] | null;
     if (d.output && !Array.isArray(d.output) && typeof d.output === 'object' && typeof d.output.image === 'string') {
@@ -82,8 +105,10 @@ function handleResult(e: MessageEvent) {
       output = d.output ? (d.output as Plain[][]).map((row) => row.map(toCellValue)) : null;
     }
     book.apply({ type: 'code_result', table: ref.table, row: ref.row, col: ref.col, output, std_out: d.std_out || null, std_err: null, deps }, { origin: 'code' });
+    finishRecord(true, output);
   } else {
     book.apply({ type: 'code_result', table: ref.table, row: ref.row, col: ref.col, output: null, std_out: d.std_out || null, std_err: d.error || 'error', deps }, { origin: 'code' });
+    finishRecord(false, null, String(d.error || 'error').slice(0, 500));
   }
 }
 
@@ -131,12 +156,13 @@ async function runSqlCell(ref: CellRef, id: number, code: string, conn: string |
     finish({ ok: false, error: prep.error, deps: prep.deps });
     return;
   }
+  const runtime: RunRuntime = { name: 'sql', version: '', packages: { connection: conn } };
   try {
     const res = await api.connections.query(conn, prep.text, 5000, prep.params);
     const output: Plain[][] = [res.columns, ...res.rows];
-    finish({ ok: true, output, std_out: `${res.rowCount} row${res.rowCount === 1 ? '' : 's'} in ${res.ms} ms${res.truncated ? ' (truncated to 5000)' : ''}`, deps: prep.deps });
+    finish({ ok: true, output, std_out: `${res.rows.length} row${res.rows.length === 1 ? '' : 's'} in ${res.ms} ms${res.truncated ? ' (truncated to the row limit)' : ''}`, deps: prep.deps, runtime });
   } catch (e) {
-    finish({ ok: false, error: (e as Error).message, deps: prep.deps });
+    finish({ ok: false, error: (e as Error).message, deps: prep.deps, runtime });
   }
 }
 
@@ -197,6 +223,7 @@ export function runCell(ref: CellRef) {
   lastRun.set(k, hist);
   const id = nextId++;
   pending.set(id, ref);
+  started.set(id, now);
   const runs = new Map(getState().runs);
   runs.set(k, { running: true, startedAt: now });
   useStore.setState({ runs });

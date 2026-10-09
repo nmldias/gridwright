@@ -9,9 +9,9 @@ An AI-native spreadsheet with free-floating, resizable tables on an infinite can
 | Area | What works |
 |---|---|
 | **Tables (Numbers-style)** | Several named tables per document on a pannable/zoomable canvas. Drag the title to move; drag the **corner circle** to add/remove rows *and* columns at once, the **right handle** for columns, the **bottom handle** for rows; drag column/row edges to resize; reference tabs appear when a table is selected. Header row; insert/delete rows and columns with formula references rewritten; renaming a table rewrites every formula that mentions it. |
-| **Formulas** | A1 references, ranges, whole columns/rows, cross-table references (`Sales::B2`, `'Table 1'::A1:C9`), **structured references** by header name (`Orders[Amount]`, `[@Unit price]`), **named ranges**, ~140 functions, dependency-driven recalculation with cycle detection, relative/absolute references that shift on copy/paste and fill-down, live preview while typing. |
+| **Formulas** | A1 references, ranges, whole columns/rows, cross-table references (`Sales::B2`, `'Table 1'::A1:C9`), **structured references** by header name (`Orders[Amount]`, `[@Unit price]`), **named ranges**, **270 functions** (`LET`, `OFFSET`, `INDIRECT`, `XMATCH`, `TEXTSPLIT`, `REGEXEXTRACT`, `PERCENTILE`, `CORREL`, `NORM.INV`, `HSTACK`/`VSTACK`/`TAKE`/`DROP`/`WRAPROWS`, …), dependency-driven recalculation with cycle detection, relative/absolute references that shift on copy/paste and fill-down, live preview while typing. |
 | **Dynamic arrays** | A formula whose result is an array **spills** into the cells below/right (`=A1:A9*2`, `=FILTER(…)`, `=SORT(…)`, `=SORTBY(…)`, `=UNIQUE(…)`, `=SEQUENCE(…)`, `=TRANSPOSE(…)`); scalar functions lift over arrays (`=ROUND(A1:A9/3, 1)`), blocked spills show `#SPILL!` and recover when the blocker goes. |
-| **Finance & dates** | NPV, IRR, XNPV, XIRR, PMT, IPMT, PPMT, PV, FV, NPER, RATE, SLN, EFFECT, NOMINAL; DATEDIF, YEARFRAC, NETWORKDAYS, WORKDAY, EDATE, EOMONTH, TIME/HOUR/MINUTE/SECOND. Dates typed as text (`2026-10-08`, `08/10/2026`, `8 Oct 2026 14:30`) become serial numbers with a matching format; `12%`, `€ 1.000,00`, `1,500 Kz` keep their formats. Patterns: `#,##0.00`, `#.##0,00` (decimal comma), `€#,##0.00`, `#,##0.00 "Kz"`, `yyyy-mm-dd hh:mm`, `d mmm yyyy`. |
+| **Finance & dates** | NPV, IRR, MIRR, XNPV, XIRR, PMT, IPMT, PPMT, CUMIPMT, CUMPRINC, ISPMT, PV, FV, FVSCHEDULE, NPER, RATE, RRI, PDURATION, SLN, SYD, DB, DDB, EFFECT, NOMINAL; DATEDIF, YEARFRAC, DAYS360, NETWORKDAYS(.INTL), WORKDAY(.INTL), WEEKNUM, ISOWEEKNUM, EDATE, EOMONTH, TIME/TIMEVALUE/HOUR/MINUTE/SECOND. Dates typed as text (`2026-10-08`, `08/10/2026`, `8 Oct 2026 14:30`) become serial numbers with a matching format; `12%`, `€ 1.000,00`, `1,500 Kz` keep their formats. Patterns: `#,##0.00`, `#.##0,00` (decimal comma), `€#,##0.00`, `#,##0.00 "Kz"`, `yyyy-mm-dd hh:mm`, `d mmm yyyy`. |
 | **Filters** | Header dropdowns (values or conditions) hide rows; `SUBTOTAL(101…111)` ignores hidden rows; sort A→Z/Z→A from the same menu; Ctrl+Shift+L. |
 | **Conditional formatting** | Cell-value, text, colour scale, top/bottom N, duplicates, blanks, formula rules per table (Rules panel). |
 | **Data validation** | List (literal or a range such as `Lists::A2:A20`, with a dropdown in the editor), number, whole number, date, text length; strict rules refuse the entry, others mark it with a red corner. |
@@ -19,14 +19,17 @@ An AI-native spreadsheet with free-floating, resizable tables on an infinite can
 | **Python cells** | Pyodide (WebAssembly) in a web worker; `q.cells("A1:B5")`, `q.df("Table 2::A1:D20")` (pandas), `q.table()`; the last expression spills; packages auto-load from imports; matplotlib figures render on the canvas; cells re-run when the cells they read change. The runtime can be served by the server (`--pyodide`) so nothing is fetched from the internet. |
 | **JavaScript cells** | Isolated worker, `async` allowed, `return` a value / list / 2-D array / array of objects. |
 | **SQL** | PostgreSQL, MySQL/MariaDB and **SQL Server** (Cegid Primavera, Azure SQL) connections, credentials encrypted at rest. **SQL cells** run a query from a cell: `{{A1}}` / `{{Orders::B2}}` bind cell values as parameters (a range becomes a list for `IN (…)`), the result spills, the cell re-runs when its parameters change, and can refresh on a schedule (30 s … 1 h). |
+| **SQL policy (server-enforced)** | Every query — from the SQL panel, a SQL cell, the assistant's tools or an MCP agent — goes through one policy point on the server. Connections are **read-only by default**: a single SELECT, no stacked statements, no `pg_sleep`/`LOAD_FILE`/`xp_*`, *and* the session itself is opened read-only (`BEGIN READ ONLY`, `START TRANSACTION READ ONLY`) so a write hidden in a SELECT is refused by the database. Per connection: a **row limit** (streamed and cut on the server, reported as *truncated*), a **statement timeout** (cancelled database-side), and an optional **allow-list of logins** — other people do not even see the connection. Viewers cannot query. |
 | **Charts (exhibits)** | Charts are objects on the canvas, drawn by the WebGL renderer and exported as SVG/PNG from the same layout. Column, horizontal bar, line, area, stacked and waterfall; an uppercase *EXHIBIT N — TOPIC* tag, an action title that states the takeaway, a grey subtitle with dataset and units, direct series labels (no legend), one highlighted observation in coral, a dashed benchmark line with an inline label, three stat cards and a source footnote. `+ Chart` builds one from the selection (header row → series names); drag to move, corner handle to resize, double-click to edit. The assistant can add charts too (`add_chart`). |
 | **Review: sign-offs** | Select a range → *Sign off*: who, when, a note and a fingerprint of the values are recorded as an operation (so it is in the audit log). The badge turns amber the moment any value inside changes; a locked range refuses manual edits until unlocked. Share a document at *sign off* level to let a reviewer attest without editing. |
+| **Review: run records** | Every run of a Python, JavaScript or SQL cell is recorded in the audit log with the hash of its code, the hash of the values it read, the runtime and package versions (Pyodide, loaded packages; the JS engine; the database kind) and the hash of its output. The Review panel shows each code cell as **verified** (the output on screen is the recorded result of the current code and inputs), *inputs changed*, *code changed*, *failed* or *not run*; the CSV export carries the records as `code_run` rows. |
 | **Review: checks & trace** | `=CHECK(condition, "label")` cells are collected in the Review panel (passing / failing). *Trace* shows precedents (navy) and dependents (coral) of the active cell on the canvas; Ctrl+[ / Ctrl+] walk through them. |
 | **Finance primitives** | `FX(amount, "USD", "AOA", [date])` and `FXRATE()` against a table named **FX** (Date \| From \| To \| Rate: latest rate on or before the date, inverse and triangulated rates); `RECONCILE(rangeA, rangeB, [tolerance])` spills Key \| A \| B \| Difference \| Status (Matched / Only in A / Only in B / Difference); `AGEING(dates, amounts, [as_of], [edges])` spills Bucket \| Count \| Amount \| Share; `AGE_BUCKET(date)` labels a row. Templates: accounts payable ageing, bank reconciliation, treasury position (with a Primavera SQL placeholder). |
+| **MCP server & proposals** | `POST /mcp` is a Model Context Protocol server (streamable HTTP, stateless) with eleven typed tools: `list_documents`, `read_document`, `read_table`, `read_range`, `evaluate` (a formula against the live document, nothing written), `run_checks`, `read_history`, `list_connections`, `run_sql` (same policy as above), `propose_edit` and `list_proposals`. Agents never write directly: `propose_edit` validates the actions on a copy of the document **as the editors currently see it** (latest checkpoint + every logged operation) and files a **proposal** with a before → after diff. The Review panel lists pending proposals; a person applies or rejects each one, with a note. Applied proposals run as ordinary operations with origin *agent*; the proposal and the decision are both in the audit log. The same tools respect document sharing and identity. |
 | **AI assistant** | Any OpenAI-compatible chat endpoint (vLLM, Ollama, llama.cpp, OpenRouter, OpenAI, Anthropic compatibility). Every proposal is shown as a **before → after diff**; nothing is written until you apply it, and applied changes are logged with origin *AI*. With tools on, the model can call read-only server tools — `run_sql` (SELECT only, ≤200 rows), `list_tables`, `describe_table`, `read_history` — and every call and result is shown in the chat. Endpoints without function calling fall back automatically. |
 | **Audit trail** | The server sequences every change into a per-document log (who, when, from a person / the AI / a code cell / an import), with checkpoints at each save (compacted: all from the last day, daily for 30 days, weekly after). The History panel lists changes, filters them per cell, restores or downloads any earlier version, **compares two versions** cell by cell, and exports the trail as **CSV**. |
 | **Multiplayer** | Server-ordered operations: concurrent edits converge on every client. In-flight cell edits are transformed past remote row/column inserts and deletes (operational transform), undo/redo travels as restore operations instead of document snapshots, remote changes never enter your own undo stack, structural conflicts resync from the log; presence cursors with names. |
-| **Identity, roles & sharing** | Behind `tailscale serve`, the server trusts Tailscale's identity headers: names in presence and history, `GRIDWRIGHT_ADMINS` (connections, AI settings, backups) and `GRIDWRIGHT_READONLY` (viewers). Per document: an owner, *everyone can edit / view / nothing*, and shares per login at view / sign-off / edit level, enforced on REST and WebSocket. Folders group documents. |
+| **Identity, roles & sharing** | Behind `tailscale serve`, the server trusts Tailscale's identity headers: names in presence and history, `GRIDWRIGHT_ADMINS` (connections, AI settings, backups) and `GRIDWRIGHT_READONLY` (viewers). Per document: an owner, *everyone can edit / view / nothing*, and shares per login at view / sign-off / edit level, enforced on REST, WebSocket and MCP. **New documents are private by default** when identity is on (`GRIDWRIGHT_DEFAULT_SHARING` changes this). Folders group documents. |
 | **Files** | Saved on the server as JSON, autosave, import CSV/TSV/Excel/JSON, **export to .xlsx** (one sheet per table, formulas, formats, widths), CSV per table, **print / save as PDF** (tables as HTML, charts as SVG), one-click backup of the whole data directory, nightly backup timer. |
 | **Editing** | Excel-like keyboard model, formula bar, number formats, bold/alignment/colours, **merged cells**, **wrapped text**, header rows that stay visible while scrolling, copy/cut/paste with other apps, fill handle, right-click menu, undo/redo, selection statistics. Touch: drag pans, tap selects, tap again edits, long-press opens the menu, pinch zooms; phone layout. |
 
@@ -39,7 +42,8 @@ core/     Rust crate → WebAssembly (wasm-bindgen). Model (workbook → tables 
           lexer/parser/evaluator with array lifting, dependency graph with cached deps and topological
           recalculation (cycles → #CYCLE!), dynamic-array spills, pivots, filters, validation,
           sign-offs (value fingerprints, locks), merges, charts as workbook objects, precedent/dependent
-          tracing, undo/redo that emits restore operations, JSON ops API. 29 unit tests.
+          tracing, undo/redo that emits restore operations, JSON ops API. Built twice: for the browser
+          and for Node (the server evaluates documents headlessly for MCP and proposal validation). 36 unit tests.
 client/   Vite + React + TypeScript. PixiJS v8 WebGL renderer (viewport culling, pooled bitmap text,
           on-demand frames, conditional formats), pointer/keyboard/touch controller, CodeMirror 6,
           zustand store (cell maps patched in place), workers for Python (Pyodide) and JavaScript,
@@ -47,12 +51,13 @@ client/   Vite + React + TypeScript. PixiJS v8 WebGL renderer (viewport culling,
           print view, SheetJS import/export.
 server/   Node 22 + Express + ws. Static client, documents on disk with per-document access metadata
           (owner, shares, folder), the per-document operation log, checkpoints and audit CSV
-          (data/history), SQL connections (pg, mysql2, mssql), streaming AI proxy with a server-side
-          tool loop (read-only SQL, schema, history), identity (Tailscale headers), backups, optional
-          self-hosted Pyodide, WebSocket sequencer. No database required.
+          (data/history), SQL connections (pg, mysql2, mssql) behind one policy point (read-only
+          sessions, limits, allow-lists), streaming AI proxy with a server-side tool loop, MCP server
+          (typed tools, proposals validated on the headless engine), identity (Tailscale headers),
+          backups, optional self-hosted Pyodide, WebSocket sequencer. No database required.
 ```
 
-Every change is an *operation* (`set_cell`, `resize_table`, `set_pivot`, `set_filters`, …). The client applies it optimistically, the server assigns it a sequence number, appends it to the document's log and broadcasts it; clients apply remote operations in server order and rebase or resync when an in-flight operation crosses a remote one. Code-cell results are derived state: each client recomputes them and they are not logged.
+Every change is an *operation* (`set_cell`, `resize_table`, `set_pivot`, `set_filters`, …). The client applies it optimistically, the server assigns it a sequence number, appends it to the document's log and broadcasts it; clients apply remote operations in server order and rebase or resync when an in-flight operation crosses a remote one. Code-cell results are derived state: each client recomputes them; what *is* logged is a run record per execution (hashes of code, inputs and output plus the runtime), which is how the Review panel knows whether the output on screen is current.
 
 ## Run it
 
@@ -96,6 +101,7 @@ Requirements: Rust (rustup), Node 22. `scripts/build.sh` builds the wasm engine,
 | `GRIDWRIGHT_TOKEN` | optional shared access token; open `http://host:8787/?token=…` once per browser |
 | `GRIDWRIGHT_TRUST_TAILSCALE` | `1` to trust `Tailscale-User-Login/Name` headers from `tailscale serve` (bind to 127.0.0.1!) |
 | `GRIDWRIGHT_ADMINS`, `GRIDWRIGHT_READONLY` | comma-separated logins: administrators (connections, AI settings, backups) and viewers |
+| `GRIDWRIGHT_DEFAULT_SHARING` | sharing level of a new document: `none` (private; the default when identity is on), `view` or `edit` (the default without identity) |
 | `GRIDWRIGHT_PYODIDE_DIR` | directory of a Pyodide distribution served at `/pyodide/` (default `data/pyodide`) |
 | `AI_BASE_URL`, `AI_MODEL`, `AI_API_KEY` | defaults for the assistant (also editable in the UI, stored encrypted) |
 
@@ -121,6 +127,15 @@ SELECT region, SUM(amount) AS total FROM orders WHERE invoice_date >= {{B1}} AND
 
 **Review.** Review panel → *Sign off selection* (optionally locking it); the list shows each sign-off with *unchanged* / *changed since*. `=CHECK(D20 = SUM(D2:D19), "Total ties")` cells are listed as checks. *Trace active cell* overlays precedents and dependents; Ctrl+[ and Ctrl+] jump through them.
 
+**SQL connections.** DB panel (administrators): host, database, credentials, *read-only* (default on — turning it off allows writes for people on the allow-list only), *allowed logins*, *row limit* (≤ 50 000) and *timeout* (≤ 5 min). Everything that runs SQL goes through these.
+
+**Agents (MCP).** Point an MCP client at `https://host/mcp` (the same identity rules apply, so put it behind Tailscale). Agents read tables and evaluate formulas directly; edits arrive as proposals in the Review panel, where you see the diff and apply or reject it. Try it from a shell:
+
+```bash
+curl -s -X POST http://localhost:8787/mcp -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_table","arguments":{"id":"<document id>","table":"Orders"}}}'
+```
+
 **Sharing.** Files panel (identity on): everyone-on-this-server *can edit / can view / no access*, plus shares per login at *view*, *sign off* or *edit* level; the owner (document creator, or an admin) changes these. Folders are free text (`Finance/2026`).
 
 **Keyboard.** Enter/F2 edit · typing replaces · Enter ↓ / Tab → · arrows, Shift+arrows, Ctrl+arrows · Ctrl+C/X/V · Ctrl+Z/Y · Ctrl+B bold · Ctrl+D fill down · Ctrl+A select table · Ctrl+Shift+L filter · Ctrl+[ / Ctrl+] trace · Delete clears (or deletes the selected chart) · wheel pans, Ctrl+wheel zooms, Space+drag pans · Ctrl+Enter runs a code cell · Ctrl+S saves.
@@ -134,8 +149,8 @@ Measured in headless Chromium with software WebGL (SwiftShader): filling a 5 000
 ## Tests
 
 ```bash
-cd core && cargo test                                   # engine: 29 tests
-python3 e2e/smoke.py http://localhost:8787 --python     # editing, handles, code cells, save/open (21 checks)
+cd core && cargo test                                   # engine: 36 tests (incl. a check that every listed function resolves)
+python3 e2e/smoke.py http://localhost:8787 --python     # editing, handles, code cells, save/open (22 checks)
 node e2e/mock-llm.mjs &                                 # mock model for the assistant (also plays a tool round)
 python3 e2e/features.py http://localhost:8787 --pg host:port:db:user:pass --mock-llm http://127.0.0.1:8899/v1
                                                         # arrays, refs, filters, rules, pivots, SQL cells, history,
@@ -143,11 +158,14 @@ python3 e2e/features.py http://localhost:8787 --pg host:port:db:user:pass --mock
 python3 e2e/features2.py http://localhost:8787 --pg … --mock-llm … --acl http://127.0.0.1:8795
                                                         # charts, sign-offs, CHECK/FX/RECONCILE/AGEING, trace, merges,
                                                         # undo as ops, OT, audit CSV, AI tools, templates, sharing (44 checks)
+python3 e2e/features3.py http://localhost:8787 --pg … --acl http://127.0.0.1:8795
+                                                        # SQL policy (refusals, read-only session, limits, timeout, allow-list),
+                                                        # run records, MCP tools, proposals end to end, private by default (31 checks)
 python3 e2e/sqlserver.py http://localhost:8787 --mssql host:port:db:user:pass   # SQL Server driver (5 checks)
 python3 e2e/perf.py http://localhost:8787               # fill / edit / frame timings
 ```
 
-CI (`.github/workflows/ci.yml`) runs all of this on every push against PostgreSQL and SQL Server containers plus a second server with identity on, publishes the prebuilt tree to the `release` branch and a multi-arch image to GHCR.
+CI (`.github/workflows/ci.yml`) runs all of this on every push against PostgreSQL and SQL Server containers plus a second server with identity on (and a command-line check of the MCP endpoint and the SQL policy), publishes the prebuilt tree to the `release` branch and a multi-arch image to GHCR.
 
 ## Limitations (honest list)
 
@@ -156,8 +174,11 @@ CI (`.github/workflows/ci.yml`) runs all of this on every push against PostgreSQ
 - Multiplayer: two people changing the *structure* of the same table at once (inserting rows while another resizes) still resolve by resyncing from the server's log — correct but visible as a brief reload. Code-cell outputs are recomputed by every client rather than shared.
 - SQL Server is exercised in CI against the official container, not yet against a Primavera instance — report the first error you see.
 - The AI assistant needs a model that follows the JSON action format and, for tools, OpenAI-style function calling; small local models may need a retry.
-- Sharing is enforced by the server only when identity is on (Tailscale headers); without identity every document is open to whoever reaches the server. Put it behind Tailscale or a reverse proxy for anything beyond a trusted network.
+- The SQL policy's text filter is a first line only; the database-side read-only session is what actually prevents writes, and it exists for PostgreSQL and MySQL. SQL Server has no equivalent, so a read-write login there relies on the filter and the row/time limits — give Gridwright a read-only login. MySQL streaming is compiled and unit-exercised but not yet run in CI.
+- Run records attest that an output came from a given code and inputs on a given runtime; they do not re-execute anything. A record is written by the client that ran the cell, so a tampered client could lie — the audit trail says who.
+- MCP is stateless HTTP only (no SSE sessions, no resources or prompts); agents see documents with the permission of the identity the request carries.
+- Sharing is enforced by the server only when identity is on (Tailscale headers); without identity every document — and the MCP endpoint — is open to whoever reaches the server. Put it behind Tailscale or a reverse proxy for anything beyond a trusted network.
 
 ## Licence
 
-MIT. Third-party: PixiJS (MIT), CodeMirror (MIT), Pyodide (MPL-2.0, fetched at runtime or self-hosted), React (MIT), Express/ws/pg/mysql2/mssql (MIT), SheetJS (Apache-2.0), Rust crates serde/serde_json/wasm-bindgen (MIT/Apache-2.0).
+MIT. Third-party: PixiJS (MIT), CodeMirror (MIT), Pyodide (MPL-2.0, fetched at runtime or self-hosted), React (MIT), Express/ws/pg/mysql2/mssql (MIT), SheetJS (Apache-2.0), Rust crates serde/serde_json/wasm-bindgen/regex-lite (MIT/Apache-2.0), @modelcontextprotocol/sdk and zod (MIT).

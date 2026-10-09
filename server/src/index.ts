@@ -12,8 +12,12 @@ import { canEdit, canManage, canSign, canView, deleteAccess, normalise, permissi
 import { chat } from './ai.js';
 import { appendEntry, checkpointSeqs, compactCheckpoints, currentSeq, deleteHistory, historyCsv, opTouchesCell, readAll, recentEntries, replayBundle, writeCheckpoint } from './history.js';
 import { identityEnabled, identityOf } from './identity.js';
-import { attachMultiplayer, notifySaved } from './multiplayer.js';
+import { attachMultiplayer, notifyProposal as notifyProposalRoom, notifySaved } from './multiplayer.js';
+import { handleMcp, setProposalNotifier } from './mcp.js';
+import { engineAvailable } from './headless.js';
+import { createProposal, decideProposal, getProposal, listProposals } from './proposals.js';
 import { runQuery, testConnection, type Param } from './sql.js';
+import { authorizeQuery, canSeeConnection, SqlRefused } from './sqlpolicy.js';
 import {
   DATA_DIR,
   deleteFile,
@@ -31,12 +35,22 @@ import {
   type StoredConnection,
 } from './storage.js';
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? '0.0.0.0';
 const TOKEN = process.env.GRIDWRIGHT_TOKEN ?? '';
 const here = fileURLToPath(new URL('.', import.meta.url));
+/** Sharing level of a new document: GRIDWRIGHT_DEFAULT_SHARING=edit|view|none (private when identity is on). */
+const DEFAULT_SHARING: 'edit' | 'view' | 'none' = (() => {
+  const v = (process.env.GRIDWRIGHT_DEFAULT_SHARING ?? '').toLowerCase();
+  if (v === 'edit' || v === 'view' || v === 'none' || v === 'private') return v === 'private' ? 'none' : v;
+  return identityEnabled ? 'none' : 'edit';
+})();
 const CLIENT_DIR = process.env.CLIENT_DIR ?? [resolve(here, '../../client/dist'), resolve(here, '../client')].find((p) => existsSync(join(p, 'index.html'))) ?? resolve(here, '../../client/dist');
+
+// a stray rejection or exception in one request must never take the whole server down
+process.on('unhandledRejection', (e) => console.error('unhandled rejection:', e));
+process.on('uncaughtException', (e) => console.error('uncaught exception:', e));
 
 ensureDirs();
 const app = express();
@@ -75,7 +89,7 @@ const requireRole = (min: 'editor' | 'admin') => (req: Request, res: Response, n
 };
 
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, version: VERSION, multiplayer: true, pyodide: !!pyodideDir(), identity: identityEnabled, token: !!TOKEN, tools: true });
+  res.json({ ok: true, version: VERSION, multiplayer: true, pyodide: !!pyodideDir(), identity: identityEnabled, token: !!TOKEN, tools: true, defaultSharing: DEFAULT_SHARING, mcp: engineAvailable() });
 });
 app.get('/api/me', (req, res) => {
   const id = identityOf(req);
@@ -124,7 +138,7 @@ app.post('/api/files', requireRole('editor'), (req, res) => {
     const meta = writeFile(null, String(name || 'Untitled').slice(0, 120), json);
     const id = identityOf(req);
     // with identity on, the creator owns the document (open to everyone on the server until restricted)
-    writeAccess(meta.id, normalise({ owner: identityEnabled ? id.login : '', ownerName: id.name || undefined, public: 'edit', shares: {}, folder: typeof folder === 'string' ? folder : '' }));
+    writeAccess(meta.id, normalise({ owner: identityEnabled ? id.login : '', ownerName: id.name || undefined, public: DEFAULT_SHARING, shares: {}, folder: typeof folder === 'string' ? folder : '' }));
     const seq = appendEntry(meta.id, { author: { id: typeof client === 'string' ? client : 'api', name: id.name || 'Guest', login: id.login || undefined }, origin: 'user', checkpoint: true, note: 'created' });
     writeCheckpoint(meta.id, seq, json);
     res.json({ ...meta, seq, permission: 'own' });
@@ -232,6 +246,51 @@ app.post('/api/files/:id/history/compact', requireRole('admin'), (req, res) => {
   res.json({ dropped: compactCheckpoints(req.params.id), kept: checkpointSeqs(req.params.id) });
 });
 
+// --- proposals (agent edits awaiting a person's decision) ----------------------------------
+app.get('/api/files/:id/proposals', (req, res) => {
+  if (!docPermission(req, res, 'view')) return;
+  const status = req.query.status === 'pending' || req.query.status === 'applied' || req.query.status === 'rejected' ? req.query.status : undefined;
+  res.json(listProposals(req.params.id, status));
+});
+app.get('/api/files/:id/proposals/:pid', (req, res) => {
+  if (!docPermission(req, res, 'view')) return;
+  const p = getProposal(req.params.id, req.params.pid);
+  if (!p) return res.status(404).json({ error: 'not found' });
+  res.json(p);
+});
+// anyone who may edit can file a proposal too (e.g. the assistant acting on someone's behalf)
+app.post('/api/files/:id/proposals', requireRole('editor'), (req, res) => {
+  if (!docPermission(req, res, 'edit')) return;
+  try {
+    const id = identityOf(req);
+    const b = req.body ?? {};
+    const actions = Array.isArray(b.actions) ? b.actions : [];
+    const p = createProposal(req.params.id, { id: typeof b.client === 'string' ? b.client : 'api', name: id.name || 'Guest', login: id.login || undefined }, String(b.agent ?? 'api').slice(0, 60), String(b.title ?? 'Proposal'), String(b.rationale ?? ''), actions, currentSeq(req.params.id));
+    notifyProposalRoom(req.params.id, p);
+    res.json(p);
+  } catch (e) {
+    res.status(400).json({ error: (e as Error).message });
+  }
+});
+app.post('/api/files/:id/proposals/:pid/decide', requireRole('editor'), (req, res) => {
+  if (!docPermission(req, res, 'edit')) return;
+  try {
+    const id = identityOf(req);
+    const b = req.body ?? {};
+    const decision = b.decision === 'applied' ? 'applied' : b.decision === 'rejected' ? 'rejected' : null;
+    if (!decision) return res.status(400).json({ error: 'decision must be applied or rejected' });
+    const p = decideProposal(req.params.id, req.params.pid, decision, { id: typeof b.client === 'string' ? b.client : 'api', name: id.name || 'Guest', login: id.login || undefined }, typeof b.note === 'string' ? b.note : undefined, Number.isFinite(Number(b.seq)) ? Number(b.seq) : undefined);
+    notifyProposalRoom(req.params.id, p);
+    res.json(p);
+  } catch (e) {
+    res.status(400).json({ error: (e as Error).message });
+  }
+});
+
+// --- MCP (agents) --------------------------------------------------------------------------
+setProposalNotifier((doc, p) => notifyProposalRoom(doc, p));
+app.all('/mcp', (req, res) => void handleMcp(req, res));
+
 // --- connections --------------------------------------------------------------------
 const publicConn = (c: StoredConnection) => ({
   id: c.id,
@@ -243,6 +302,10 @@ const publicConn = (c: StoredConnection) => ({
   user: c.user,
   ssl: !!c.ssl,
   hasPassword: !!c.passwordEnc,
+  readOnly: c.readOnly !== false,
+  allowed: c.allowed ?? [],
+  maxRows: c.maxRows ?? 5000,
+  timeoutMs: c.timeoutMs ?? 30000,
 });
 function validateConn(body: any, existing?: StoredConnection): StoredConnection {
   const kind: StoredConnection['kind'] = body.kind === 'mysql' ? 'mysql' : body.kind === 'mssql' ? 'mssql' : 'postgres';
@@ -260,9 +323,20 @@ function validateConn(body: any, existing?: StoredConnection): StoredConnection 
   };
   if (typeof body.password === 'string' && body.password.length) c.passwordEnc = encrypt(body.password);
   if (!Number.isFinite(c.port) || c.port < 1 || c.port > 65535) throw new Error('bad port');
+  // policy: read-only unless an administrator explicitly turns it off
+  c.readOnly = body.readOnly === undefined ? (existing ? existing.readOnly !== false : true) : body.readOnly !== false && body.readOnly !== 'false';
+  const allowedRaw = body.allowed !== undefined ? body.allowed : existing?.allowed;
+  c.allowed = (Array.isArray(allowedRaw) ? allowedRaw : typeof allowedRaw === 'string' ? allowedRaw.split(/[,\s]+/) : []).map((x: unknown) => String(x).trim().toLowerCase()).filter(Boolean).slice(0, 200);
+  const maxRows = Number(body.maxRows ?? existing?.maxRows ?? 5000);
+  c.maxRows = Number.isFinite(maxRows) ? Math.min(50000, Math.max(1, Math.round(maxRows))) : 5000;
+  const timeoutMs = Number(body.timeoutMs ?? existing?.timeoutMs ?? 30000);
+  c.timeoutMs = Number.isFinite(timeoutMs) ? Math.min(300000, Math.max(1000, Math.round(timeoutMs))) : 30000;
   return c;
 }
-app.get('/api/connections', (_req, res) => res.json(listConnections().map(publicConn)));
+app.get('/api/connections', (req, res) => {
+  const who = identityOf(req);
+  res.json(listConnections().filter((c) => canSeeConnection(c, who)).map(publicConn));
+});
 app.post('/api/connections', requireRole('admin'), (req, res) => {
   try {
     const list = listConnections();
@@ -293,16 +367,25 @@ app.delete('/api/connections/:id', requireRole('admin'), (req, res) => {
   saveConnections(next);
   res.json({ ok: true });
 });
-app.post('/api/connections/:id/test', async (req, res) => {
-  const c = listConnections().find((x) => x.id === req.params.id);
+app.post('/api/connections/:id/test', requireRole('editor'), async (req, res) => {
+  const who = identityOf(req);
+  const c = listConnections().find((x) => x.id === req.params.id && canSeeConnection(x, who));
   if (!c) return res.status(404).json({ error: 'not found' });
   res.json(await testConnection(c));
 });
-app.post('/api/connections/:id/query', async (req, res) => {
-  const c = listConnections().find((x) => x.id === req.params.id);
+// the single query endpoint behind the SQL panel and SQL cells: policy first, then bounded execution
+app.post('/api/connections/:id/query', requireRole('editor'), async (req, res) => {
+  const who = identityOf(req);
+  const c = listConnections().find((x) => x.id === req.params.id && canSeeConnection(x, who));
   if (!c) return res.status(404).json({ error: 'not found' });
   const sql = String(req.body?.sql ?? '');
   if (!sql.trim()) return res.status(400).json({ error: 'sql required' });
+  try {
+    authorizeQuery(c, who, sql);
+  } catch (e) {
+    const status = e instanceof SqlRefused ? e.status : 403;
+    return res.status(status).json({ error: (e as Error).message });
+  }
   const params: Param[] = Array.isArray(req.body?.params) ? req.body.params.map((p: unknown) => (p === null || ['string', 'number', 'boolean'].includes(typeof p) ? (p as Param) : String(p))) : [];
   try {
     res.json(await runQuery(c, sql, Number(req.body?.limit ?? 5000), params));

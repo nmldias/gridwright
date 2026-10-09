@@ -33,6 +33,12 @@ export interface ConnectionInfo {
   user: string;
   ssl: boolean;
   hasPassword: boolean;
+  /** SELECT only, enforced by the server (and by a read-only transaction where the database has one) */
+  readOnly?: boolean;
+  /** logins allowed to use this connection (empty = every editor; admins always) */
+  allowed?: string[];
+  maxRows?: number;
+  timeoutMs?: number;
 }
 
 export interface SqlResult {
@@ -58,9 +64,30 @@ export interface HistoryEntry {
   op?: Record<string, unknown>;
   checkpoint?: boolean;
   note?: string;
+  run?: { table: number; row: number; col: number; kind: string; codeHash: string; inputsHash: string; outputHash: string; ok: boolean; error?: string; ms: number; runtime: { name: string; version: string; packages: Record<string, string> }; at: string };
 }
 
 export type SqlParam = string | number | boolean | null;
+
+export interface Proposal {
+  id: string;
+  document: string;
+  by: { id: string; name: string; login?: string };
+  agent: string;
+  at: string;
+  title: string;
+  rationale: string;
+  actions: Record<string, unknown>[];
+  ops: Record<string, unknown>[];
+  preview: { where: string; before: string; after: string }[];
+  errors: string[];
+  seq: number;
+  status: 'pending' | 'applied' | 'rejected';
+  decidedBy?: { id: string; name: string; login?: string };
+  decidedAt?: string;
+  decisionNote?: string;
+  appliedSeq?: number;
+}
 
 export type ToolEvent =
   | { kind: 'call'; id: string; name: string; args: Record<string, unknown> }
@@ -106,6 +133,15 @@ export const api = {
     },
     historyCsvUrl(id: string): string {
       return `/api/files/${encodeURIComponent(id)}/history.csv`;
+    },
+    async proposals(id: string, status?: Proposal['status']): Promise<Proposal[]> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/proposals${status ? `?status=${status}` : ''}`));
+    },
+    async propose(id: string, body: { title: string; rationale?: string; actions: Record<string, unknown>[]; agent?: string; client?: string }): Promise<Proposal> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/proposals`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));
+    },
+    async decide(id: string, pid: string, decision: 'applied' | 'rejected', note?: string, seq?: number, client?: string): Promise<Proposal> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/proposals/${encodeURIComponent(pid)}/decide`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ decision, note, seq, client }) }));
     },
     async save(id: string, name: string, json: string, client?: string, seq?: number): Promise<FileInfo & { seq: number }> {
       return j(

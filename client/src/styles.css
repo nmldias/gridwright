@@ -1053,3 +1053,39 @@ label.check {
 .chart-panel .row.wrap button {
   flex: 0 0 auto;
 }
+.run-item {
+  border: 1px solid var(--border);
+  border-left: 3px solid #85b7eb;
+  border-radius: 6px;
+  padding: 5px 8px;
+  margin: 2px 0;
+  font-size: 12px;
+}
+.run-item.verified {
+  border-left-color: #2e7d32;
+}
+.run-item.inputs-changed,
+.run-item.code-changed,
+.run-item.failed {
+  border-left-color: #b26a00;
+}
+.pill.origin-agent {
+  background: #ede9fe;
+  color: #5b21b6;
+}
+.proposal {
+  border: 1px solid var(--border);
+  border-left: 3px solid #b26a00;
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin: 4px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.proposal.applied {
+  border-left-color: #2e7d32;
+}
+.proposal.rejected {
+  border-left-color: #9ca3af;
+}

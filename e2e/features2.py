@@ -345,7 +345,8 @@ def main():
             created = rest("POST", "/api/files", doc, base=ACL, headers=A)
             did = created["id"]
             check("identity server: creator owns the document", created.get("permission") == "own" and rest("GET", f"/api/files/{did}/access", base=ACL, headers=A)["owner"] == "alice@example.com", str(created))
-            check("identity server: non-owner cannot change sharing", status_of("PUT", f"/api/files/{did}/access", {"public": "none"}, base=ACL, headers=B) == 403, "")
+            # private by default (0.4): a stranger gets 404; once shared for editing they still get 403 for sharing changes
+            check("identity server: non-owner cannot change sharing", status_of("PUT", f"/api/files/{did}/access", {"public": "none"}, base=ACL, headers=B) in (403, 404), "")
             rest("PUT", f"/api/files/{did}/access", {"public": "none", "shares": {"bob@example.com": "sign"}, "folder": "Finance/2026"}, base=ACL, headers=A)
             check("identity server: private document is invisible to others and listed with its folder for the owner", status_of("GET", f"/api/files/{did}", base=ACL, headers=C) == 404 and rest("GET", "/api/files", base=ACL, headers=C) == [] and any(f["id"] == did and f["folder"] == "Finance/2026" for f in rest("GET", "/api/files", base=ACL, headers=A)), "")
             check("identity server: a sign-off share can save but not change sharing; admins see everything", status_of("PUT", f"/api/files/{did}", doc, base=ACL, headers=B) == 200 and status_of("PUT", f"/api/files/{did}/access", {"public": "edit"}, base=ACL, headers=B) == 403 and any(f["id"] == did for f in rest("GET", "/api/files", base=ACL, headers=BOSS)), "")

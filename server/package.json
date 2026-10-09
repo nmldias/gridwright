@@ -1,7 +1,7 @@
 {
   "name": "gridwright-server",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
@@ -9,17 +9,21 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "express": "^4.21.2",
     "mssql": "^11.0.2",
     "mysql2": "^3.11.5",
     "pg": "^8.13.1",
-    "ws": "^8.18.0"
+    "pg-cursor": "^2.22.1",
+    "ws": "^8.18.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",
     "@types/mssql": "^12.3.0",
     "@types/node": "^22.10.2",
     "@types/pg": "^8.11.10",
+    "@types/pg-cursor": "^2.7.2",
     "@types/ws": "^8.5.13",
     "tsx": "^4.19.2",
     "typescript": "^5.6.3"

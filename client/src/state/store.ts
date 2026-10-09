@@ -99,6 +99,10 @@ interface State {
   /** sharing level of the open document */
   permission: Permission;
   fileFolder: string;
+  /** bumped when a code-cell run record is added (Review panel) */
+  runsVersion: number;
+  /** bumped when the server reports a proposal filed or decided */
+  proposalsVersion: number;
   set: (patch: Partial<State>) => void;
 }
 
@@ -133,6 +137,8 @@ export const useStore = create<State>((set) => ({
   trace: null,
   permission: 'own',
   fileFolder: '',
+  runsVersion: 0,
+  proposalsVersion: 0,
   touch: typeof window !== 'undefined' && (navigator.maxTouchPoints > 0 || 'ontouchstart' in window) && !matchMedia('(pointer: fine)').matches,
   set: (patch) => set(patch),
 }));

@@ -118,12 +118,15 @@ impl Arg {
     }
 }
 
+#[derive(Clone)]
 pub struct Ctx<'a> {
     pub wb: &'a Workbook,
     pub table: TableId,
     pub now: f64,
     /// Position of the cell being evaluated (for ROW()/COLUMN() and `[@Column]`).
     pub at: Option<CellKey>,
+    /// Names bound by LET (innermost last).
+    pub locals: Vec<(String, Arg)>,
 }
 
 /// Resolve a reference to a rectangle inside a table, clipped to the table bounds.
@@ -205,6 +208,27 @@ fn walk_deps(e: &Expr, wb: &Workbook, current: TableId, out: &mut Vec<Rect>, dep
             }
         }
         Expr::Call(name, args) => {
+            if name.eq_ignore_ascii_case("INDIRECT") {
+                if let Some(Expr::Str(text)) = args.first() {
+                    if let Ok(Expr::Ref(r)) = super::parser::parse(text) {
+                        if let Ok(rect) = resolve_ref(&r, wb, current) {
+                            out.push(rect);
+                        }
+                    }
+                }
+            }
+            if name.eq_ignore_ascii_case("OFFSET") {
+                // the window may move: depend on the whole table of the base reference
+                if let Some(Expr::Ref(r)) = args.first() {
+                    if let Ok(rect) = resolve_ref(r, wb, current) {
+                        if let Some(t) = wb.table(rect.table) {
+                            if t.rows > 0 && t.cols > 0 {
+                                out.push(Rect { table: t.id, r0: 0, c0: 0, r1: t.rows - 1, c1: t.cols - 1 });
+                            }
+                        }
+                    }
+                }
+            }
             if name.eq_ignore_ascii_case("FX") {
                 if let Some(t) = fx_table(wb) {
                     if t.rows > 0 && t.cols > 0 {
@@ -711,13 +735,18 @@ fn eval_depth(e: &Expr, ctx: &Ctx, depth: u32) -> Arg {
             }
             Err(k) => Arg::err(k),
         },
-        Expr::Name(name) => match ctx.wb.named_range(name) {
-            Some(nr) => match super::parser::parse(&nr.reference) {
-                Ok(parsed) => eval_depth(&parsed, ctx, depth + 1),
-                Err(_) => Arg::err(ErrorKind::Name),
-            },
-            None => Arg::err(ErrorKind::Name),
-        },
+        Expr::Name(name) => {
+            if let Some((_, v)) = ctx.locals.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+                return v.clone();
+            }
+            match ctx.wb.named_range(name) {
+                Some(nr) => match super::parser::parse(&nr.reference) {
+                    Ok(parsed) => eval_depth(&parsed, ctx, depth + 1),
+                    Err(_) => Arg::err(ErrorKind::Name),
+                },
+                None => Arg::err(ErrorKind::Name),
+            }
+        }
         Expr::Neg(x) => lift1(eval_depth(x, ctx, depth), |v| {
             let x = try_num!(v);
             n(-x)
@@ -880,8 +909,12 @@ const LIFTED: &[&str] = &[
     "ABS", "SQRT", "EXP", "LN", "LOG", "LOG10", "POWER", "MOD", "INT", "TRUNC", "ROUND", "ROUNDUP", "ROUNDDOWN", "CEILING", "FLOOR", "SIGN", "NOT",
     "ISBLANK", "ISNUMBER", "ISTEXT", "ISLOGICAL", "ISERROR", "ISNA", "ISEVEN", "ISODD", "LEN", "UPPER", "LOWER", "PROPER", "TRIM", "LEFT", "RIGHT", "MID",
     "FIND", "SEARCH", "SUBSTITUTE", "REPT", "VALUE", "TEXT", "EXACT", "N", "T", "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "WEEKDAY", "EDATE",
-    "EOMONTH", "DAYS", "DATE", "DATEVALUE", "TIME", "YEARFRAC", "DATEDIF", "WORKDAY", "EFFECT", "NOMINAL", "PMT", "PV", "FV", "NPER", "RATE", "IPMT", "PPMT",
-    "SLN", "SWITCH", "AGE_BUCKET",
+    "EOMONTH", "DAYS", "DATE", "DATEVALUE", "TIME", "YEARFRAC", "DATEDIF", "EFFECT", "NOMINAL", "PMT", "PV", "FV", "NPER", "RATE", "IPMT", "PPMT",
+    "SLN", "SWITCH", "AGE_BUCKET", "QUOTIENT", "GCD", "LCM", "FACT", "COMBIN", "PERMUT", "MROUND", "EVEN", "ODD", "SQRTPI", "RADIANS", "DEGREES", "SIN", "COS", "TAN",
+    "ASIN", "ACOS", "ATAN", "ATAN2", "SINH", "COSH", "TANH", "CEILING.MATH", "FLOOR.MATH", "BASE", "DECIMAL", "CHAR", "CODE", "UNICHAR", "UNICODE", "CLEAN", "FIXED",
+    "NUMBERVALUE", "REPLACE", "TEXTBEFORE", "TEXTAFTER", "REGEXMATCH", "REGEXEXTRACT", "REGEXREPLACE", "DAYS360", "WEEKNUM", "ISOWEEKNUM", "TIMEVALUE", "ISERR",
+    "ISNONTEXT", "TYPE", "ERROR.TYPE", "SYD", "DB", "DDB", "RRI", "PDURATION", "ISPMT", "NORM.DIST", "NORMDIST", "NORM.S.DIST", "NORMSDIST", "NORM.INV", "NORMINV",
+    "NORM.S.INV", "NORMSINV", "STANDARDIZE", "ADDRESS",
 ];
 
 fn call(name: &str, raw_args: &[Expr], ctx: &Ctx, depth: u32) -> Arg {
@@ -944,6 +977,78 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx, depth: u32) -> Arg {
             return match raw_args.get(i) {
                 Some(e) if i >= 1 => ev(e),
                 _ => Arg::err(ErrorKind::Value),
+            };
+        }
+        "LET" => {
+            // LET(name1, value1, [name2, value2, ...], calculation)
+            if raw_args.len() < 3 || raw_args.len() % 2 == 0 {
+                return Arg::err(ErrorKind::Value);
+            }
+            let mut inner = ctx.clone();
+            let mut i = 0;
+            while i + 1 < raw_args.len() - 1 {
+                let name = match &raw_args[i] {
+                    Expr::Name(nm) => nm.clone(),
+                    Expr::Ref(r) => super::parser::ref_to_string(r),
+                    _ => return Arg::err(ErrorKind::Value),
+                };
+                let value = eval_depth(&raw_args[i + 1], &inner, depth + 1);
+                inner.locals.push((name, value));
+                i += 2;
+            }
+            return eval_depth(&raw_args[raw_args.len() - 1], &inner, depth + 1);
+        }
+        "OFFSET" => {
+            // OFFSET(reference, rows, cols, [height], [width])
+            let base = match raw_args.first() {
+                Some(Expr::Ref(r)) => match resolve_ref_at(r, ctx.wb, ctx.table, ctx.at) {
+                    Ok(rect) => rect,
+                    Err(e) => return Arg::err(e),
+                },
+                _ => return Arg::err(ErrorKind::Value),
+            };
+            let dr = try_num!(raw_args.get(1).map(ev).unwrap_or(n(0.0)).scalar()) as i64;
+            let dc = try_num!(raw_args.get(2).map(ev).unwrap_or(n(0.0)).scalar()) as i64;
+            let h = match raw_args.get(3).map(ev).map(|v| v.scalar()) {
+                None | Some(Value::Empty) => base.rows() as i64,
+                Some(v) => try_num!(v) as i64,
+            };
+            let w = match raw_args.get(4).map(ev).map(|v| v.scalar()) {
+                None | Some(Value::Empty) => base.cols() as i64,
+                Some(v) => try_num!(v) as i64,
+            };
+            let table = match ctx.wb.table(base.table) {
+                Some(t) => t,
+                None => return Arg::err(ErrorKind::Ref),
+            };
+            let r0 = base.r0 as i64 + dr;
+            let c0 = base.c0 as i64 + dc;
+            if h < 1 || w < 1 || r0 < 0 || c0 < 0 || r0 + h > table.rows as i64 || c0 + w > table.cols as i64 {
+                return Arg::err(ErrorKind::Ref);
+            }
+            let rect = Rect { table: base.table, r0: r0 as u32, c0: c0 as u32, r1: (r0 + h - 1) as u32, c1: (c0 + w - 1) as u32 };
+            return if h == 1 && w == 1 { Arg::Scalar(table.value_at(CellKey::new(rect.r0, rect.c0))) } else { range_arg(rect, ctx.wb) };
+        }
+        "FORMULATEXT" | "ISFORMULA" | "ISREF" => {
+            let rect = match raw_args.first() {
+                Some(Expr::Ref(r)) => resolve_ref_at(r, ctx.wb, ctx.table, ctx.at).ok(),
+                _ => None,
+            };
+            if name == "ISREF" {
+                return b(rect.is_some());
+            }
+            let rect = match rect {
+                Some(r) => r,
+                None => return if name == "ISFORMULA" { b(false) } else { Arg::err(ErrorKind::NA) },
+            };
+            let cell = ctx.wb.table(rect.table).and_then(|t| t.get(CellKey::new(rect.r0, rect.c0)));
+            let is_formula = cell.map(|c| c.kind == crate::model::CellKind::Formula).unwrap_or(false);
+            return if name == "ISFORMULA" {
+                b(is_formula)
+            } else if is_formula {
+                t(cell.map(|c| c.input.clone()).unwrap_or_default())
+            } else {
+                Arg::err(ErrorKind::NA)
             };
         }
         "ROW" | "COLUMN" => {
@@ -2063,6 +2168,1004 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
             nums.sort_by(|x, y| x.partial_cmp(y).unwrap());
             n(if name == "SMALL" { nums[k - 1] } else { nums[nums.len() - k] })
         }
+        // ---------------- more maths ----------------
+        "QUOTIENT" => {
+            let d = try_num!(a(1));
+            if d == 0.0 {
+                return Arg::err(ErrorKind::Div0);
+            }
+            n((try_num!(a(0)) / d).trunc())
+        }
+        "GCD" | "LCM" => match numbers(args) {
+            Ok(v) => {
+                if v.iter().any(|x| *x < 0.0) {
+                    return Arg::err(ErrorKind::Num);
+                }
+                let ints: Vec<u64> = v.iter().map(|x| x.floor() as u64).collect();
+                let gcd = |mut a: u64, mut b: u64| {
+                    while b != 0 {
+                        let t = a % b;
+                        a = b;
+                        b = t;
+                    }
+                    a
+                };
+                if name == "GCD" {
+                    n(ints.iter().fold(0u64, |acc, x| gcd(acc, *x)) as f64)
+                } else {
+                    n(ints.iter().fold(1u64, |acc, x| if *x == 0 { 0 } else { acc / gcd(acc, *x) * *x }) as f64)
+                }
+            }
+            Err(e) => Arg::err(e),
+        },
+        "FACT" => {
+            let x = try_num!(a(0)).floor();
+            if x < 0.0 || x > 170.0 {
+                return Arg::err(ErrorKind::Num);
+            }
+            n((1..=(x as u64)).fold(1.0, |acc, k| acc * k as f64))
+        }
+        "COMBIN" | "PERMUT" => {
+            let nn = try_num!(a(0)).floor();
+            let k = try_num!(a(1)).floor();
+            if nn < 0.0 || k < 0.0 || k > nn {
+                return Arg::err(ErrorKind::Num);
+            }
+            let mut r = 1.0;
+            for i in 0..(k as u64) {
+                r *= nn - i as f64;
+                if name == "COMBIN" {
+                    r /= (i + 1) as f64;
+                }
+            }
+            n(r.round())
+        }
+        "MROUND" => {
+            let x = try_num!(a(0));
+            let m = try_num!(a(1));
+            if m == 0.0 {
+                return n(0.0);
+            }
+            if (x < 0.0) != (m < 0.0) {
+                return Arg::err(ErrorKind::Num);
+            }
+            n((x / m).round() * m)
+        }
+        "EVEN" | "ODD" => {
+            let x = try_num!(a(0));
+            let mut r = x.abs().ceil();
+            if name == "EVEN" {
+                if r % 2.0 != 0.0 {
+                    r += 1.0;
+                }
+            } else if r % 2.0 == 0.0 {
+                r += 1.0;
+            }
+            n(if x < 0.0 { -r } else { r })
+        }
+        "SUMSQ" => match numbers(args) {
+            Ok(v) => n(v.iter().map(|x| x * x).sum()),
+            Err(e) => Arg::err(e),
+        },
+        "SQRTPI" => {
+            let x = try_num!(a(0));
+            if x < 0.0 {
+                return Arg::err(ErrorKind::Num);
+            }
+            n((x * std::f64::consts::PI).sqrt())
+        }
+        "RADIANS" => n(try_num!(a(0)).to_radians()),
+        "DEGREES" => n(try_num!(a(0)).to_degrees()),
+        "SIN" => n(try_num!(a(0)).sin()),
+        "COS" => n(try_num!(a(0)).cos()),
+        "TAN" => n(try_num!(a(0)).tan()),
+        "ASIN" => n(try_num!(a(0)).asin()),
+        "ACOS" => n(try_num!(a(0)).acos()),
+        "ATAN" => n(try_num!(a(0)).atan()),
+        "ATAN2" => n(try_num!(a(1)).atan2(try_num!(a(0)))),
+        "SINH" => n(try_num!(a(0)).sinh()),
+        "COSH" => n(try_num!(a(0)).cosh()),
+        "TANH" => n(try_num!(a(0)).tanh()),
+        "RAND" => n(pseudo_random()),
+        "RANDBETWEEN" => {
+            let lo = try_num!(a(0)).ceil();
+            let hi = try_num!(a(1)).floor();
+            if hi < lo {
+                return Arg::err(ErrorKind::Num);
+            }
+            n(lo + (pseudo_random() * (hi - lo + 1.0)).floor())
+        }
+        "CEILING.MATH" | "FLOOR.MATH" => {
+            let x = try_num!(a(0));
+            let sig = match args.get(1).map(|v| v.clone().scalar()) {
+                None | Some(Value::Empty) => 1.0,
+                Some(v) => try_num!(v).abs(),
+            };
+            if sig == 0.0 {
+                return n(0.0);
+            }
+            let q = x / sig;
+            n(if name == "CEILING.MATH" { q.ceil() } else { q.floor() } * sig)
+        }
+        "BASE" => {
+            let x = try_num!(a(0)).floor();
+            let radix = try_num!(a(1)).floor() as u32;
+            if !(2..=36).contains(&radix) || x < 0.0 {
+                return Arg::err(ErrorKind::Num);
+            }
+            let min_len = args.get(2).map(|v| v.clone().scalar()).map(|v| to_number(&v).unwrap_or(0.0) as usize).unwrap_or(0);
+            let mut v = x as u64;
+            let digits = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+            let mut out = vec![];
+            if v == 0 {
+                out.push(b'0');
+            }
+            while v > 0 {
+                out.push(digits[(v % radix as u64) as usize]);
+                v /= radix as u64;
+            }
+            out.reverse();
+            let mut s = String::from_utf8(out).unwrap_or_default();
+            while s.len() < min_len {
+                s.insert(0, '0');
+            }
+            t(s)
+        }
+        "DECIMAL" => {
+            let text = try_text!(a(0)).trim().to_ascii_uppercase();
+            let radix = try_num!(a(1)).floor() as u32;
+            if !(2..=36).contains(&radix) {
+                return Arg::err(ErrorKind::Num);
+            }
+            match u64::from_str_radix(&text, radix) {
+                Ok(v) => n(v as f64),
+                Err(_) => Arg::err(ErrorKind::Num),
+            }
+        }
+        // ---------------- more statistics ----------------
+        "AVERAGEA" | "MAXA" | "MINA" => {
+            let vals: Vec<f64> = args
+                .iter()
+                .flat_map(|x| x.values())
+                .filter(|v| !v.is_empty())
+                .map(|v| match v {
+                    Value::Number(x) => x,
+                    Value::Bool(bv) => if bv { 1.0 } else { 0.0 },
+                    _ => 0.0,
+                })
+                .collect();
+            if vals.is_empty() {
+                return if name == "AVERAGEA" { Arg::err(ErrorKind::Div0) } else { n(0.0) };
+            }
+            n(match name {
+                "AVERAGEA" => vals.iter().sum::<f64>() / vals.len() as f64,
+                "MAXA" => vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+                _ => vals.iter().cloned().fold(f64::INFINITY, f64::min),
+            })
+        }
+        "MODE" | "MODE.SNGL" => match numbers(args) {
+            Ok(v) => {
+                let mut best: Option<(f64, usize)> = None;
+                for x in &v {
+                    let c = v.iter().filter(|y| *y == x).count();
+                    if c > 1 && best.map(|(_, bc)| c > bc).unwrap_or(true) {
+                        best = Some((*x, c));
+                    }
+                }
+                match best {
+                    Some((x, _)) => n(x),
+                    None => Arg::err(ErrorKind::NA),
+                }
+            }
+            Err(e) => Arg::err(e),
+        },
+        "PERCENTILE" | "PERCENTILE.INC" | "PERCENTILE.EXC" | "QUARTILE" | "QUARTILE.INC" | "QUARTILE.EXC" => {
+            let arr = args.first().map(|v| v.as_array()).unwrap_or_else(empty_arr);
+            let mut v: Vec<f64> = arr.data.iter().filter_map(|x| if let Value::Number(y) = x { Some(*y) } else { None }).collect();
+            if v.is_empty() {
+                return Arg::err(ErrorKind::Num);
+            }
+            v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            let k = try_num!(a(1));
+            let p = if name.starts_with("QUARTILE") { k / 4.0 } else { k };
+            let exc = name.ends_with(".EXC");
+            let nn = v.len() as f64;
+            if exc {
+                if p <= 0.0 || p >= 1.0 {
+                    return Arg::err(ErrorKind::Num);
+                }
+                let pos = p * (nn + 1.0);
+                if pos < 1.0 || pos > nn {
+                    return Arg::err(ErrorKind::Num);
+                }
+                let i = pos.floor() as usize;
+                let f = pos - pos.floor();
+                let lo = v[i - 1];
+                let hi = v[(i).min(v.len() - 1)];
+                n(lo + (hi - lo) * f)
+            } else {
+                if !(0.0..=1.0).contains(&p) {
+                    return Arg::err(ErrorKind::Num);
+                }
+                let pos = p * (nn - 1.0);
+                let i = pos.floor() as usize;
+                let f = pos - pos.floor();
+                let lo = v[i];
+                let hi = v[(i + 1).min(v.len() - 1)];
+                n(lo + (hi - lo) * f)
+            }
+        }
+        "PERCENTRANK" | "PERCENTRANK.INC" => {
+            let arr = args.first().map(|v| v.as_array()).unwrap_or_else(empty_arr);
+            let mut v: Vec<f64> = arr.data.iter().filter_map(|x| if let Value::Number(y) = x { Some(*y) } else { None }).collect();
+            let x = try_num!(a(1));
+            if v.len() < 2 {
+                return Arg::err(ErrorKind::NA);
+            }
+            v.sort_by(|p, q| p.partial_cmp(q).unwrap());
+            if x < v[0] || x > v[v.len() - 1] {
+                return Arg::err(ErrorKind::NA);
+            }
+            let nn = (v.len() - 1) as f64;
+            let below = v.iter().filter(|y| **y < x).count() as f64;
+            let r = if v.contains(&x) {
+                below / nn
+            } else {
+                // interpolate between neighbours
+                let lo = v.iter().filter(|y| **y < x).cloned().fold(f64::NEG_INFINITY, f64::max);
+                let hi = v.iter().filter(|y| **y > x).cloned().fold(f64::INFINITY, f64::min);
+                (below - 1.0 + (x - lo) / (hi - lo)) / nn
+            };
+            let digits = args.get(2).map(|d| to_number(&d.clone().scalar()).unwrap_or(3.0)).unwrap_or(3.0);
+            n(round_to(r, digits, 2))
+        }
+        "RANK.AVG" => {
+            let x = try_num!(a(0));
+            let arr = args.get(1).map(|v| v.as_array()).unwrap_or_else(empty_arr);
+            let asc = args.len() > 2 && try_bool!(a(2));
+            let nums: Vec<f64> = arr.data.iter().filter_map(|v| if let Value::Number(y) = v { Some(*y) } else { None }).collect();
+            if !nums.contains(&x) {
+                return Arg::err(ErrorKind::NA);
+            }
+            let better = nums.iter().filter(|&&y| if asc { y < x } else { y > x }).count();
+            let ties = nums.iter().filter(|&&y| y == x).count();
+            n(better as f64 + (ties as f64 + 1.0) / 2.0)
+        }
+        "CORREL" | "PEARSON" | "COVARIANCE.P" | "COVARIANCE.S" | "COVAR" | "SLOPE" | "INTERCEPT" | "RSQ" | "FORECAST" | "FORECAST.LINEAR" | "STEYX" => {
+            let (xs, ys) = match name {
+                "FORECAST" | "FORECAST.LINEAR" => (args.get(2).map(|v| v.as_array()).unwrap_or_else(empty_arr), args.get(1).map(|v| v.as_array()).unwrap_or_else(empty_arr)),
+                "SLOPE" | "INTERCEPT" | "RSQ" | "STEYX" => (args.get(1).map(|v| v.as_array()).unwrap_or_else(empty_arr), args.first().map(|v| v.as_array()).unwrap_or_else(empty_arr)),
+                _ => (args.first().map(|v| v.as_array()).unwrap_or_else(empty_arr), args.get(1).map(|v| v.as_array()).unwrap_or_else(empty_arr)),
+            };
+            let pairs: Vec<(f64, f64)> = xs.data.iter().zip(ys.data.iter()).filter_map(|(x, y)| match (x, y) {
+                (Value::Number(p), Value::Number(q)) => Some((*p, *q)),
+                _ => None,
+            }).collect();
+            let k = pairs.len() as f64;
+            if k < 2.0 {
+                return Arg::err(ErrorKind::Div0);
+            }
+            let mx = pairs.iter().map(|p| p.0).sum::<f64>() / k;
+            let my = pairs.iter().map(|p| p.1).sum::<f64>() / k;
+            let sxy: f64 = pairs.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+            let sxx: f64 = pairs.iter().map(|p| (p.0 - mx).powi(2)).sum();
+            let syy: f64 = pairs.iter().map(|p| (p.1 - my).powi(2)).sum();
+            match name {
+                "CORREL" | "PEARSON" => n(sxy / (sxx * syy).sqrt()),
+                "COVARIANCE.P" | "COVAR" => n(sxy / k),
+                "COVARIANCE.S" => n(sxy / (k - 1.0)),
+                "SLOPE" => n(sxy / sxx),
+                "INTERCEPT" => n(my - (sxy / sxx) * mx),
+                "RSQ" => n((sxy * sxy) / (sxx * syy)),
+                "STEYX" => n(((syy - sxy * sxy / sxx) / (k - 2.0)).sqrt()),
+                _ => {
+                    let x = try_num!(a(0));
+                    n(my + (sxy / sxx) * (x - mx))
+                }
+            }
+        }
+        "GEOMEAN" => match numbers(args) {
+            Ok(v) if !v.is_empty() && v.iter().all(|x| *x > 0.0) => n((v.iter().map(|x| x.ln()).sum::<f64>() / v.len() as f64).exp()),
+            Ok(_) => Arg::err(ErrorKind::Num),
+            Err(e) => Arg::err(e),
+        },
+        "HARMEAN" => match numbers(args) {
+            Ok(v) if !v.is_empty() && v.iter().all(|x| *x > 0.0) => n(v.len() as f64 / v.iter().map(|x| 1.0 / x).sum::<f64>()),
+            Ok(_) => Arg::err(ErrorKind::Num),
+            Err(e) => Arg::err(e),
+        },
+        "DEVSQ" | "AVEDEV" => match numbers(args) {
+            Ok(v) if !v.is_empty() => {
+                let m = v.iter().sum::<f64>() / v.len() as f64;
+                if name == "DEVSQ" {
+                    n(v.iter().map(|x| (x - m).powi(2)).sum())
+                } else {
+                    n(v.iter().map(|x| (x - m).abs()).sum::<f64>() / v.len() as f64)
+                }
+            }
+            Ok(_) => Arg::err(ErrorKind::Num),
+            Err(e) => Arg::err(e),
+        },
+        "TRIMMEAN" => {
+            let arr = args.first().map(|v| v.as_array()).unwrap_or_else(empty_arr);
+            let mut v: Vec<f64> = arr.data.iter().filter_map(|x| if let Value::Number(y) = x { Some(*y) } else { None }).collect();
+            let pct = try_num!(a(1));
+            if v.is_empty() || !(0.0..1.0).contains(&pct) {
+                return Arg::err(ErrorKind::Num);
+            }
+            v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            let drop = ((v.len() as f64 * pct) / 2.0).floor() as usize;
+            let kept = &v[drop..v.len() - drop];
+            n(kept.iter().sum::<f64>() / kept.len() as f64)
+        }
+        "COUNTUNIQUE" => {
+            let mut seen: Vec<String> = vec![];
+            for v in args.iter().flat_map(|x| x.values()) {
+                if v.is_empty() {
+                    continue;
+                }
+                let key = v.to_display().to_lowercase();
+                if !seen.contains(&key) {
+                    seen.push(key);
+                }
+            }
+            n(seen.len() as f64)
+        }
+        "NORM.DIST" | "NORMDIST" => {
+            let x = try_num!(a(0));
+            let mean = try_num!(a(1));
+            let sd = try_num!(a(2));
+            let cumulative = try_bool!(a(3));
+            if sd <= 0.0 {
+                return Arg::err(ErrorKind::Num);
+            }
+            n(if cumulative { normal_cdf((x - mean) / sd) } else { (-0.5 * ((x - mean) / sd).powi(2)).exp() / (sd * (2.0 * std::f64::consts::PI).sqrt()) })
+        }
+        "NORM.S.DIST" | "NORMSDIST" => {
+            let z = try_num!(a(0));
+            let cumulative = args.len() < 2 || try_bool!(a(1));
+            n(if cumulative { normal_cdf(z) } else { (-0.5 * z * z).exp() / (2.0 * std::f64::consts::PI).sqrt() })
+        }
+        "NORM.INV" | "NORMINV" => {
+            let p = try_num!(a(0));
+            let mean = try_num!(a(1));
+            let sd = try_num!(a(2));
+            if p <= 0.0 || p >= 1.0 || sd <= 0.0 {
+                return Arg::err(ErrorKind::Num);
+            }
+            n(mean + sd * normal_inv(p))
+        }
+        "NORM.S.INV" | "NORMSINV" => {
+            let p = try_num!(a(0));
+            if p <= 0.0 || p >= 1.0 {
+                return Arg::err(ErrorKind::Num);
+            }
+            n(normal_inv(p))
+        }
+        "STANDARDIZE" => {
+            let sd = try_num!(a(2));
+            if sd <= 0.0 {
+                return Arg::err(ErrorKind::Num);
+            }
+            n((try_num!(a(0)) - try_num!(a(1))) / sd)
+        }
+        // ---------------- more text ----------------
+        "CHAR" | "UNICHAR" => {
+            let code = try_num!(a(0)) as u32;
+            match char::from_u32(code) {
+                Some(c) if code > 0 => t(c.to_string()),
+                _ => Arg::err(ErrorKind::Value),
+            }
+        }
+        "CODE" | "UNICODE" => {
+            let s = try_text!(a(0));
+            match s.chars().next() {
+                Some(c) => n(c as u32 as f64),
+                None => Arg::err(ErrorKind::Value),
+            }
+        }
+        "CLEAN" => t(try_text!(a(0)).chars().filter(|c| !c.is_control()).collect()),
+        "FIXED" => {
+            let x = try_num!(a(0));
+            let d = match args.get(1).map(|v| v.clone().scalar()) {
+                None | Some(Value::Empty) => 2.0,
+                Some(v) => try_num!(v),
+            };
+            let no_commas = args.len() > 2 && try_bool!(a(2));
+            let pattern = if no_commas { format!("0{}", if d > 0.0 { format!(".{}", "0".repeat(d as usize)) } else { String::new() }) } else { format!("#,##0{}", if d > 0.0 { format!(".{}", "0".repeat(d as usize)) } else { String::new() }) };
+            t(format_text(&Value::Number(round_to(x, d, 0)), &pattern))
+        }
+        "NUMBERVALUE" => {
+            let mut s = try_text!(a(0)).trim().to_string();
+            let dec = args.get(1).map(|v| v.clone().scalar().to_display()).unwrap_or_else(|| ".".into());
+            let grp = args.get(2).map(|v| v.clone().scalar().to_display()).unwrap_or_else(|| ",".into());
+            if !grp.is_empty() {
+                s = s.replace(&grp, "");
+            }
+            if !dec.is_empty() && dec != "." {
+                s = s.replace(&dec, ".");
+            }
+            let pct = s.matches('%').count() as i32;
+            s = s.replace('%', "");
+            match s.trim().parse::<f64>() {
+                Ok(v) => n(v / 100f64.powi(pct)),
+                Err(_) => Arg::err(ErrorKind::Value),
+            }
+        }
+        "REPLACE" => {
+            let s: Vec<char> = try_text!(a(0)).chars().collect();
+            let start = (try_num!(a(1)) as usize).max(1) - 1;
+            let count = try_num!(a(2)).max(0.0) as usize;
+            let new = try_text!(a(3));
+            let mut out: String = s.iter().take(start.min(s.len())).collect();
+            out.push_str(&new);
+            out.extend(s.iter().skip((start + count).min(s.len())));
+            t(out)
+        }
+        "TEXTSPLIT" | "SPLIT" => {
+            let text = try_text!(a(0));
+            let col_delims: Vec<String> = args.get(1).map(|v| v.values().iter().map(|x| x.to_display()).filter(|x| !x.is_empty()).collect()).unwrap_or_default();
+            let row_delims: Vec<String> = if name == "TEXTSPLIT" { args.get(2).map(|v| v.values().iter().map(|x| x.to_display()).filter(|x| !x.is_empty()).collect()).unwrap_or_default() } else { vec![] };
+            let ignore_empty = if name == "TEXTSPLIT" { args.len() > 3 && try_bool!(a(3)) } else { args.len() < 3 || try_bool!(a(2)) };
+            let split_by = |s: &str, delims: &[String]| -> Vec<String> {
+                if delims.is_empty() {
+                    return vec![s.to_string()];
+                }
+                let mut parts = vec![s.to_string()];
+                for d in delims {
+                    parts = parts.iter().flat_map(|p| p.split(d.as_str()).map(|x| x.to_string()).collect::<Vec<_>>()).collect();
+                }
+                parts
+            };
+            let rows: Vec<Vec<Value>> = split_by(&text, &row_delims)
+                .into_iter()
+                .map(|r| split_by(&r, &col_delims).into_iter().filter(|x| !(ignore_empty && x.is_empty())).map(|x| Value::parse_literal(&x)).collect())
+                .filter(|r: &Vec<Value>| !r.is_empty())
+                .collect();
+            if rows.is_empty() {
+                return t(String::new());
+            }
+            Arg::Array(Array::from_rows(rows)).normalise()
+        }
+        "TEXTBEFORE" | "TEXTAFTER" => {
+            let text = try_text!(a(0));
+            let delim = try_text!(a(1));
+            let inst = match args.get(2).map(|v| v.clone().scalar()) {
+                None | Some(Value::Empty) => 1i64,
+                Some(v) => try_num!(v) as i64,
+            };
+            if delim.is_empty() || inst == 0 {
+                return Arg::err(ErrorKind::Value);
+            }
+            let positions: Vec<usize> = text.match_indices(delim.as_str()).map(|(i, _)| i).collect();
+            let idx = if inst > 0 { positions.get(inst as usize - 1) } else { positions.len().checked_sub((-inst) as usize).and_then(|i| positions.get(i)) };
+            match idx {
+                Some(&i) => t(if name == "TEXTBEFORE" { text[..i].to_string() } else { text[i + delim.len()..].to_string() }),
+                None => Arg::err(ErrorKind::NA),
+            }
+        }
+        "REGEXMATCH" | "REGEXEXTRACT" | "REGEXREPLACE" => {
+            let text = try_text!(a(0));
+            let pattern = try_text!(a(1));
+            let re = match regex_lite::Regex::new(&pattern) {
+                Ok(r) => r,
+                Err(_) => return Arg::err(ErrorKind::Value),
+            };
+            match name {
+                "REGEXMATCH" => b(re.is_match(&text)),
+                "REGEXEXTRACT" => match re.captures(&text) {
+                    Some(c) => t(c.get(1).or_else(|| c.get(0)).map(|m| m.as_str().to_string()).unwrap_or_default()),
+                    None => Arg::err(ErrorKind::NA),
+                },
+                _ => {
+                    let rep = try_text!(a(2));
+                    t(re.replace_all(&text, rep.as_str()).to_string())
+                }
+            }
+        }
+        "ARRAYTOTEXT" | "VALUETOTEXT" => {
+            let arr = args.first().map(|v| v.as_array()).unwrap_or_else(empty_arr);
+            let concise = args.get(1).map(|v| to_number(&v.clone().scalar()).unwrap_or(0.0) == 0.0).unwrap_or(true);
+            if name == "VALUETOTEXT" || arr.rows * arr.cols == 1 {
+                let v = arr.data.first().cloned().unwrap_or(Value::Empty);
+                return t(if concise || !matches!(v, Value::Text(_)) { v.to_display() } else { format!("\"{}\"", v.to_display()) });
+            }
+            let rows: Vec<String> = (0..arr.rows).map(|r| arr.row(r).iter().map(|v| if concise || !matches!(v, Value::Text(_)) { v.to_display() } else { format!("\"{}\"", v.to_display()) }).collect::<Vec<_>>().join(if concise { ", " } else { "," })).collect();
+            t(if concise { rows.join("; ") } else { format!("{{{}}}", rows.join(";")) })
+        }
+        "JOIN" => {
+            let delim = try_text!(a(0));
+            let parts: Vec<String> = args.iter().skip(1).flat_map(|x| x.values()).map(|v| v.to_display()).collect();
+            t(parts.join(&delim))
+        }
+        // ---------------- more lookup & array shaping ----------------
+        "INDIRECT" => {
+            let text = try_text!(a(0));
+            match super::parser::parse(text.trim().trim_start_matches('=')) {
+                Ok(Expr::Ref(r)) => match resolve_ref_at(&r, ctx.wb, ctx.table, ctx.at) {
+                    Ok(rect) => {
+                        if rect.r0 == rect.r1 && rect.c0 == rect.c1 {
+                            Arg::Scalar(ctx.wb.value(crate::model::CellRef::new(rect.table, rect.r0, rect.c0)))
+                        } else {
+                            range_arg(rect, ctx.wb)
+                        }
+                    }
+                    Err(e) => Arg::err(e),
+                },
+                Ok(Expr::Name(nm)) => match ctx.wb.named_range(&nm) {
+                    Some(nr) => super::evaluate_full(ctx.wb, ctx.table, ctx.at, &nr.reference),
+                    None => Arg::err(ErrorKind::Ref),
+                },
+                _ => Arg::err(ErrorKind::Ref),
+            }
+        }
+        "ADDRESS" => {
+            let row = try_num!(a(0)) as i64;
+            let col = try_num!(a(1)) as i64;
+            if row < 1 || col < 1 {
+                return Arg::err(ErrorKind::Value);
+            }
+            let abs = match args.get(2).map(|v| v.clone().scalar()) {
+                None | Some(Value::Empty) => 1,
+                Some(v) => try_num!(v) as i64,
+            };
+            let col_text = crate::model::col_to_letters((col - 1) as u32);
+            let cell = match abs {
+                2 => format!("{}${}", col_text, row),
+                3 => format!("${}{}", col_text, row),
+                4 => format!("{}{}", col_text, row),
+                _ => format!("${}${}", col_text, row),
+            };
+            match args.get(4).map(|v| v.clone().scalar()) {
+                Some(Value::Text(sheet)) if !sheet.is_empty() => t(format!("{}::{}", if sheet.chars().all(|c| c.is_alphanumeric() || c == '_') { sheet } else { format!("'{}'", sheet) }, cell)),
+                _ => t(cell),
+            }
+        }
+        "LOOKUP" => {
+            let x = a(0);
+            let vector = args.get(1).map(|v| v.as_array()).unwrap_or_else(empty_arr);
+            let result = args.get(2).map(|v| v.as_array()).unwrap_or_else(|| vector.clone());
+            let mut best: Option<usize> = None;
+            for (i, v) in vector.data.iter().enumerate() {
+                if v.is_empty() {
+                    continue;
+                }
+                if compare(v, &x) != std::cmp::Ordering::Greater {
+                    best = Some(i);
+                } else {
+                    break;
+                }
+            }
+            match best {
+                Some(i) => Arg::Scalar(result.data.get(i).cloned().unwrap_or(Value::Error(ErrorKind::NA))),
+                None => Arg::err(ErrorKind::NA),
+            }
+        }
+        "XMATCH" => {
+            let x = a(0);
+            let arr = args.get(1).map(|v| v.as_array()).unwrap_or_else(empty_arr);
+            let mode = match args.get(2).map(|v| v.clone().scalar()) {
+                None | Some(Value::Empty) => 0i64,
+                Some(v) => try_num!(v) as i64,
+            };
+            let mut best: Option<(usize, Value)> = None;
+            for (i, v) in arr.data.iter().enumerate() {
+                let ord = compare(v, &x);
+                match mode {
+                    0 => {
+                        if ord == std::cmp::Ordering::Equal {
+                            return n(i as f64 + 1.0);
+                        }
+                    }
+                    -1 => {
+                        if ord != std::cmp::Ordering::Greater && best.as_ref().map(|(_, bv)| compare(v, bv) == std::cmp::Ordering::Greater).unwrap_or(true) {
+                            best = Some((i, v.clone()));
+                        }
+                    }
+                    1 => {
+                        if ord != std::cmp::Ordering::Less && best.as_ref().map(|(_, bv)| compare(v, bv) == std::cmp::Ordering::Less).unwrap_or(true) {
+                            best = Some((i, v.clone()));
+                        }
+                    }
+                    _ => return Arg::err(ErrorKind::Value),
+                }
+            }
+            match best {
+                Some((i, v)) if mode != 0 && (mode != -1 || compare(&v, &x) != std::cmp::Ordering::Greater) => n(i as f64 + 1.0),
+                _ => Arg::err(ErrorKind::NA),
+            }
+        }
+        "HSTACK" | "VSTACK" => {
+            let arrays: Vec<Array> = args.iter().map(|v| v.as_array()).collect();
+            if arrays.is_empty() {
+                return Arg::err(ErrorKind::Value);
+            }
+            if name == "VSTACK" {
+                let cols = arrays.iter().map(|x| x.cols).max().unwrap_or(0);
+                let mut rows: Vec<Vec<Value>> = vec![];
+                for x in &arrays {
+                    for r in 0..x.rows {
+                        let mut row = x.row(r);
+                        row.resize(cols as usize, Value::Error(ErrorKind::NA));
+                        rows.push(row);
+                    }
+                }
+                Arg::Array(Array::from_rows(rows))
+            } else {
+                let nrows = arrays.iter().map(|x| x.rows).max().unwrap_or(0);
+                let mut rows: Vec<Vec<Value>> = (0..nrows).map(|_| vec![]).collect();
+                for x in &arrays {
+                    for r in 0..nrows {
+                        if r < x.rows {
+                            rows[r as usize].extend(x.row(r));
+                        } else {
+                            rows[r as usize].extend((0..x.cols).map(|_| Value::Error(ErrorKind::NA)));
+                        }
+                    }
+                }
+                Arg::Array(Array::from_rows(rows))
+            }
+        }
+        "TAKE" | "DROP" => {
+            let arr = args.first().map(|v| v.as_array()).unwrap_or_else(empty_arr);
+            let rows_n = match args.get(1).map(|v| v.clone().scalar()) {
+                None | Some(Value::Empty) => None,
+                Some(v) => Some(try_num!(v) as i64),
+            };
+            let cols_n = match args.get(2).map(|v| v.clone().scalar()) {
+                None | Some(Value::Empty) => None,
+                Some(v) => Some(try_num!(v) as i64),
+            };
+            let pick = |len: u32, k: Option<i64>| -> (u32, u32) {
+                let len_i = len as i64;
+                match (name, k) {
+                    (_, None) => (0, len),
+                    ("TAKE", Some(k)) if k >= 0 => (0, k.min(len_i) as u32),
+                    ("TAKE", Some(k)) => ((len_i + k).max(0) as u32, len),
+                    (_, Some(k)) if k >= 0 => (k.min(len_i) as u32, len),
+                    (_, Some(k)) => (0, (len_i + k).max(0) as u32),
+                }
+            };
+            let (r0, r1) = pick(arr.rows, rows_n);
+            let (c0, c1) = pick(arr.cols, cols_n);
+            if r1 <= r0 || c1 <= c0 {
+                return Arg::err(ErrorKind::Value);
+            }
+            let rows: Vec<Vec<Value>> = (r0..r1).map(|r| (c0..c1).map(|c| arr.get(r, c).clone()).collect()).collect();
+            Arg::Array(Array::from_rows(rows)).normalise()
+        }
+        "CHOOSECOLS" | "CHOOSEROWS" => {
+            let arr = args.first().map(|v| v.as_array()).unwrap_or_else(empty_arr);
+            let mut idx: Vec<i64> = vec![];
+            for v in args.iter().skip(1).flat_map(|x| x.values()) {
+                idx.push(try_num!(v) as i64);
+            }
+            let len = if name == "CHOOSECOLS" { arr.cols } else { arr.rows } as i64;
+            let mut picks: Vec<u32> = vec![];
+            for i in idx {
+                let k = if i < 0 { len + i } else { i - 1 };
+                if k < 0 || k >= len {
+                    return Arg::err(ErrorKind::Value);
+                }
+                picks.push(k as u32);
+            }
+            let rows: Vec<Vec<Value>> = if name == "CHOOSECOLS" {
+                (0..arr.rows).map(|r| picks.iter().map(|c| arr.get(r, *c).clone()).collect()).collect()
+            } else {
+                picks.iter().map(|r| arr.row(*r)).collect()
+            };
+            Arg::Array(Array::from_rows(rows)).normalise()
+        }
+        "TOCOL" | "TOROW" => {
+            let arr = args.first().map(|v| v.as_array()).unwrap_or_else(empty_arr);
+            let ignore = match args.get(1).map(|v| v.clone().scalar()) {
+                None | Some(Value::Empty) => 0i64,
+                Some(v) => try_num!(v) as i64,
+            };
+            let by_col = args.len() > 2 && try_bool!(a(2));
+            let mut vals: Vec<Value> = vec![];
+            if by_col {
+                for c in 0..arr.cols {
+                    for r in 0..arr.rows {
+                        vals.push(arr.get(r, c).clone());
+                    }
+                }
+            } else {
+                vals = arr.data.clone();
+            }
+            let vals: Vec<Value> = vals.into_iter().filter(|v| !((ignore == 1 || ignore == 3) && v.is_empty()) && !((ignore == 2 || ignore == 3) && matches!(v, Value::Error(_)))).collect();
+            if vals.is_empty() {
+                return Arg::err(ErrorKind::Value);
+            }
+            let len = vals.len() as u32;
+            Arg::Array(if name == "TOCOL" { Array { rows: len, cols: 1, data: vals } } else { Array { rows: 1, cols: len, data: vals } }).normalise()
+        }
+        "WRAPROWS" | "WRAPCOLS" => {
+            let arr = args.first().map(|v| v.as_array()).unwrap_or_else(empty_arr);
+            let width = try_num!(a(1)) as usize;
+            if width == 0 {
+                return Arg::err(ErrorKind::Num);
+            }
+            let pad = args.get(2).map(|v| v.clone().scalar()).unwrap_or(Value::Error(ErrorKind::NA));
+            let vals = arr.data.clone();
+            let chunks: Vec<Vec<Value>> = vals.chunks(width).map(|c| {
+                let mut row = c.to_vec();
+                row.resize(width, pad.clone());
+                row
+            }).collect();
+            if chunks.is_empty() {
+                return Arg::err(ErrorKind::Value);
+            }
+            let out = Array::from_rows(chunks);
+            if name == "WRAPROWS" {
+                Arg::Array(out)
+            } else {
+                let rows: Vec<Vec<Value>> = (0..out.cols).map(|c| out.column(c)).collect();
+                Arg::Array(Array::from_rows(rows))
+            }
+        }
+        "EXPAND" => {
+            let arr = args.first().map(|v| v.as_array()).unwrap_or_else(empty_arr);
+            let rows = match args.get(1).map(|v| v.clone().scalar()) {
+                None | Some(Value::Empty) => arr.rows,
+                Some(v) => try_num!(v) as u32,
+            };
+            let cols = match args.get(2).map(|v| v.clone().scalar()) {
+                None | Some(Value::Empty) => arr.cols,
+                Some(v) => try_num!(v) as u32,
+            };
+            if rows < arr.rows || cols < arr.cols {
+                return Arg::err(ErrorKind::Value);
+            }
+            let pad = args.get(3).map(|v| v.clone().scalar()).unwrap_or(Value::Error(ErrorKind::NA));
+            let data: Vec<Value> = (0..rows).flat_map(|r| (0..cols).map(move |c| (r, c))).map(|(r, c)| if r < arr.rows && c < arr.cols { arr.get(r, c).clone() } else { pad.clone() }).collect();
+            Arg::Array(Array { rows, cols, data })
+        }
+        "TYPE" => n(match a(0) {
+            Value::Number(_) => 1.0,
+            Value::Text(_) => 2.0,
+            Value::Bool(_) => 4.0,
+            Value::Error(_) => 16.0,
+            Value::Empty => 1.0,
+        }),
+        "ERROR.TYPE" => match a(0) {
+            Value::Error(e) => n(match e {
+                ErrorKind::Div0 => 2.0,
+                ErrorKind::Value => 3.0,
+                ErrorKind::Ref => 4.0,
+                ErrorKind::Name => 5.0,
+                ErrorKind::Num => 6.0,
+                ErrorKind::NA => 7.0,
+                _ => 8.0,
+            }),
+            _ => Arg::err(ErrorKind::NA),
+        },
+        "ISERR" => b(matches!(a(0), Value::Error(e) if e != ErrorKind::NA)),
+        "ISNONTEXT" => b(!matches!(a(0), Value::Text(_))),
+        // ---------------- more dates ----------------
+        "DAYS360" => {
+            let start = match date_arg(&a(0)) {
+                Ok(x) => x.floor(),
+                Err(e) => return Arg::err(e),
+            };
+            let end = match date_arg(&a(1)) {
+                Ok(x) => x.floor(),
+                Err(e) => return Arg::err(e),
+            };
+            let european = args.len() > 2 && try_bool!(a(2));
+            let (y1, m1, mut d1) = civil_from_days(start as i64 + serial_to_civil_offset());
+            let (y2, m2, mut d2) = civil_from_days(end as i64 + serial_to_civil_offset());
+            if european {
+                if d1 == 31 {
+                    d1 = 30;
+                }
+                if d2 == 31 {
+                    d2 = 30;
+                }
+            } else {
+                if d1 == 31 {
+                    d1 = 30;
+                }
+                if d2 == 31 && d1 == 30 {
+                    d2 = 30;
+                }
+            }
+            n(((y2 - y1) * 360 + (m2 - m1) * 30 + (d2 - d1)) as f64)
+        }
+        "WEEKNUM" | "ISOWEEKNUM" => {
+            let s = match date_arg(&a(0)) {
+                Ok(x) => x.floor(),
+                Err(e) => return Arg::err(e),
+            };
+            let (y, _, _) = civil_from_days(s as i64 + serial_to_civil_offset());
+            if name == "ISOWEEKNUM" {
+                // ISO 8601: week with the year's first Thursday is week 1
+                let wd = weekday_mon0(s); // 0 = Monday
+                let thursday = s - wd as f64 + 3.0;
+                let (ty, _, _) = civil_from_days(thursday as i64 + serial_to_civil_offset());
+                let jan1 = serial_from_ymd(ty, 1, 1);
+                n(((thursday - jan1) / 7.0).floor() + 1.0)
+            } else {
+                let kind = if args.len() > 1 { try_num!(a(1)) as i64 } else { 1 };
+                let jan1 = serial_from_ymd(y, 1, 1);
+                // week starts on Sunday (1) or Monday (2/11/21)
+                let start_mon0 = if kind == 1 || kind == 17 { 6 } else { 0 };
+                let offset = ((weekday_mon0(jan1) - start_mon0) % 7 + 7) % 7;
+                n(((s - jan1 + offset as f64) / 7.0).floor() + 1.0)
+            }
+        }
+        "TIMEVALUE" => {
+            let s = try_text!(a(0));
+            match parse_date_time_text(&s) {
+                Some((v, _)) => n(v - v.floor()),
+                None => Arg::err(ErrorKind::Value),
+            }
+        }
+        "NETWORKDAYS.INTL" | "WORKDAY.INTL" => {
+            let start = match date_arg(&a(0)) {
+                Ok(x) => x.floor(),
+                Err(e) => return Arg::err(e),
+            };
+            let weekend = match args.get(2).map(|v| v.clone().scalar()) {
+                None | Some(Value::Empty) => weekend_mask(1),
+                Some(Value::Text(s)) if s.len() == 7 && s.chars().all(|c| c == '0' || c == '1') => s.chars().map(|c| c == '1').collect::<Vec<bool>>(),
+                Some(v) => weekend_mask(try_num!(v) as i64),
+            };
+            let holidays: Vec<f64> = args.get(3).map(|h| h.values().iter().filter_map(|v| to_number(v).ok().map(|x| x.floor())).collect()).unwrap_or_default();
+            let is_workday = |d: f64| !weekend[weekday_mon0(d) as usize] && !holidays.contains(&d);
+            if name == "NETWORKDAYS.INTL" {
+                let end = match date_arg(&a(1)) {
+                    Ok(x) => x.floor(),
+                    Err(e) => return Arg::err(e),
+                };
+                let (s, e, sign) = if start <= end { (start, end, 1.0) } else { (end, start, -1.0) };
+                let mut count = 0;
+                let mut d = s;
+                while d <= e {
+                    if is_workday(d) {
+                        count += 1;
+                    }
+                    d += 1.0;
+                }
+                n(count as f64 * sign)
+            } else {
+                let days = try_num!(a(1)) as i64;
+                if weekend.iter().all(|w| *w) {
+                    return Arg::err(ErrorKind::Value);
+                }
+                let step = if days >= 0 { 1.0 } else { -1.0 };
+                let mut left = days.abs();
+                let mut d = start;
+                while left > 0 {
+                    d += step;
+                    if is_workday(d) {
+                        left -= 1;
+                    }
+                }
+                n(d)
+            }
+        }
+        // ---------------- more finance ----------------
+        "SYD" => {
+            let (cost, salvage, life, per) = (try_num!(a(0)), try_num!(a(1)), try_num!(a(2)), try_num!(a(3)));
+            if life <= 0.0 || per < 1.0 || per > life {
+                return Arg::err(ErrorKind::Num);
+            }
+            n((cost - salvage) * (life - per + 1.0) * 2.0 / (life * (life + 1.0)))
+        }
+        "DB" => {
+            let (cost, salvage, life, period) = (try_num!(a(0)), try_num!(a(1)), try_num!(a(2)), try_num!(a(3)));
+            let month = match args.get(4).map(|v| v.clone().scalar()) {
+                None | Some(Value::Empty) => 12.0,
+                Some(v) => try_num!(v),
+            };
+            if cost <= 0.0 || life <= 0.0 || period < 1.0 || period > life + 1.0 {
+                return Arg::err(ErrorKind::Num);
+            }
+            let rate = ((1.0 - (salvage / cost).powf(1.0 / life)) * 1000.0).round() / 1000.0;
+            let mut total = 0.0;
+            let mut dep = 0.0;
+            for p in 1..=(period as i64) {
+                dep = if p == 1 {
+                    cost * rate * month / 12.0
+                } else if p as f64 == life + 1.0 {
+                    (cost - total) * rate * (12.0 - month) / 12.0
+                } else {
+                    (cost - total) * rate
+                };
+                total += dep;
+            }
+            n(dep)
+        }
+        "DDB" => {
+            let (cost, salvage, life, period) = (try_num!(a(0)), try_num!(a(1)), try_num!(a(2)), try_num!(a(3)));
+            let factor = match args.get(4).map(|v| v.clone().scalar()) {
+                None | Some(Value::Empty) => 2.0,
+                Some(v) => try_num!(v),
+            };
+            if cost < 0.0 || life <= 0.0 || period < 1.0 || period > life {
+                return Arg::err(ErrorKind::Num);
+            }
+            let mut book_value = cost;
+            let mut dep = 0.0;
+            for _ in 1..=(period as i64) {
+                dep = (book_value * factor / life).min(book_value - salvage).max(0.0);
+                book_value -= dep;
+            }
+            n(dep)
+        }
+        "FVSCHEDULE" => {
+            let principal = try_num!(a(0));
+            let rates = args.get(1).map(|v| v.values()).unwrap_or_default();
+            let mut v = principal;
+            for r in rates {
+                if r.is_empty() {
+                    continue;
+                }
+                v *= 1.0 + try_num!(r);
+            }
+            n(v)
+        }
+        "CUMIPMT" | "CUMPRINC" => {
+            let (rate, nper, pv, start, end) = (try_num!(a(0)), try_num!(a(1)), try_num!(a(2)), try_num!(a(3)), try_num!(a(4)));
+            let kind = match args.get(5).map(|v| v.clone().scalar()) {
+                None | Some(Value::Empty) => 0.0,
+                Some(v) => try_num!(v),
+            };
+            if rate <= 0.0 || nper <= 0.0 || pv <= 0.0 || start < 1.0 || end < start || end > nper {
+                return Arg::err(ErrorKind::Num);
+            }
+            let mut total = 0.0;
+            for per in (start as i64)..=(end as i64) {
+                let part = annuity(if name == "CUMIPMT" { "IPMT" } else { "PPMT" }, &[n(rate), n(per as f64), n(nper), n(pv), n(0.0), n(kind)]);
+                match part.scalar() {
+                    Value::Number(x) => total += x,
+                    Value::Error(e) => return Arg::err(e),
+                    _ => {}
+                }
+            }
+            n(total)
+        }
+        "ISPMT" => {
+            let (rate, per, nper, pv) = (try_num!(a(0)), try_num!(a(1)), try_num!(a(2)), try_num!(a(3)));
+            if nper == 0.0 {
+                return Arg::err(ErrorKind::Div0);
+            }
+            n(-pv * rate * (1.0 - (per - 1.0) / nper))
+        }
+        "MIRR" => {
+            let flows = match args.first().map(cash_flows) {
+                Some(Ok(v)) => v,
+                Some(Err(e)) => return Arg::err(e),
+                None => return Arg::err(ErrorKind::Value),
+            };
+            let finance = try_num!(a(1));
+            let reinvest = try_num!(a(2));
+            let nn = flows.len() as f64;
+            if nn < 2.0 {
+                return Arg::err(ErrorKind::Value);
+            }
+            let npv_neg: f64 = flows.iter().enumerate().filter(|(_, v)| **v < 0.0).map(|(i, v)| v / (1.0 + finance).powi(i as i32)).sum();
+            let fv_pos: f64 = flows.iter().enumerate().filter(|(_, v)| **v > 0.0).map(|(i, v)| v * (1.0 + reinvest).powf(nn - 1.0 - i as f64)).sum();
+            if npv_neg == 0.0 || fv_pos == 0.0 {
+                return Arg::err(ErrorKind::Div0);
+            }
+            n((fv_pos / -npv_neg).powf(1.0 / (nn - 1.0)) - 1.0)
+        }
+        "RRI" => {
+            let (nper, pv, fv) = (try_num!(a(0)), try_num!(a(1)), try_num!(a(2)));
+            if nper <= 0.0 || pv == 0.0 {
+                return Arg::err(ErrorKind::Num);
+            }
+            n((fv / pv).powf(1.0 / nper) - 1.0)
+        }
+        "PDURATION" => {
+            let (rate, pv, fv) = (try_num!(a(0)), try_num!(a(1)), try_num!(a(2)));
+            if rate <= 0.0 || pv <= 0.0 || fv <= 0.0 {
+                return Arg::err(ErrorKind::Num);
+            }
+            n((fv.ln() - pv.ln()) / (1.0 + rate).ln())
+        }
         // ---------------- review & finance primitives ----------------
         "CHECK" => {
             // CHECK(condition, [label]) — TRUE/FALSE; collected by the Review panel
@@ -2801,4 +3904,113 @@ fn bucket_label(age: i64, edges: &[i64]) -> String {
     }
     let lo = if idx == 1 { 0 } else { edges[idx - 2] + 1 };
     format!("{}-{}", lo, edges[idx - 1])
+}
+
+
+// ---------------------------------------------------------------------------
+// helpers for the extended library
+// ---------------------------------------------------------------------------
+
+/// Offset between serial dates (days since 1899-12-30) and `civil_from_days` (days since 1970-01-01).
+fn serial_to_civil_offset() -> i64 {
+    -25569
+}
+
+/// Weekend mask for NETWORKDAYS.INTL / WORKDAY.INTL codes (index 0 = Monday).
+fn weekend_mask(code: i64) -> Vec<bool> {
+    let mut m = vec![false; 7];
+    match code {
+        1 => {
+            m[5] = true;
+            m[6] = true;
+        }
+        2 => {
+            m[6] = true;
+            m[0] = true;
+        }
+        3 => {
+            m[0] = true;
+            m[1] = true;
+        }
+        4 => {
+            m[1] = true;
+            m[2] = true;
+        }
+        5 => {
+            m[2] = true;
+            m[3] = true;
+        }
+        6 => {
+            m[3] = true;
+            m[4] = true;
+        }
+        7 => {
+            m[4] = true;
+            m[5] = true;
+        }
+        11 => m[6] = true,
+        12 => m[0] = true,
+        13 => m[1] = true,
+        14 => m[2] = true,
+        15 => m[3] = true,
+        16 => m[4] = true,
+        17 => m[5] = true,
+        _ => {
+            m[5] = true;
+            m[6] = true;
+        }
+    }
+    m
+}
+
+/// Standard normal CDF (Abramowitz–Stegun 7.1.26, |error| < 1.5e-7).
+fn normal_cdf(z: f64) -> f64 {
+    let t = 1.0 / (1.0 + 0.2316419 * z.abs());
+    let d = 0.3989422804014327 * (-z * z / 2.0).exp();
+    let p = d * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+    if z >= 0.0 {
+        1.0 - p
+    } else {
+        p
+    }
+}
+
+/// Inverse standard normal CDF (Acklam's rational approximation refined by one Newton step).
+fn normal_inv(p: f64) -> f64 {
+    let a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02, 1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00];
+    let b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02, 6.680131188771972e+01, -1.328068155288572e+01];
+    let c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00, -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00];
+    let d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00, 3.754408661907416e+00];
+    let plow = 0.02425;
+    let x = if p < plow {
+        let q = (-2.0 * p.ln()).sqrt();
+        (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+    } else if p <= 1.0 - plow {
+        let q = p - 0.5;
+        let r = q * q;
+        (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0)
+    } else {
+        let q = (-2.0 * (1.0 - p).ln()).sqrt();
+        -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+    };
+    // one Newton refinement
+    let e = normal_cdf(x) - p;
+    let u = e * (2.0 * std::f64::consts::PI).sqrt() * (x * x / 2.0).exp();
+    x - u / (1.0 + x * u / 2.0)
+}
+
+/// Deterministic-per-call pseudo random number in [0, 1) (xorshift seeded from the clock).
+fn pseudo_random() -> f64 {
+    use std::cell::Cell;
+    thread_local! {
+        static STATE: Cell<u64> = Cell::new(0x9E3779B97F4A7C15);
+    }
+    STATE.with(|s| {
+        let mut x = s.get() ^ (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1) | 1);
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        (x >> 11) as f64 / (1u64 << 53) as f64
+    })
 }

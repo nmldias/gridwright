@@ -129,6 +129,7 @@ pub fn list_entries(wb: &Workbook, table: TableId, rule: &Validation) -> Vec<Str
                     table,
                     now: wb.now_serial,
                     at: None,
+                    locals: vec![],
                 };
                 let vals = formula::eval(&expr, &ctx).values();
                 return vals.into_iter().filter(|v| !v.is_empty()).map(|v| v.to_display()).collect();
