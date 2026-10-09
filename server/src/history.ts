@@ -135,6 +135,13 @@ export function currentSeq(fileId: string): number {
 }
 
 /** Append an entry; returns the assigned seq. */
+const appendListeners = new Set<(fileId: string, entry: LogEntry) => void>();
+/** Be told of every appended entry (the companion re-checks a document after it changes). */
+export function onAppend(fn: (fileId: string, entry: LogEntry) => void): () => void {
+  appendListeners.add(fn);
+  return () => appendListeners.delete(fn);
+}
+
 export function appendEntry(fileId: string, entry: Omit<LogEntry, 'seq' | 'ts'>): number {
   if (!safeId(fileId)) throw new Error('bad file id');
   ensureHistoryDir();
@@ -142,6 +149,13 @@ export function appendEntry(fileId: string, entry: Omit<LogEntry, 'seq' | 'ts'>)
   const full: LogEntry = { seq, ts: new Date().toISOString(), ...entry };
   appendFileSync(logPath(fileId), JSON.stringify(full) + '\n');
   seqCache.set(fileId, seq);
+  for (const fn of appendListeners) {
+    try {
+      fn(fileId, full);
+    } catch (e) {
+      console.error('append listener failed:', (e as Error).message);
+    }
+  }
   return seq;
 }
 

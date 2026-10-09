@@ -38,6 +38,7 @@ export function TopBar() {
   const selection = useStore((s) => s.selection);
   const selectedChart = useStore((s) => s.selectedChart);
   const pendingCount = useStore((s) => s.proposals.reduce((n, p) => n + (p.status === 'pending' ? 1 : 0), 0));
+  const attention = useStore((s) => s.attention);
   const selKind = useStore((s) => {
     const sel = s.selection;
     const c = sel && s.cells.get(sel.table)?.get(sel.ar * 65536 + sel.ac);
@@ -192,7 +193,7 @@ export function TopBar() {
           testId="code"
         />
       )}
-      {btn('ai', 'Ask', 'Ask the AI assistant about this document')}
+      {btn('ai', 'Ask', attention ? `${attention} issue${attention === 1 ? '' : 's'} need${attention === 1 ? 's' : ''} attention — the companion's brief is in Ask` : 'Ask the assistant; the companion keeps the context and the brief here', attention ? <span className="count">{attention}</span> : null)}
       {btn('review', 'Review', 'Proposals awaiting review, checks, code-cell evidence, sign-offs', pendingCount ? <span className="count">{pendingCount}</span> : null)}
       {btn('share', 'Share', 'Who can open this document, and copies to send', undefined, 'phone-hide')}
       <span className="grow" />

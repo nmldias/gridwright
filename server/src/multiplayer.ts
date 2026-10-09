@@ -185,6 +185,14 @@ export function notifyProposal(file: string, proposal: unknown) {
   for (const p of room.values()) if (p.ws.readyState === WebSocket.OPEN) p.ws.send(msg);
 }
 
+/** The companion re-checked a document: open sessions refresh their brief. */
+export function notifyCompanion(file: string, payload: { attention: number }) {
+  const room = rooms.get(file);
+  if (!room) return;
+  const msg = JSON.stringify({ type: 'companion', file, ...payload });
+  for (const p of room.values()) if (p.ws.readyState === WebSocket.OPEN) p.ws.send(msg);
+}
+
 export function notifySaved(file: string, byClient?: string) {
   const room = rooms.get(file);
   if (!room) return;

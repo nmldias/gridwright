@@ -149,6 +149,10 @@ function connect() {
       case 'reload':
         // another client saved; edits are already relayed live, nothing to do
         break;
+      case 'companion':
+        // the companion re-checked this document (a change, a timer): the brief refreshes itself
+        useStore.setState({ companionVersion: getState().companionVersion + 1, attention: typeof msg.attention === 'number' ? msg.attention : getState().attention });
+        break;
       case 'permission':
         // the owner changed this document's sharing while we are connected
         if (typeof msg.permission === 'string') {

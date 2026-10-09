@@ -5,6 +5,8 @@ import { useStore } from '../state/store';
 import { applyActions } from './ai';
 import { docKey, patchConversation, sendMessage, stopMessage, updateMessage, useChat, type ToolRun } from './chat';
 import { PanelHeader } from './PanelHeader';
+import { CompanionBrief } from './CompanionPanel';
+import { remember, statementOf } from './companion';
 
 const AUTO_KEY = 'gridwright.ai.autoApply';
 const TOOLS_KEY = 'gridwright.ai.tools';
@@ -92,7 +94,16 @@ export function AiPanel() {
     bottom.current?.scrollIntoView({ block: 'end' });
   }, [messages]);
 
-  const send = () => void sendMessage(key, { tools, autoApply, file: fileId });
+  const send = () => {
+    // a statement to keep ("Objective: …", "Exclude: …") is recorded, not asked
+    const st = statementOf(input);
+    if (st) {
+      patchConversation(key, { input: '' });
+      void remember(st.kind, st.text);
+      return;
+    }
+    void sendMessage(key, { tools, autoApply, file: fileId });
+  };
 
   const stop = (e: React.KeyboardEvent) => e.stopPropagation();
   const stripActions = (s: string) => s.replace(/```gridwright-actions[\s\S]*?```/g, '').trim();
@@ -184,10 +195,11 @@ export function AiPanel() {
           <p className="muted small">Works with any OpenAI-compatible chat endpoint: vLLM, Ollama, llama.cpp, OpenRouter, OpenAI, or Anthropic's compatibility endpoint. The key is kept on the server. {me.role !== 'admin' ? 'Only administrators can change the endpoint.' : ''}</p>
         </div>
       )}
+      <CompanionBrief />
       <div className="chat">
         {messages.length === 0 && (
           <div className="muted small">
-            Ask for formulas, Python/JavaScript/SQL analysis, or new tables. The assistant sees your table names, sizes and the first rows, plus the current selection. Every proposed change is shown as a before → after diff; nothing is written until you apply it (Ctrl+Z reverts).
+            Ask about the data, for formulas, Python/JavaScript/SQL analysis, or new tables. Start a line with <b>Objective:</b>, <b>Exclude:</b>, <b>Decision:</b> or <b>Remember:</b> to record it in the context without asking. Every proposed change is shown as a before → after diff; nothing is written until you apply it (Ctrl+Z reverts).
           </div>
         )}
         {messages.map((m, i) => (
@@ -254,7 +266,7 @@ export function AiPanel() {
         <textarea
           value={input}
           rows={3}
-          placeholder="Ask about your data…  (Enter to send, Shift+Enter for a new line)"
+          placeholder="Ask, or state what matters (Objective: …, Exclude: …)  ·  Enter to send"
           onKeyDown={(e) => {
             e.stopPropagation();
             if (e.key === 'Enter' && !e.shiftKey) {

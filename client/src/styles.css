@@ -1315,14 +1315,14 @@ label.check {
 .ok-text {
   color: #166534;
 }
-.attention {
+.review-panel .attention {
   background: var(--amber-soft);
   color: var(--amber);
   border-radius: 6px;
   padding: 6px 8px;
   font-size: var(--ui-small);
 }
-.attention::before {
+.review-panel .attention::before {
   content: '⚠ ';
 }
 .effect-lines {
@@ -1423,4 +1423,159 @@ details.evidence > div {
 }
 .diff-table.effects tr.effect .new {
   background: #dbeafe;
+}
+
+/* ---- the companion (inside Ask) ---- */
+.companion {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #fafafa;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.companion.attention {
+  border-left: 3px solid var(--amber);
+}
+.companion-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.companion-lead {
+  font-size: var(--ui-base);
+  color: var(--accent);
+}
+.companion.attention .companion-lead {
+  color: var(--amber);
+}
+.reflection {
+  position: relative;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 28px 6px 8px;
+  font-size: var(--ui-small);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.reflection .icon {
+  position: absolute;
+  right: 4px;
+  top: 4px;
+}
+.reflection-line button {
+  margin-left: 6px;
+}
+.brief {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+  font-size: var(--ui-small);
+}
+@media (min-width: 1100px) {
+  .side .brief {
+    grid-template-columns: 1fr;
+  }
+}
+.brief-h {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin-bottom: 2px;
+}
+.matters-attention {
+  color: var(--amber);
+}
+.companion-actions button {
+  font-size: var(--ui-small);
+  min-height: 28px;
+  padding: 3px 9px;
+}
+.companion-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+.ctx-item {
+  padding: 4px 0;
+  border-bottom: 1px dashed var(--border);
+}
+.ctx-item.proposed {
+  background: var(--amber-soft);
+  padding: 4px 6px;
+  border-radius: 4px;
+}
+.ctx-item .badge {
+  margin-left: 6px;
+}
+.ctx-add .period {
+  width: 90px;
+}
+.watch-item {
+  border: 1px solid var(--border);
+  border-left: 3px solid #85b7eb;
+  border-radius: 6px;
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  background: var(--panel);
+}
+.watch-item.attention {
+  border-left-color: var(--amber);
+}
+.watch-item.ok {
+  border-left-color: var(--green);
+}
+.watch-item.stale,
+.watch-item.error {
+  border-left-color: var(--border-strong);
+}
+.watch-item.proposed {
+  border-left-color: #7c3aed;
+}
+.watch-item code {
+  font-size: 11.5px;
+}
+.issue {
+  background: var(--amber-soft);
+  border-radius: 6px;
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.interpretation {
+  background: var(--panel);
+  border-radius: 4px;
+  padding: 4px 6px;
+}
+.interpretation .pre {
+  white-space: pre-wrap;
+}
+.watch-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  background: var(--panel);
+}
+.watch-form .mono {
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+.watch-form .num {
+  width: 70px;
+}
+.source-chip .muted {
+  font-size: var(--ui-small);
 }

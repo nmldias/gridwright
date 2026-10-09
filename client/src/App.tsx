@@ -18,6 +18,7 @@ import { NavigatePanel } from './ui/NavigatePanel';
 import { StartCard } from './ui/StartCard';
 import { SidePanel } from './ui/SidePanel';
 import { loadProposals } from './ui/proposals';
+import { loadCompanion } from './ui/companion';
 import { SqlPanel } from './ui/SqlPanel';
 import { StatusBar } from './ui/StatusBar';
 import { TablePanel } from './ui/TablePanel';
@@ -124,9 +125,14 @@ export function App() {
   // keep ?file= in the URL in sync with the open document
   const fileId = useStore((s) => s.fileId);
   const proposalsVersion = useStore((s) => s.proposalsVersion);
+  const companionVersion = useStore((s) => s.companionVersion);
   useEffect(() => {
     void loadProposals();
   }, [fileId, proposalsVersion]);
+  useEffect(() => {
+    if (fileId) void loadCompanion(fileId);
+    else useStore.setState({ attention: 0 });
+  }, [fileId, companionVersion]);
   useEffect(() => {
     const url = new URL(location.href);
     if (fileId) url.searchParams.set('file', fileId);

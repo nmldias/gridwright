@@ -120,6 +120,10 @@ interface State {
   start: boolean;
   /** what the Files panel shows */
   filesView: 'documents' | 'templates';
+  /** open companion issues needing attention (the Ask badge) */
+  attention: number;
+  /** bumped when the server says the companion re-checked the document */
+  companionVersion: number;
   set: (patch: Partial<State>) => void;
 }
 
@@ -177,6 +181,8 @@ export const useStore = create<State>((set) => ({
   })(),
   start: false,
   filesView: 'documents',
+  attention: 0,
+  companionVersion: 0,
   touch: typeof window !== 'undefined' && (navigator.maxTouchPoints > 0 || 'ontouchstart' in window) && !matchMedia('(pointer: fine)').matches,
   set: (patch) => set(patch),
 }));

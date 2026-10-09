@@ -144,6 +144,35 @@ export async function chat(req: Request, res: Response) {
   res.end();
 }
 
+/** One non-interactive completion (the companion's interpretation of an issue): text and model id, or an error. */
+export async function completeOnce(messages: { role: string; content: string }[], maxTokens = 1200): Promise<{ text: string; model: string }> {
+  const cfg = readAiConfig();
+  const baseUrl = (cfg.baseUrl || '').replace(/\/+$/, '');
+  if (!baseUrl || !cfg.model) throw new Error('AI endpoint not configured — open the assistant settings (⚙) and set the base URL and model');
+  const apiKey = cfg.apiKeyEnc ? decrypt(cfg.apiKeyEnc) : process.env.AI_API_KEY ?? '';
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (apiKey) headers.authorization = `Bearer ${apiKey}`;
+  if (/anthropic\.com/.test(baseUrl)) {
+    headers['x-api-key'] = apiKey;
+    headers['anthropic-version'] = '2023-06-01';
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 120_000);
+  try {
+    const upstream = await fetch(`${baseUrl}/chat/completions`, { method: 'POST', headers, body: JSON.stringify({ model: cfg.model, messages, stream: true, temperature: 0.2, max_tokens: maxTokens }), signal: controller.signal });
+    if (!upstream.ok || !upstream.body) throw new Error(`model endpoint returned ${upstream.status}: ${(await upstream.text().catch(() => '')).slice(0, 300)}`);
+    let err = '';
+    const r = await readRound(upstream.body, (o) => {
+      const e = (o as { error?: string }).error;
+      if (e) err = e;
+    });
+    if (!r.text && err) throw new Error(err);
+    return { text: r.text.trim(), model: cfg.model };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Consume one streamed completion: forward text deltas, collect tool calls. */
 async function readRound(body: ReadableStream<Uint8Array>, send: (o: unknown) => void): Promise<Round> {
   const reader = body.getReader();

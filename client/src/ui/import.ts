@@ -6,6 +6,7 @@ import * as book from '../engine/book';
 import { addTable } from '../grid/actions';
 import { setStatus, useStore } from '../state/store';
 import { parseCsv } from './files';
+import { recordImport } from './companion';
 
 export const IMPORT_ACCEPT = '.csv,.tsv,.txt,.json,.xlsx,.xlsm,.xls,.ods';
 
@@ -29,7 +30,9 @@ export async function importFile(f: File): Promise<void> {
           if (values[p.r]) values[p.r][p.c] = '=' + cell.f;
         }
       }
-      addTable({ name: wb.SheetNames.length > 1 ? `${f.name.replace(/\.[^.]+$/, '')} ${name}` : f.name.replace(/\.[^.]+$/, ''), rows: values.length, cols: Math.max(...values.map((r) => r.length), 1), values, origin: 'import' });
+      const tname = wb.SheetNames.length > 1 ? `${f.name.replace(/\.[^.]+$/, '')} ${name}` : f.name.replace(/\.[^.]+$/, '');
+      const tid = addTable({ name: tname, rows: values.length, cols: Math.max(...values.map((r) => r.length), 1), values, origin: 'import' });
+      if (typeof tid === 'number') void recordImport(f.name, tid, tname, Math.max(0, values.length - 1), values[0]?.map(String).filter(Boolean) ?? []);
       n++;
     }
     setStatus(`Imported ${n} sheet${n === 1 ? '' : 's'} from ${f.name}`);
@@ -52,7 +55,9 @@ export async function importFile(f: File): Promise<void> {
     setStatus('The file is empty.');
     return;
   }
-  addTable({ name: f.name.replace(/\.(csv|tsv|txt)$/i, ''), rows: rows.length, cols: Math.max(...rows.map((r) => r.length)), values: rows, origin: 'import' });
+  const tname = f.name.replace(/\.(csv|tsv|txt)$/i, '');
+  const tid = addTable({ name: tname, rows: rows.length, cols: Math.max(...rows.map((r) => r.length)), values: rows, origin: 'import' });
+  if (typeof tid === 'number') void recordImport(f.name, tid, tname, Math.max(0, rows.length - 1), rows[0]?.filter(Boolean) ?? []);
   setStatus(`Imported ${rows.length} rows into a new table`);
 }
 

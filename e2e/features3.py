@@ -29,7 +29,7 @@ for i, a in enumerate(sys.argv):
 OUT = os.environ.get("E2E_OUT", "/tmp/gridwright-e2e")
 os.makedirs(OUT, exist_ok=True)
 
-MCP_TOOLS = sorted(["list_documents", "read_document", "read_table", "read_range", "evaluate", "run_checks", "read_history", "propose_edit", "list_proposals", "list_connections", "run_sql"])
+MCP_TOOLS = sorted(["list_documents", "read_document", "read_table", "read_range", "evaluate", "run_checks", "read_history", "list_connections", "run_sql", "propose_edit", "list_proposals", "read_context", "read_graph", "remember", "propose_watch", "list_attention"])
 
 
 def rest(method, path, body=None, base=None, headers=None, raw=False):
@@ -83,7 +83,7 @@ def main():
     check("MCP initialize answers with server info and the tools capability", bool(res.get("serverInfo")) and "tools" in res.get("capabilities", {}), json.dumps(init)[:160])
     _, listed = mcp("tools/list")
     names = sorted(t["name"] for t in listed.get("result", {}).get("tools", []))
-    check("MCP lists the eleven typed workbook tools", names == MCP_TOOLS, ", ".join(names))
+    check("MCP lists the sixteen typed tools (workbook, proposals, SQL and the companion)", names == MCP_TOOLS, ", ".join(names))
     code, _ = rest("GET", "/mcp", raw=True)
     check("MCP refuses GET (stateless: POST only)", code == 405, str(code))
     # the engine throws plain strings; they must come back as a readable tool error, not a protocol error

@@ -92,7 +92,7 @@ jobs:
           /tmp/gw-py/bin/python -c "import pandas, matplotlib; print('pandas', pandas.__version__)"
       - name: Browser tests
         run: |
-          pip install -q playwright && python3 -m playwright install --with-deps chromium >/dev/null
+          pip install -q playwright langgraph && python3 -m playwright install --with-deps chromium >/dev/null
           (cd server && GRIDWRIGHT_DATA=/tmp/gw-data PORT=8787 GRIDWRIGHT_PYTHON=/tmp/gw-py/bin/python GRIDWRIGHT_PYTHON_TIMEOUT_MS=5000 GRIDWRIGHT_PYTHON_QUEUE=3 node dist/index.js > /tmp/server.log 2>&1 &)
           (cd server && GRIDWRIGHT_DATA=/tmp/gw-acl GRIDWRIGHT_TRUST_TAILSCALE=1 GRIDWRIGHT_ADMINS=boss@example.com GRIDWRIGHT_PYTHON=/tmp/gw-py/bin/python GRIDWRIGHT_PYTHON_USERS=alice@example.com GRIDWRIGHT_GPU_USERS=boss@example.com PORT=8795 node dist/index.js > /tmp/server-acl.log 2>&1 &)
           node e2e/mock-llm.mjs > /tmp/mock.log 2>&1 &
@@ -107,6 +107,8 @@ jobs:
         run: python3 e2e/reference.py http://127.0.0.1:8787
       - name: Interaction quality (drafts, overflow, document menu, Review wording, navigation, keyboard, phone)
         run: python3 e2e/interface.py http://127.0.0.1:8787 --acl http://127.0.0.1:8795
+      - name: The companion (context, watches, attention gate, graph, LangGraph cycle, interpretation)
+        run: python3 e2e/companion.py http://127.0.0.1:8787 --mock-llm http://127.0.0.1:8899/v1
       - name: Control gates (reviewer isolation, approval integrity, revocation, execution permissions)
         run: node e2e/controls.mjs http://127.0.0.1:8795
       - name: Worker isolation fails closed without bubblewrap

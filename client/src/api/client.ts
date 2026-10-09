@@ -92,6 +92,122 @@ export interface Proposal {
   command?: string;
 }
 
+// --- the companion ---------------------------------------------------------------------------
+export type RecordKind = 'fact' | 'source' | 'objective' | 'hypothesis' | 'contradiction' | 'decision' | 'exclusion';
+export const RECORD_KINDS: RecordKind[] = ['objective', 'exclusion', 'decision', 'fact', 'source', 'hypothesis', 'contradiction'];
+export interface ContextRecord {
+  id: string;
+  kind: RecordKind;
+  text: string;
+  source?: string;
+  period?: string;
+  arrivedAt: string;
+  by: { id: string; name: string; login?: string };
+  origin: 'user' | 'agent' | 'system';
+  status: 'stated' | 'proposed' | 'confirmed' | 'retired' | 'superseded';
+  supersededBy?: string;
+  links?: { table?: number; ref?: string }[];
+}
+export interface WatchDef {
+  purpose: string;
+  scope: string;
+  formula: string;
+  table?: string;
+  kind: 'threshold' | 'check' | 'change';
+  op?: '>' | '>=' | '<' | '<=' | '=' | '!=';
+  value?: number;
+  sustain: number;
+  response: 'note' | 'brief' | 'case';
+  sources?: string[];
+  freshnessHours?: number;
+}
+export interface Observation {
+  at: string;
+  seq: number;
+  value: number | boolean | string | null;
+  error?: string;
+  breach: boolean;
+  fresh: boolean;
+  def: string;
+}
+export interface Issue {
+  id: string;
+  watch: string;
+  openedAt: string;
+  updatedAt: string;
+  status: 'open' | 'resolved';
+  resolvedAt?: string;
+  revision: number;
+  summary: string;
+  evidence: string[];
+  uncertainty: string[];
+  next: string;
+  interpretation?: { text: string; model: string; at: string; revision: number };
+}
+export type Health = 'ok' | 'baseline' | 'attention' | 'stale' | 'error' | 'unchecked' | 'proposed';
+export interface Watch {
+  id: string;
+  def: WatchDef;
+  defHash: string;
+  authority: 'proposed' | 'approved';
+  by: { id: string; name: string; login?: string };
+  origin: 'user' | 'agent';
+  createdAt: string;
+  updatedAt: string;
+  lastChecked?: string;
+  health: Health;
+  observations: Observation[];
+  issue?: Issue;
+  history: Issue[];
+}
+export interface CompanionEvent {
+  at: string;
+  kind: string;
+  text: string;
+  by?: string;
+  level: 'quiet' | 'watch' | 'attention';
+}
+export interface SourceStatus {
+  name: string;
+  kind: 'table';
+  lastChange?: string;
+  supply: 'import' | 'live' | 'manual' | 'unknown';
+  rows: number;
+}
+export interface Brief {
+  changed: string[];
+  matters: string[];
+  next: string[];
+  health: { checked?: string; ok: number; baseline: number; attention: number; stale: number; error: number; unchecked: number; proposed: number };
+  sources: SourceStatus[];
+}
+export interface GraphNode {
+  id: string;
+  type: string;
+  label: string;
+  table?: number;
+  status?: string;
+  health?: Health;
+  supply?: SourceStatus['supply'];
+  lastChange?: string;
+  rows?: number;
+  period?: string;
+}
+export interface GraphEdge {
+  from: string;
+  to: string;
+  type: string;
+  via: string;
+}
+export interface Companion {
+  records: ContextRecord[];
+  watches: Watch[];
+  events: CompanionEvent[];
+  brief: Brief;
+  seenAt?: string;
+  graph: { nodes: GraphNode[]; edges: GraphEdge[] };
+}
+
 export type ToolEvent =
   | { kind: 'call'; id: string; name: string; args: Record<string, unknown> }
   | { kind: 'result'; id: string; name: string; ok: boolean; summary: string; result?: unknown }
@@ -199,6 +315,37 @@ export const api = {
       return j(await fetch(`/api/files/${encodeURIComponent(id)}/proposals/${encodeURIComponent(pid)}/refresh`, { method: 'POST' }));
     },
     /** A checkpoint built by the server from the log — how a sign-off share persists. */
+    // the companion: context records, watches, issues, the brief and the graph
+    async companion(id: string): Promise<Companion> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion`));
+    },
+    async companionSeen(id: string): Promise<void> {
+      await fetch(`/api/files/${encodeURIComponent(id)}/companion/seen`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    },
+    async companionCheck(id: string): Promise<Companion & { attention: number; changed: boolean }> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/check`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }));
+    },
+    async addRecord(id: string, body: { kind: RecordKind; text: string; source?: string; period?: string; links?: { table?: number; ref?: string }[]; client?: string }): Promise<ContextRecord> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/records`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));
+    },
+    async updateRecord(id: string, rid: string, body: { text?: string; status?: 'confirmed' | 'retired' | 'stated'; period?: string; source?: string; kind?: RecordKind; client?: string }): Promise<ContextRecord> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/records/${encodeURIComponent(rid)}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));
+    },
+    async removeRecord(id: string, rid: string): Promise<void> {
+      await j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/records/${encodeURIComponent(rid)}`, { method: 'DELETE' }));
+    },
+    async addWatch(id: string, body: Partial<WatchDef> & { client?: string }): Promise<Watch> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/watches`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));
+    },
+    async updateWatch(id: string, wid: string, body: { approve?: boolean; def?: Partial<WatchDef>; reason?: string; client?: string }): Promise<Watch> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/watches/${encodeURIComponent(wid)}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));
+    },
+    async removeWatch(id: string, wid: string): Promise<void> {
+      await j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/watches/${encodeURIComponent(wid)}`, { method: 'DELETE' }));
+    },
+    async interpret(id: string, issueId: string, again = false): Promise<Issue> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/interpret/${encodeURIComponent(issueId)}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ again }) }));
+    },
     async checkpoint(id: string, client?: string): Promise<{ id: string; seq: number }> {
       return j(await fetch(`/api/files/${encodeURIComponent(id)}/checkpoint`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ client }) }));
     },
