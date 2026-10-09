@@ -75,7 +75,7 @@ The `release` branch carries the prebuilt engine, client and server, so only Nod
 ```bash
 scripts/install.sh --tailscale   # HTTPS on the tailnet via `tailscale serve`, identity + roles from Tailscale
 scripts/install.sh --python      # venv with pandas/numpy/matplotlib for server-side Python cells (recommended)
-scripts/install.sh --sandbox     # bubblewrap + an AppArmor profile so cells run fully isolated on Ubuntu ≥ 23.10 (sudo once)
+scripts/install.sh --sandbox     # bubblewrap + an AppArmor profile so cells run fully isolated on Ubuntu ≥ 23.10 (sudo once; use ssh -t)
 scripts/install.sh --pyodide     # download the browser Python runtime (~400 MB) for offline Pyodide cells
 GW_TOKEN=$(openssl rand -hex 16) GW_ADMINS=you@example.com AI_BASE_URL=http://host:8888/v1 scripts/install.sh
 ```
@@ -109,7 +109,7 @@ Requirements: Rust (rustup), Node 22. `scripts/build.sh` builds the wasm engine,
 | `GRIDWRIGHT_PYODIDE_DIR` | directory of a Pyodide distribution served at `/pyodide/` (default `data/pyodide`) |
 | `GRIDWRIGHT_PYTHON` | interpreter for server-side Python cells: a path, `off`, or unset = `data/pyenv/bin/python` (made by `install.sh --python`) else `python3` on PATH |
 | `GRIDWRIGHT_PYTHON_SANDBOX` | `auto` (bubblewrap → user namespace → none), `bwrap`, `unshare`, `none`, or `require` (no namespace sandbox = runtime off). `/api/health` and every run record report what is in use |
-| `GRIDWRIGHT_PYTHON_TIMEOUT_MS`, `GRIDWRIGHT_PYTHON_MEMORY_MB`, `GRIDWRIGHT_PYTHON_CONCURRENCY` | per-run wall-clock limit (60 000), address-space cap for CPU runs (2 048; GPU runs are uncapped because CUDA reserves address space), parallel runs (2) |
+| `GRIDWRIGHT_PYTHON_TIMEOUT_MS`, `GRIDWRIGHT_PYTHON_MEMORY_MB`, `GRIDWRIGHT_PYTHON_CONCURRENCY`, `GRIDWRIGHT_PYTHON_THREADS` | per-run wall-clock limit (60 000); data-segment cap for CPU runs (default: a quarter of RAM, at most half of what was free at start, never under 2 048 — GPU runs are uncapped because CUDA reserves address space); parallel runs (2); BLAS/OpenMP threads per run (4 — numpy reserves a buffer per thread at import, so this also bounds memory) |
 | `AI_BASE_URL`, `AI_MODEL`, `AI_API_KEY` | defaults for the assistant (also editable in the UI, stored encrypted) |
 
 ## Using it

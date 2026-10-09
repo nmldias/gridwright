@@ -137,6 +137,10 @@ export const api = {
     async status(): Promise<ServerPython & { available: boolean; reason?: string }> {
       return j(await fetch('/api/python'));
     },
+    /** administrators: detect interpreter, sandbox and cuDF again */
+    async probe(): Promise<{ available: boolean; version: string; sandbox: 'bwrap' | 'unshare' | 'none' | null; gpu: string | null; reason?: string; fallbacks?: string; limits: { timeoutMs: number; memoryMb: number } }> {
+      return j(await fetch('/api/python/probe', { method: 'POST' }));
+    },
   },
   async me(): Promise<{ login: string; name: string; role: 'admin' | 'editor' | 'viewer'; identity: boolean }> {
     return j(await fetch('/api/me'));

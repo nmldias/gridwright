@@ -36,7 +36,7 @@ import {
   type StoredConnection,
 } from './storage.js';
 
-const VERSION = '0.5.0';
+const VERSION = '0.5.1';
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? '0.0.0.0';
 const TOKEN = process.env.GRIDWRIGHT_TOKEN ?? '';

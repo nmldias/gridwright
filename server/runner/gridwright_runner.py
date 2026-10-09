@@ -41,10 +41,16 @@ def set_limits(limits, gpu):
             resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
         except Exception:
             pass
-        # CUDA reserves very large virtual address ranges, so the address-space cap only applies to CPU runs
+        # Memory: cap the data segment (heap + private anonymous mappings), not the whole address
+        # space — shared libraries, thread stacks and the per-core BLAS buffers numpy reserves at
+        # import would otherwise eat the budget on machines with many cores. CUDA reserves huge
+        # address ranges of its own, so GPU runs are not capped here (the wall-clock limit still holds).
         if not gpu:
             mem = int(limits.get("memoryMb") or 2048) * 1024 * 1024
-            resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
+            try:
+                resource.setrlimit(resource.RLIMIT_DATA, (mem, mem))
+            except Exception:
+                resource.setrlimit(resource.RLIMIT_AS, (mem * 2, mem * 2))
     except Exception:
         pass
 
@@ -319,7 +325,6 @@ def run_cell(req):
     snapshot = req.get("snapshot") or {"tables": [], "current": {"table": 0, "row": 0, "col": 0}}
     gpu = bool(req.get("gpu"))
     limits = req.get("limits") or {}
-    set_limits(limits, gpu)
     max_cells = int(limits.get("maxCells") or 200000)
 
     gpu_state = "off"
@@ -339,6 +344,9 @@ def run_cell(req):
         matplotlib.use("Agg")
     except Exception:
         pass
+    # limits apply to the cell's own work, after the runtime's imports (in the warm host they are
+    # inherited from the parent; in a single run they happen just above)
+    set_limits(limits, gpu)
 
     q = _Q(snapshot)
     real_stdout = sys.stdout

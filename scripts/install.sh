@@ -34,7 +34,9 @@
 #   GW_PYTHON           interpreter for server-side Python cells (default: the --python venv, else python3); "off" disables
 #   GW_PYTHON_SANDBOX   auto (default: bubblewrap → user namespace → none), bwrap, unshare, none, or require
 #                       (refuse to run cells without a namespace sandbox)
-#   GW_PYTHON_TIMEOUT_MS, GW_PYTHON_MEMORY_MB, GW_PYTHON_CONCURRENCY   per-run limits (60000, 2048, 2)
+#   GW_PYTHON_TIMEOUT_MS, GW_PYTHON_MEMORY_MB, GW_PYTHON_CONCURRENCY, GW_PYTHON_THREADS
+#                       per-run limits: wall clock (60000 ms), memory (default a quarter of RAM, at most half of
+#                       what is free at start), parallel runs (2), BLAS threads per run (4)
 #   GW_BACKUP_DIR    where nightly backups go (default ~/gridwright-backups, 14 kept)
 #   GW_BACKUP_TARGET optional rsync destination for the backups, e.g. nmldias@100.78.161.2:gridwright-backups/
 #   AI_BASE_URL, AI_MODEL, AI_API_KEY   defaults for the assistant (also editable in the UI)
@@ -142,15 +144,32 @@ if [ "$SANDBOX" = 1 ]; then
     say "installing bubblewrap (sudo)"
     sudo apt-get install -y -qq bubblewrap >/dev/null || die "apt-get install bubblewrap failed"
   fi
-  if [ -d /etc/apparmor.d ] && [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ] && [ ! -f /etc/apparmor.d/bwrap ]; then
-    say "this kernel restricts unprivileged user namespaces; adding an AppArmor profile for bubblewrap (sudo)"
-    printf 'abi <abi/4.0>,\ninclude <tunables/global>\n\n# Lets bubblewrap create user namespaces on kernels with apparmor_restrict_unprivileged_userns=1\n# (installed by gridwright/scripts/install.sh --sandbox). The sandbox itself is set up by bwrap.\nprofile bwrap %s flags=(unconfined) {\n  userns,\n\n  include if exists <local/bwrap>\n}\n' "$(command -v bwrap)" | sudo tee /etc/apparmor.d/bwrap >/dev/null
-    sudo apparmor_parser -r -T -W /etc/apparmor.d/bwrap || die "apparmor_parser failed (is apparmor installed?)"
-  fi
-  if bwrap --ro-bind / / --tmpfs /tmp --proc /proc --dev /dev --unshare-all --die-with-parent true 2>/dev/null; then
+  bwrap_ok() { bwrap --ro-bind / / --tmpfs /tmp --proc /proc --dev /dev --unshare-all --die-with-parent true 2>"$DATA/.bwrap-test.err"; }
+  bwrap_err() { tail -n 1 "$DATA/.bwrap-test.err" 2>/dev/null; }
+  profile_text() {
+    printf 'abi <abi/4.0>,\ninclude <tunables/global>\n\n# Lets bubblewrap create user namespaces on kernels with apparmor_restrict_unprivileged_userns=1\n# (installed by gridwright/scripts/install.sh --sandbox). The sandbox itself is set up by bwrap.\nprofile bwrap %s flags=(unconfined) {\n  userns,\n\n  include if exists <local/bwrap>\n}\n' "$(command -v bwrap)"
+  }
+  mkdir -p "$DATA"
+  if bwrap_ok; then
     say "bubblewrap sandbox works"
+  elif [ ! -d /etc/apparmor.d ]; then
+    echo "warning: bubblewrap cannot set up its sandbox ($(bwrap_err)) and this host has no AppArmor; cells will fall back" >&2
+  elif [ -f /etc/apparmor.d/bwrap ] && ! grep -q gridwright /etc/apparmor.d/bwrap; then
+    echo "warning: bubblewrap cannot set up its sandbox ($(bwrap_err)) and /etc/apparmor.d/bwrap already exists (not Gridwright's):" >&2
+    sed 's/^/    /' /etc/apparmor.d/bwrap >&2
+    echo "  If that profile confines bwrap's children, move it aside and re-run:" >&2
+    echo "    sudo apparmor_parser -R /etc/apparmor.d/bwrap && sudo mv /etc/apparmor.d/bwrap /etc/apparmor.d/disable/ && scripts/install.sh --sandbox" >&2
   else
-    echo "warning: bubblewrap still cannot create its namespaces here; cells will fall back (see the health line below)" >&2
+    say "bubblewrap cannot set up its sandbox ($(bwrap_err)); adding an AppArmor profile that lets it create user namespaces (sudo)"
+    profile_text | sudo tee /etc/apparmor.d/bwrap >/dev/null
+    sudo apparmor_parser -r -T -W /etc/apparmor.d/bwrap || die "apparmor_parser failed (is apparmor installed?)"
+    if bwrap_ok; then
+      say "bubblewrap sandbox works"
+    else
+      echo "warning: bubblewrap still cannot set up its sandbox: $(bwrap_err)" >&2
+      echo "  $(sysctl kernel.apparmor_restrict_unprivileged_userns kernel.apparmor_restrict_unprivileged_unconfined 2>&1 | tr '\n' ' ')" >&2
+      echo "  loaded profile: $(sudo aa-status 2>/dev/null | grep -c -i bwrap) match(es); kernel $(uname -r). Please report this output." >&2
+    fi
   fi
 elif ! command -v bwrap >/dev/null 2>&1 || [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ] && [ ! -f /etc/apparmor.d/bwrap ]; then
   echo "note: for the strongest isolation of server-side Python cells run the installer with --sandbox (bubblewrap + an AppArmor profile; needs sudo once)" >&2
@@ -174,6 +193,7 @@ Environment=GRIDWRIGHT_PYTHON_SANDBOX=${GW_PYTHON_SANDBOX:-}
 Environment=GRIDWRIGHT_PYTHON_TIMEOUT_MS=${GW_PYTHON_TIMEOUT_MS:-}
 Environment=GRIDWRIGHT_PYTHON_MEMORY_MB=${GW_PYTHON_MEMORY_MB:-}
 Environment=GRIDWRIGHT_PYTHON_CONCURRENCY=${GW_PYTHON_CONCURRENCY:-}
+Environment=GRIDWRIGHT_PYTHON_THREADS=${GW_PYTHON_THREADS:-}
 Environment=AI_BASE_URL=${AI_BASE_URL:-}
 Environment=AI_MODEL=${AI_MODEL:-}
 Environment=AI_API_KEY=${AI_API_KEY:-}
@@ -184,7 +204,7 @@ start_nohup() {
   pkill -f "$ROOT/server/dist/index.js" 2>/dev/null || true
   (cd server && PORT="$PORT" HOST="$HOST_BIND" GRIDWRIGHT_DATA="$DATA" CLIENT_DIR="$ROOT/client/dist" \
     GRIDWRIGHT_TOKEN="${GW_TOKEN:-}" GRIDWRIGHT_TRUST_TAILSCALE="$TRUST" GRIDWRIGHT_ADMINS="${GW_ADMINS:-}" GRIDWRIGHT_READONLY="${GW_READONLY:-}" GRIDWRIGHT_DEFAULT_SHARING="${GW_DEFAULT_SHARING:-}" \
-    GRIDWRIGHT_PYTHON="${GW_PYTHON:-}" GRIDWRIGHT_PYTHON_SANDBOX="${GW_PYTHON_SANDBOX:-}" GRIDWRIGHT_PYTHON_TIMEOUT_MS="${GW_PYTHON_TIMEOUT_MS:-}" GRIDWRIGHT_PYTHON_MEMORY_MB="${GW_PYTHON_MEMORY_MB:-}" GRIDWRIGHT_PYTHON_CONCURRENCY="${GW_PYTHON_CONCURRENCY:-}" \
+    GRIDWRIGHT_PYTHON="${GW_PYTHON:-}" GRIDWRIGHT_PYTHON_SANDBOX="${GW_PYTHON_SANDBOX:-}" GRIDWRIGHT_PYTHON_TIMEOUT_MS="${GW_PYTHON_TIMEOUT_MS:-}" GRIDWRIGHT_PYTHON_MEMORY_MB="${GW_PYTHON_MEMORY_MB:-}" GRIDWRIGHT_PYTHON_CONCURRENCY="${GW_PYTHON_CONCURRENCY:-}" GRIDWRIGHT_PYTHON_THREADS="${GW_PYTHON_THREADS:-}" \
     AI_BASE_URL="${AI_BASE_URL:-}" AI_MODEL="${AI_MODEL:-}" AI_API_KEY="${AI_API_KEY:-}" \
     setsid -f nohup "$NODE_BIN" "$ROOT/server/dist/index.js" > "$DATA/server.log" 2>&1 < /dev/null)
   say "started with nohup (no systemd user session); log: $DATA/server.log"

@@ -7,7 +7,7 @@
 
 import { spawn, execFile, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { cpus, freemem, homedir, tmpdir, totalmem } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DATA_DIR } from './storage.js';
@@ -19,6 +19,8 @@ export interface PythonLimits {
   memoryMb: number;
   maxCells: number;
   concurrency: number;
+  /** BLAS/OpenMP threads per run (keeps numpy's per-core buffers and the pool's CPU use in check) */
+  threads: number;
 }
 
 export interface PythonStatus {
@@ -58,12 +60,23 @@ const num = (v: string | undefined, dflt: number, max: number) => {
   return Number.isFinite(n) && n > 0 ? Math.min(n, max) : dflt;
 };
 
+// per-run memory by default: a quarter of the machine, but no more than half of what is free at
+// start (the host may share the box with models), never less than 2 GB — a runaway cell is stopped
+// long before the host suffers, and a real workload still has tens of GB on a DGX Spark
+const DEFAULT_MEMORY_MB = Math.max(2048, Math.floor(Math.min(totalmem() / 4, freemem() / 2) / 1024 / 1024));
 export const LIMITS: PythonLimits = {
   timeoutMs: num(process.env.GRIDWRIGHT_PYTHON_TIMEOUT_MS, 60_000, 600_000),
-  memoryMb: num(process.env.GRIDWRIGHT_PYTHON_MEMORY_MB, 2048, 262_144),
+  memoryMb: num(process.env.GRIDWRIGHT_PYTHON_MEMORY_MB, DEFAULT_MEMORY_MB, 1_048_576),
   maxCells: num(process.env.GRIDWRIGHT_PYTHON_MAX_CELLS, 200_000, 5_000_000),
   concurrency: num(process.env.GRIDWRIGHT_PYTHON_CONCURRENCY, 2, 32),
+  threads: num(process.env.GRIDWRIGHT_PYTHON_THREADS, Math.max(1, Math.min(4, cpus().length)), 256),
 };
+
+/** Environment every run gets: thread caps for BLAS/OpenMP (per-core buffers!) and a lean allocator. */
+function runtimeEnv(): Record<string, string> {
+  const t = String(LIMITS.threads);
+  return { OPENBLAS_NUM_THREADS: t, OMP_NUM_THREADS: t, MKL_NUM_THREADS: t, NUMEXPR_MAX_THREADS: t, POLARS_MAX_THREADS: t, MALLOC_ARENA_MAX: '2', LANG: 'C.UTF-8', MPLBACKEND: 'Agg', PYTHONDONTWRITEBYTECODE: '1', PYTHONIOENCODING: 'utf-8' };
+}
 
 let status: PythonStatus = { available: false, interpreter: '', version: '', sandbox: null, gpu: null, reason: 'not probed yet', limits: LIMITS };
 let probing: Promise<PythonStatus> | null = null;
@@ -114,7 +127,8 @@ export function wrap(sandbox: Sandbox, py: string, gpu: boolean, serve = false):
     const expose = new Set<string>([dirname(script), resolve(dirname(dirname(py)))]);
     for (const dir of expose) if (existsSync(dir)) args.push('--ro-bind', dir, dir);
     if (gpu) for (const dev of nvidiaDevices()) args.push('--dev-bind', dev, dev);
-    args.push('--setenv', 'PATH', '/usr/local/bin:/usr/bin:/bin', '--setenv', 'HOME', '/tmp', '--setenv', 'LANG', 'C.UTF-8', '--setenv', 'MPLBACKEND', 'Agg', '--setenv', 'MPLCONFIGDIR', '/tmp/mpl', '--setenv', 'PYTHONDONTWRITEBYTECODE', '1', '--setenv', 'PYTHONIOENCODING', 'utf-8');
+    args.push('--setenv', 'PATH', '/usr/local/bin:/usr/bin:/bin', '--setenv', 'HOME', '/tmp', '--setenv', 'MPLCONFIGDIR', '/tmp/mpl');
+    for (const [k, v] of Object.entries(runtimeEnv())) args.push('--setenv', k, v);
     for (const k of ['LD_LIBRARY_PATH', 'CUDA_HOME', 'CUDA_VISIBLE_DEVICES', 'VIRTUAL_ENV']) if (process.env[k]) args.push('--setenv', k, process.env[k] as string);
     args.push('--chdir', '/tmp');
     return ['bwrap', ...args, ...tail];
@@ -124,7 +138,7 @@ export function wrap(sandbox: Sandbox, py: string, gpu: boolean, serve = false):
 }
 
 function childEnv(cwd: string): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', HOME: cwd, LANG: 'C.UTF-8', MPLBACKEND: 'Agg', MPLCONFIGDIR: join(cwd, 'mpl'), PYTHONDONTWRITEBYTECODE: '1', PYTHONIOENCODING: 'utf-8' };
+  const env: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', HOME: cwd, MPLCONFIGDIR: join(cwd, 'mpl'), ...runtimeEnv() };
   for (const k of ['LD_LIBRARY_PATH', 'CUDA_HOME', 'CUDA_VISIBLE_DEVICES', 'VIRTUAL_ENV']) if (process.env[k]) env[k] = process.env[k];
   return env;
 }
@@ -197,7 +211,7 @@ function execute(argv: string[], request: unknown, timeoutMs: number): Promise<R
 }
 
 async function probeSandbox(py: string, sb: Sandbox): Promise<{ ok: boolean; version: string; reason?: string }> {
-  const r = await execute(wrap(sb, py, false), { code: '1+1', snapshot: { tables: [], current: { table: 0, row: 0, col: 0 } }, gpu: false, limits: { cpuSeconds: 10, memoryMb: 512 } }, 20_000);
+  const r = await execute(wrap(sb, py, false), { code: '1+1', snapshot: { tables: [], current: { table: 0, row: 0, col: 0 } }, gpu: false, limits: { cpuSeconds: 10, memoryMb: LIMITS.memoryMb } }, 30_000);
   const out = r.result?.output as unknown[][] | undefined;
   if (r.result?.ok && Array.isArray(out) && out[0]?.[0] === 2) {
     return { ok: true, version: String((r.result.runtime as { version?: string })?.version ?? '') };
@@ -240,7 +254,7 @@ export function probePython(force = false): Promise<PythonStatus> {
 /** Does a GPU-requested run find RAPIDS cuDF? Slow (imports cudf), so it runs in the background. */
 export async function probeGpu(): Promise<string | null> {
   if (!status.available || !status.sandbox) return null;
-  const r = await execute(wrap(status.sandbox, status.interpreter, true), { code: '1', snapshot: { tables: [], current: { table: 0, row: 0, col: 0 } }, gpu: true, limits: { cpuSeconds: 60, memoryMb: 8192 } }, 90_000);
+  const r = await execute(wrap(status.sandbox, status.interpreter, true), { code: '1', snapshot: { tables: [], current: { table: 0, row: 0, col: 0 } }, gpu: true, limits: { cpuSeconds: 60, memoryMb: LIMITS.memoryMb } }, 90_000);
   const gpu = String(((r.result?.runtime as { packages?: Record<string, string> })?.packages ?? {}).gpu ?? (r.timedOut ? 'unavailable: probe timed out' : 'unavailable'));
   status = { ...status, gpu };
   return gpu;

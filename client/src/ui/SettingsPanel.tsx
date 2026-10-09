@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { setMyName } from '../api/ws';
 import { engineVersion } from '../engine/book';
 import { useStore } from '../state/store';
+import { api } from '../api/client';
 import { DEFAULT_PYODIDE_INDEX, getPyWorker, localPyodideIndex, pyodideIndexURL, resetPython, setPyodideIndexURL } from '../workers/runner';
 
 const PREWARM_KEY = 'gridwright.python.prewarm';
@@ -18,6 +19,22 @@ export function prewarmEnabled(): boolean {
 export function SettingsPanel() {
   const me = useStore((s) => s.me);
   const pythonStatus = useStore((s) => s.pythonStatus);
+  const serverPython = useStore((s) => s.serverPython);
+  const [probing, setProbing] = useState(false);
+  const [probeNote, setProbeNote] = useState('');
+  const reprobe = async () => {
+    setProbing(true);
+    setProbeNote('');
+    try {
+      const p = await api.python.probe();
+      useStore.setState({ serverPython: p.available ? { version: p.version, sandbox: p.sandbox, gpu: p.gpu, timeoutMs: p.limits.timeoutMs, memoryMb: p.limits.memoryMb } : null });
+      setProbeNote(p.available ? `CPython ${p.version} · sandbox: ${p.sandbox}${p.fallbacks ? ` (stronger sandboxes unavailable: ${p.fallbacks})` : ''} · ${p.gpu ?? ''}` : `not available: ${p.reason ?? 'unknown'}`);
+    } catch (e) {
+      setProbeNote((e as Error).message);
+    } finally {
+      setProbing(false);
+    }
+  };
   const [name, setName] = useState(() => {
     try {
       return localStorage.getItem('gridwright.name') ?? '';
@@ -41,7 +58,19 @@ export function SettingsPanel() {
           <input value={name} onKeyDown={stop} onChange={(e) => setName(e.target.value)} onBlur={() => name.trim() && setMyName(name.trim())} />
         </label>
       )}
-      <div className="panel-subtitle">Python runtime</div>
+      <div className="panel-subtitle">Python on the server</div>
+      <div className="muted small">
+        {serverPython
+          ? `CPython ${serverPython.version} · sandbox: ${serverPython.sandbox} · ${serverPython.gpu?.startsWith('cudf') ? 'GPU: ' + serverPython.gpu : 'no GPU (cuDF not installed)'} · ${serverPython.memoryMb} MB, ${Math.round(serverPython.timeoutMs / 1000)} s per run`
+          : 'not available on this server (no python3, or the sandbox probe failed) — new Python cells run in the browser'}
+      </div>
+      <div className="row wrap">
+        <button disabled={probing || me.role !== 'admin'} onClick={() => void reprobe()} title={me.role === 'admin' ? 'Detect the interpreter, the sandbox and cuDF again (after installing python, bubblewrap or RAPIDS)' : 'administrators only'}>
+          {probing ? 'Checking…' : 'Re-check server Python'}
+        </button>
+        {probeNote && <span className="muted small">{probeNote}</span>}
+      </div>
+      <div className="panel-subtitle">Python in the browser</div>
       <label className="field">
         <span>Pyodide URL {localPyodideIndex ? '(a local copy is served by this server)' : '(CDN by default)'}</span>
         <input value={pyUrl} onKeyDown={stop} onChange={(e) => setPyUrl(e.target.value)} />
