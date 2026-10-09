@@ -36,7 +36,11 @@ def check(name, ok, detail=""):
 
 
 host, port, db, user, pw = MS
-conn = rest("POST", "/api/connections", {"name": "sql server", "kind": "mssql", "host": host, "port": int(port), "database": db, "user": user, "password": pw, "ssl": False})
+# the seeding statements are writes, so this connection is opened read-write (an administrator's choice;
+# connections are read-only by default) and switched to read-only below to check the policy on this driver
+body = {"name": "sql server", "kind": "mssql", "host": host, "port": int(port), "database": db, "user": user, "password": pw, "ssl": False}
+conn = rest("POST", "/api/connections", dict(body, readOnly=False))
+check("a connection can be opened read-write by an administrator", conn.get("readOnly") is False, str(conn.get("readOnly")))
 t = None
 for _ in range(30):
     t = rest("POST", f"/api/connections/{conn['id']}/test")
@@ -60,6 +64,17 @@ try:
 except urllib.error.HTTPError as e:
     body = e.read().decode()
     check("errors from the server are surfaced", e.code == 400 and "missing_table" in body, body[:120])
+# the same connection switched to read-only: the policy refuses writes before they reach SQL Server
+rest("PUT", f"/api/connections/{conn['id']}", dict(body, readOnly=True))
+try:
+    q("DELETE FROM dbo.orders")
+    check("read-only policy refuses writes on SQL Server", False, "the DELETE went through")
+except urllib.error.HTTPError as e:
+    body_text = e.read().decode()
+    check("read-only policy refuses writes on SQL Server", e.code == 400 and "read-only" in body_text, body_text[:120])
+r = q("SELECT COUNT(*) AS n FROM dbo.orders")
+check("reads still work on the read-only connection", r["rows"] == [[5]], str(r["rows"]))
+rest("PUT", f"/api/connections/{conn['id']}", dict(body, readOnly=False))
 q("DROP TABLE dbo.orders")
 rest("DELETE", f"/api/connections/{conn['id']}")
 print(f"\n{sum(results)}/{len(results)} checks passed")
