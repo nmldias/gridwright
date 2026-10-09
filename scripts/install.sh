@@ -245,7 +245,7 @@ if [ "$BACKUP" = 1 ]; then
 set -euo pipefail
 stamp="\$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BACKUP_DIR"
-tar -czf "$BACKUP_DIR/gridwright-\$stamp.tar.gz" -C "$DATA" --exclude=./pyodide --exclude=./pyenv --exclude=./server.log --exclude=./backup.sh .
+tar -czf "$BACKUP_DIR/gridwright-\$stamp.tar.gz" -C "$DATA" --exclude=./pyodide --exclude=./pyenv --exclude=./pycache --exclude=./server.log --exclude=./backup.sh .
 ls -1t "$BACKUP_DIR"/gridwright-*.tar.gz 2>/dev/null | tail -n +15 | xargs -r rm -f
 ${GW_BACKUP_TARGET:+rsync -a --delete "$BACKUP_DIR/" "$GW_BACKUP_TARGET" || echo "rsync to $GW_BACKUP_TARGET failed" >&2}
 echo "backup written: $BACKUP_DIR/gridwright-\$stamp.tar.gz"

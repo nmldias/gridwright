@@ -6,7 +6,7 @@
 // run record so an auditor can see what protected the host.
 
 import { spawn, execFile, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { cpus, freemem, homedir, tmpdir, totalmem } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -52,6 +52,15 @@ export interface RunResult {
 }
 
 const here = dirname(fileURLToPath(import.meta.url));
+/** Caches that survive sandbox instances and restarts: matplotlib fonts, numba/cuPy JIT kernels. */
+const CACHE_DIR = join(DATA_DIR, 'pycache');
+try {
+  mkdirSync(CACHE_DIR, { recursive: true });
+} catch {
+  /* reported when a run fails */
+}
+const CACHE_IN_SANDBOX = '/tmp/gw-cache';
+const cacheEnv = (base: string): Record<string, string> => ({ MPLCONFIGDIR: join(base, 'mpl'), NUMBA_CACHE_DIR: join(base, 'numba'), CUPY_CACHE_DIR: join(base, 'cupy'), XDG_CACHE_HOME: join(base, 'xdg') });
 const RUNNER = [join(here, '../runner/gridwright_runner.py'), join(here, '../../runner/gridwright_runner.py')].find((p) => existsSync(p)) ?? join(here, '../runner/gridwright_runner.py');
 const MARKER = '\n__GRIDWRIGHT_RESULT__\n';
 
@@ -127,8 +136,10 @@ export function wrap(sandbox: Sandbox, py: string, gpu: boolean, serve = false):
     const expose = new Set<string>([dirname(script), resolve(dirname(dirname(py)))]);
     for (const dir of expose) if (existsSync(dir)) args.push('--ro-bind', dir, dir);
     if (gpu) for (const dev of nvidiaDevices()) args.push('--dev-bind', dev, dev);
-    args.push('--setenv', 'PATH', '/usr/local/bin:/usr/bin:/bin', '--setenv', 'HOME', '/tmp', '--setenv', 'MPLCONFIGDIR', '/tmp/mpl');
-    for (const [k, v] of Object.entries(runtimeEnv())) args.push('--setenv', k, v);
+    // one writable directory for library caches (fonts, JIT kernels), bound after the hiding mounts
+    if (existsSync(CACHE_DIR)) args.push('--bind', CACHE_DIR, CACHE_IN_SANDBOX);
+    args.push('--setenv', 'PATH', '/usr/local/bin:/usr/bin:/bin', '--setenv', 'HOME', '/tmp');
+    for (const [k, v] of Object.entries({ ...runtimeEnv(), ...cacheEnv(CACHE_IN_SANDBOX) })) args.push('--setenv', k, v);
     for (const k of ['LD_LIBRARY_PATH', 'CUDA_HOME', 'CUDA_VISIBLE_DEVICES', 'VIRTUAL_ENV']) if (process.env[k]) args.push('--setenv', k, process.env[k] as string);
     args.push('--chdir', '/tmp');
     return ['bwrap', ...args, ...tail];
@@ -138,7 +149,7 @@ export function wrap(sandbox: Sandbox, py: string, gpu: boolean, serve = false):
 }
 
 function childEnv(cwd: string): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', HOME: cwd, MPLCONFIGDIR: join(cwd, 'mpl'), ...runtimeEnv() };
+  const env: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', HOME: cwd, ...runtimeEnv(), ...cacheEnv(CACHE_DIR) };
   for (const k of ['LD_LIBRARY_PATH', 'CUDA_HOME', 'CUDA_VISIBLE_DEVICES', 'VIRTUAL_ENV']) if (process.env[k]) env[k] = process.env[k];
   return env;
 }
@@ -211,7 +222,7 @@ function execute(argv: string[], request: unknown, timeoutMs: number): Promise<R
 }
 
 async function probeSandbox(py: string, sb: Sandbox): Promise<{ ok: boolean; version: string; reason?: string }> {
-  const r = await execute(wrap(sb, py, false), { code: '1+1', snapshot: { tables: [], current: { table: 0, row: 0, col: 0 } }, gpu: false, limits: { cpuSeconds: 10, memoryMb: LIMITS.memoryMb } }, 30_000);
+  const r = await execute(wrap(sb, py, false), { code: '1+1', snapshot: { tables: [], current: { table: 0, row: 0, col: 0 } }, gpu: false, limits: { cpuSeconds: 60, memoryMb: LIMITS.memoryMb } }, 120_000);
   const out = r.result?.output as unknown[][] | undefined;
   if (r.result?.ok && Array.isArray(out) && out[0]?.[0] === 2) {
     return { ok: true, version: String((r.result.runtime as { version?: string })?.version ?? '') };
@@ -240,6 +251,7 @@ export function probePython(force = false): Promise<PythonStatus> {
       const p = await probeSandbox(py, sb);
       if (p.ok) {
         status = { available: true, interpreter: py, version: p.version, sandbox: sb, gpu: status.gpu, fallbacks: reasons.length ? reasons.join('; ') : undefined, limits: LIMITS };
+        warmPool();
         void probeGpu();
         return status;
       }
@@ -270,21 +282,43 @@ export const pythonStatus = () => status;
 interface Host {
   proc: ChildProcess;
   busy: boolean;
-  ready: boolean;
+  /** resolves when the host has imported its libraries and is reading requests; rejects if it dies first */
+  ready: Promise<void>;
   buf: string;
   waiter: ((line: Record<string, unknown>) => void) | null;
   runs: number;
+  dead: boolean;
 }
 
 const hosts: Host[] = [];
 const queue: (() => void)[] = [];
 const MAX_RUNS_PER_HOST = 500;
+/** a cold host imports pandas, numpy and matplotlib; the very first start may also build font caches */
+const HOST_START_MS = 180_000;
+
+function dropHost(host: Host) {
+  host.dead = true;
+  const i = hosts.indexOf(host);
+  if (i >= 0) hosts.splice(i, 1);
+}
+
+function drainQueue() {
+  const next = queue.shift();
+  if (next) next();
+}
 
 function startHost(sandbox: Sandbox, py: string): Host {
   const argv = wrap(sandbox, py, false, true);
   const cwd = mkdtempSync(join(tmpdir(), 'gw-pyhost-'));
   const proc = spawn(argv[0], argv.slice(1), { cwd, env: childEnv(cwd), stdio: ['pipe', 'pipe', 'pipe'] });
-  const host: Host = { proc, busy: false, ready: false, buf: '', waiter: null, runs: 0 };
+  let markReady: () => void = () => undefined;
+  let markDead: (e: Error) => void = () => undefined;
+  const ready = new Promise<void>((res, rej) => {
+    markReady = res;
+    markDead = rej;
+  });
+  ready.catch(() => undefined); // observed by hostRun; never an unhandled rejection
+  const host: Host = { proc, busy: false, ready, buf: '', waiter: null, runs: 0, dead: false };
   proc.stdout!.setEncoding('utf8');
   proc.stdout!.on('data', (chunk: string) => {
     host.buf += chunk;
@@ -300,7 +334,7 @@ function startHost(sandbox: Sandbox, py: string): Host {
         continue;
       }
       if (msg.ready) {
-        host.ready = true;
+        markReady();
         continue;
       }
       host.waiter?.(msg);
@@ -311,34 +345,55 @@ function startHost(sandbox: Sandbox, py: string): Host {
     if (text) console.error('python host:', text.slice(0, 500));
   });
   proc.stdin!.on('error', () => undefined);
-  proc.on('exit', () => {
+  proc.on('error', (e) => markDead(e));
+  proc.on('exit', (code, signal) => {
     rmSync(cwd, { recursive: true, force: true });
-    const i = hosts.indexOf(host);
-    if (i >= 0) hosts.splice(i, 1);
-    host.waiter?.({ id: -1, result: { ok: false, error: 'the Python host process exited', std_out: '', deps: [] } });
+    dropHost(host);
+    markDead(new Error(`python host exited (${code ?? signal})`));
+    const w = host.waiter;
+    host.waiter = null;
+    w?.({ id: -1, result: { ok: false, error: 'the Python host process exited', std_out: '', deps: [] } });
+    drainQueue(); // a run waiting for this host must move to a fresh one
   });
   hosts.push(host);
   return host;
 }
 
 function idleHost(sandbox: Sandbox, py: string): Host | null {
-  const free = hosts.find((h) => !h.busy && h.proc.exitCode === null);
+  const free = hosts.find((h) => !h.busy && !h.dead);
   if (free) return free;
   if (hosts.length < LIMITS.concurrency) return startHost(sandbox, py);
   return null;
 }
 
-function hostRun(host: Host, request: Record<string, unknown>, timeoutMs: number): Promise<{ result: Record<string, unknown> | null; ms: number }> {
+/** Start one host ahead of the first cell so it does not pay the cold start. */
+export function warmPool() {
+  if (!status.available || !status.sandbox || hosts.length) return;
+  const host = startHost(status.sandbox, status.interpreter);
+  host.ready.catch((e) => console.error('python host failed to start:', (e as Error).message));
+}
+
+async function hostRun(host: Host, request: Record<string, unknown>, timeoutMs: number): Promise<{ result: Record<string, unknown> | null; ms: number }> {
+  host.busy = true;
+  host.runs++;
+  const t0 = Date.now();
+  // start-up (library imports, caches) is not the run's time: wait for the host first, with its own limit
+  const startTimer = setTimeout(() => host.proc.kill('SIGKILL'), HOST_START_MS);
+  try {
+    await host.ready;
+  } catch {
+    clearTimeout(startTimer);
+    return { result: null, ms: Date.now() - t0 };
+  }
+  clearTimeout(startTimer);
   return new Promise((res) => {
-    const t0 = Date.now();
-    host.busy = true;
-    host.runs++;
     let done = false;
     // the host enforces the run's deadline itself; this watchdog only fires if the host is wedged
     const watchdog = setTimeout(() => {
       if (done) return;
       done = true;
       host.waiter = null;
+      dropHost(host);
       try {
         host.proc.kill('SIGKILL');
       } catch {
@@ -352,11 +407,10 @@ function hostRun(host: Host, request: Record<string, unknown>, timeoutMs: number
       clearTimeout(watchdog);
       host.waiter = null;
       host.busy = false;
-      if (host.runs >= MAX_RUNS_PER_HOST) host.proc.kill(); // periodic recycle keeps the host lean
-      else {
-        const next = queue.shift();
-        if (next) next();
-      }
+      if (host.runs >= MAX_RUNS_PER_HOST && !host.dead) {
+        dropHost(host);
+        host.proc.kill(); // periodic recycle keeps the host lean; its exit handler drains the queue
+      } else drainQueue();
       res({ result: (msg.result as Record<string, unknown>) ?? null, ms: Date.now() - t0 });
     };
     host.proc.stdin!.write(JSON.stringify(request) + '\n');
@@ -372,9 +426,10 @@ function pooledRun(sandbox: Sandbox, py: string, request: Record<string, unknown
         return;
       }
       void hostRun(host, request, timeoutMs).then((r) => {
-        if (!r.result && host.proc.exitCode !== null && (request.retries as number) < 1) {
-          // the host died under us (recycled or crashed): once more on a fresh one
-          request.retries = ((request.retries as number) ?? 0) + 1;
+        const retries = (request.retries as number) ?? 0;
+        if (!r.result && retries < 1) {
+          // the host died or wedged under us: once more on a fresh one
+          request.retries = retries + 1;
           attempt();
         } else res(r);
       });
@@ -385,7 +440,10 @@ function pooledRun(sandbox: Sandbox, py: string, request: Record<string, unknown
 
 /** Stop the pool (tests, shutdown). */
 export function stopPool() {
-  for (const h of hosts.splice(0)) h.proc.kill();
+  for (const h of hosts.splice(0)) {
+    h.dead = true;
+    h.proc.kill();
+  }
 }
 
 // GPU runs: a fresh process each time, at most `concurrency` at once

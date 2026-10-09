@@ -109,6 +109,7 @@ Requirements: Rust (rustup), Node 22. `scripts/build.sh` builds the wasm engine,
 | `GRIDWRIGHT_PYODIDE_DIR` | directory of a Pyodide distribution served at `/pyodide/` (default `data/pyodide`) |
 | `GRIDWRIGHT_PYTHON` | interpreter for server-side Python cells: a path, `off`, or unset = `data/pyenv/bin/python` (made by `install.sh --python`) else `python3` on PATH |
 | `GRIDWRIGHT_PYTHON_SANDBOX` | `auto` (bubblewrap → user namespace → none), `bwrap`, `unshare`, `none`, or `require` (no namespace sandbox = runtime off). `/api/health` and every run record report what is in use |
+| *(data directory)* `pycache/` | library caches shared by all server-side runs and bound writable into the sandbox: matplotlib fonts, numba and cuPy JIT kernels (GPU cells get fast after their first run); safe to delete, excluded from backups |
 | `GRIDWRIGHT_PYTHON_TIMEOUT_MS`, `GRIDWRIGHT_PYTHON_MEMORY_MB`, `GRIDWRIGHT_PYTHON_CONCURRENCY`, `GRIDWRIGHT_PYTHON_THREADS` | per-run wall-clock limit (60 000); data-segment cap for CPU runs (default: a quarter of RAM, at most half of what was free at start, never under 2 048 — GPU runs are uncapped because CUDA reserves address space); parallel runs (2); BLAS/OpenMP threads per run (4 — numpy reserves a buffer per thread at import, so this also bounds memory) |
 | `AI_BASE_URL`, `AI_MODEL`, `AI_API_KEY` | defaults for the assistant (also editable in the UI, stored encrypted) |
 

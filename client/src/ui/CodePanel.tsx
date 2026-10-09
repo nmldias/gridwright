@@ -181,7 +181,18 @@ export function CodePanel() {
       <div className="code-output">
         {cell.err && <pre className="err">{cell.err}</pre>}
         {cell.out && <pre className="out">{cell.out}</pre>}
-        {!cell.err && !cell.out && <div className="muted">Output: {cell.v && 's' in cell.v && cell.v.s.startsWith('data:image/') ? `picture (${cell.ss?.[0]} × ${cell.ss?.[1]} cells)` : cell.ss ? `${cell.ss[0]} × ${cell.ss[1]} cells` : cell.v ? 'single value' : 'nothing yet'}</div>}
+        {!cell.err && !cell.out && (
+          <div className="muted">
+            Output:{' '}
+            {cell.v && 's' in cell.v && cell.v.s.startsWith('data:image/')
+              ? `picture (${cell.ss?.[0]} × ${cell.ss?.[1]} cells)`
+              : cell.ss
+                ? `${cell.ss[0]} × ${cell.ss[1]} cells`
+                : cell.v
+                  ? `single value — ${'n' in cell.v ? String(cell.v.n) : 's' in cell.v ? cell.v.s.slice(0, 200) : 'b' in cell.v ? (cell.v.b ? 'TRUE' : 'FALSE') : 'e' in cell.v ? cell.v.e : ''}`
+                  : 'nothing yet'}
+          </div>
+        )}
       </div>
       <div className="muted small">
         Ctrl+Enter runs · Ctrl+S saves without running · results spill from this cell; the table grows to fit{lang === 'sql' ? ' · {{A1}} and {{Table::B2}} bind cell values as query parameters; a range becomes a list for IN (…)' : ''}
