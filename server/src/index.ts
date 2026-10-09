@@ -46,6 +46,7 @@ app.use(express.json({ limit: '64mb' }));
 const COOKIE = 'gridwright_token';
 app.use((req: Request, res: Response, next: NextFunction) => {
   if (!TOKEN) return next();
+  if (req.path === '/api/health') return next(); // liveness probe stays reachable (it reveals nothing private)
   const q = typeof req.query.token === 'string' ? req.query.token : '';
   if (q === TOKEN) {
     res.setHeader('set-cookie', `${COOKIE}=${encodeURIComponent(TOKEN)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000`);
@@ -73,7 +74,7 @@ const requireRole = (min: 'editor' | 'admin') => (req: Request, res: Response, n
 };
 
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, version: VERSION, multiplayer: true, dataDir: DATA_DIR, pyodide: !!pyodideDir(), identity: identityEnabled });
+  res.json({ ok: true, version: VERSION, multiplayer: true, pyodide: !!pyodideDir(), identity: identityEnabled, token: !!TOKEN });
 });
 app.get('/api/me', (req, res) => {
   const id = identityOf(req);
