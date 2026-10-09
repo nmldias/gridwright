@@ -50,11 +50,17 @@ The build compiles the Rust engine to wasm, bundles the client and the server (�
 
 ### Prebuilt (Node only)
 
-The release tarball ships the compiled engine (`client/src/engine/pkg`), the client bundle (`client/dist`) and the server (`server/dist`), so an arm64 or amd64 box only needs Node 22:
+The release tarball ships the compiled engine (`client/src/engine/pkg`), the client bundle (`client/dist`) and the server (`server/dist`), so an arm64 or amd64 box needs nothing but Node 22 — and the installer fetches that into `~/.local` if the host has none. No root required:
 
 ```bash
-tar -xzf gridwright.tar.gz && cd gridwright/server
-npm ci --omit=dev --no-audit --no-fund
+tar -xzf gridwright.tar.gz && cd gridwright && scripts/install.sh
+# options: GW_PORT=8787 GW_DATA=~/gridwright-data GW_TOKEN=… AI_BASE_URL=… AI_MODEL=… scripts/install.sh
+```
+
+The installer registers a systemd *user* service (`systemctl --user status gridwright`, `journalctl --user -u gridwright -f`) that restarts on failure and starts at boot once linger is enabled; without a systemd user session it falls back to `nohup`. Re-run it to change options. Manual equivalent:
+
+```bash
+cd gridwright/server && npm ci --omit=dev --no-audit --no-fund
 GRIDWRIGHT_DATA=/srv/gridwright PORT=8787 npm start      # http://<host>:8787
 ```
 
