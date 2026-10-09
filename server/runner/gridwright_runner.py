@@ -345,8 +345,9 @@ def run_cell(req):
     except Exception:
         pass
     # limits apply to the cell's own work, after the runtime's imports (in the warm host they are
-    # inherited from the parent; in a single run they happen just above)
-    set_limits(limits, gpu)
+    # inherited from the parent; in a single run they happen just above). The memory cap is lifted
+    # only when the run is actually on the GPU — a GPU request that fell back to the CPU keeps it.
+    set_limits(limits, gpu_state.startswith("cudf"))
 
     q = _Q(snapshot)
     real_stdout = sys.stdout

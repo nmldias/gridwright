@@ -47,9 +47,9 @@ self.onmessage = async (e: MessageEvent<RunMsg>) => {
     const fn = new Function('q', 'console', `"use strict";\nreturn (async () => {\n${body}\n})();`);
     const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('cell timed out after 60 s')), 60000));
     const result = await Promise.race([fn(q, con), timeout]);
-    self.postMessage({ id, ok: true, output: toGrid(result), std_out: logs.join('\n'), deps: q.deps, runtime: { name: 'javascript', version: self.navigator?.userAgent ?? '', packages: {} } });
+    self.postMessage({ id, code, ok: true, output: toGrid(result), std_out: logs.join('\n'), deps: q.deps, runtime: { name: 'javascript', version: self.navigator?.userAgent ?? '', packages: {} } });
   } catch (err) {
     const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-    self.postMessage({ id, ok: false, error: msg, std_out: logs.join('\n'), deps: q.deps, runtime: { name: 'javascript', version: self.navigator?.userAgent ?? '', packages: {} } });
+    self.postMessage({ id, code, ok: false, error: msg, std_out: logs.join('\n'), deps: q.deps, runtime: { name: 'javascript', version: self.navigator?.userAgent ?? '', packages: {} } });
   }
 };

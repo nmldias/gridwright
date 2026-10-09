@@ -178,7 +178,7 @@ def main():
         page.evaluate("() => window.__gw.getState().set({ panel: 'review' })")
         page.wait_for_selector(".review-panel .run-item", timeout=8000)
         item = page.locator(".review-panel .run-item").first.text_content() or ""
-        check("the Review panel lists the run with a status badge", "javascript" in item and ("Verified" in item or "verified" in item or "Failed" in item or "failed" in item), item[:120])
+        check("the Review panel lists the run with a status badge", "javascript" in item and ("matches recorded run" in item or "failed" in item), item[:120])
         page.screenshot(path=f"{OUT}/f3-01-runs.png")
 
         # ------------------------------------------------------------------ MCP tools on the open document

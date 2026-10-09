@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { api, type FileAccess, type FileInfo } from '../api/client';
+import { api, type FileInfo } from '../api/client';
 import { addTable } from '../grid/actions';
 import { setStatus, useStore } from '../state/store';
 import { downloadJson, newFile, openFile, parseCsv, saveCurrentFile } from './files';
@@ -12,13 +12,9 @@ export function FilesPanel() {
   const [files, setFiles] = useState<FileInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [showTemplates, setShowTemplates] = useState(false);
-  const [access, setAccess] = useState<FileAccess | null>(null);
-  const [shareLogin, setShareLogin] = useState('');
-  const [shareLevel, setShareLevel] = useState<'view' | 'edit' | 'sign'>('edit');
   const fileId = useStore((s) => s.fileId);
   const dirty = useStore((s) => s.dirty);
   const me = useStore((s) => s.me);
-  const permission = useStore((s) => s.permission);
   const fileFolder = useStore((s) => s.fileFolder);
   const importRef = useRef<HTMLInputElement>(null);
 
@@ -33,15 +29,6 @@ export function FilesPanel() {
   useEffect(() => {
     void refresh();
   }, [fileId, dirty]);
-  useEffect(() => {
-    setAccess(null);
-    if (!fileId) return;
-    api.files
-      .access(fileId)
-      .then(setAccess)
-      .catch(() => setAccess(null));
-  }, [fileId, permission]);
-
   const onImport = async (f: File) => {
     if (/\.(xlsx|xlsm|xls|ods)$/i.test(f.name)) {
       const XLSX = await import('xlsx');
@@ -92,22 +79,10 @@ export function FilesPanel() {
     useStore.setState({ fileFolder: folder });
     if (!fileId) return;
     try {
-      const a = await api.files.setAccess(fileId, { folder });
-      setAccess(a);
+      await api.files.setAccess(fileId, { folder });
       void refresh();
     } catch (e) {
       setStatus(`Could not move the document: ${(e as Error).message}`, 5000);
-    }
-  };
-  const updateAccess = async (patch: Partial<FileAccess>) => {
-    if (!fileId) return;
-    try {
-      const a = await api.files.setAccess(fileId, patch);
-      setAccess(a);
-      useStore.setState({ permission: a.permission });
-      void refresh();
-    } catch (e) {
-      setStatus(`Sharing not changed: ${(e as Error).message}`, 5000);
     }
   };
 
@@ -119,7 +94,6 @@ export function FilesPanel() {
     folders.get(key)!.push(f);
   }
   const folderNames = Array.from(folders.keys()).sort((a, b) => (a === '' ? -1 : b === '' ? 1 : a.localeCompare(b)));
-  const canManage = access?.permission === 'own';
 
   return (
     <div className="panel">
@@ -222,70 +196,7 @@ export function FilesPanel() {
         </div>
       ))}
       {!files.length && !error && <div className="muted">No documents yet — Save to create one.</div>}
-      {fileId && access && access.identity && (
-        <>
-          <div className="panel-subtitle">Sharing</div>
-          <div className="small">
-            Owner: {access.ownerName || access.owner || 'nobody (open document)'}
-            {access.owner && access.owner === me.login.toLowerCase() ? ' (you)' : ''}
-          </div>
-          <label className="row">
-            <span className="muted small">Everyone on this server</span>
-            <select value={access.public} disabled={!canManage} onChange={(e) => void updateAccess({ public: e.target.value as FileAccess['public'] })}>
-              <option value="edit">can edit</option>
-              <option value="view">can view</option>
-              <option value="none">no access</option>
-            </select>
-          </label>
-          {Object.entries(access.shares).map(([login, level]) => (
-            <div key={login} className="row small">
-              <span className="grow">{login}</span>
-              <select value={level} disabled={!canManage} onChange={(e) => void updateAccess({ shares: { ...access.shares, [login]: e.target.value as 'view' | 'edit' | 'sign' } })}>
-                <option value="view">view</option>
-                <option value="sign">sign off</option>
-                <option value="edit">edit</option>
-              </select>
-              <button
-                className="icon"
-                disabled={!canManage}
-                onClick={() => {
-                  const next = { ...access.shares };
-                  delete next[login];
-                  void updateAccess({ shares: next });
-                }}
-              >
-                ×
-              </button>
-            </div>
-          ))}
-          {canManage && (
-            <div className="row">
-              <input className="grow" placeholder="login (e.g. ana@example.com)" value={shareLogin} onChange={(e) => setShareLogin(e.target.value)} onKeyDown={(e) => e.stopPropagation()} />
-              <select value={shareLevel} onChange={(e) => setShareLevel(e.target.value as 'view' | 'edit' | 'sign')}>
-                <option value="view">view</option>
-                <option value="sign">sign off</option>
-                <option value="edit">edit</option>
-              </select>
-              <button
-                disabled={!shareLogin.trim()}
-                onClick={() => {
-                  void updateAccess({ shares: { ...access.shares, [shareLogin.trim().toLowerCase()]: shareLevel } });
-                  setShareLogin('');
-                }}
-              >
-                Share
-              </button>
-            </div>
-          )}
-          {!access.owner && canManage && me.login && (
-            <button className="link small" onClick={() => void updateAccess({ owner: me.login, ownerName: me.name })}>
-              Take ownership (lets you restrict who sees this document)
-            </button>
-          )}
-          <p className="muted small">“Sign off” lets someone attest ranges in the Review panel without editing values. Logins come from Tailscale.</p>
-        </>
-      )}
-      <p className="muted small">Documents autosave a few seconds after each change once they have been saved once. Anyone opening the same document edits it live with you.</p>
+      <p className="muted small">Documents autosave a few seconds after each change once they have been saved once. Who can open one is set under Share.</p>
     </div>
   );
 }

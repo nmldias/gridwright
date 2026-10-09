@@ -26,6 +26,16 @@ jobs:
         ports: ['54329:5432']
         options: >-
           --health-cmd "pg_isready -U gw" --health-interval 5s --health-timeout 5s --health-retries 20
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_USER: gw
+          MARIADB_PASSWORD: gw
+          MARIADB_DATABASE: demo
+          MARIADB_ROOT_PASSWORD: root
+        ports: ['33069:3306']
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized" --health-interval 5s --health-timeout 5s --health-retries 20
       mssql:
         image: mcr.microsoft.com/mssql/server:2022-latest
         env:
@@ -83,8 +93,8 @@ jobs:
       - name: Browser tests
         run: |
           pip install -q playwright && python3 -m playwright install --with-deps chromium >/dev/null
-          (cd server && GRIDWRIGHT_DATA=/tmp/gw-data PORT=8787 GRIDWRIGHT_PYTHON=/tmp/gw-py/bin/python GRIDWRIGHT_PYTHON_TIMEOUT_MS=5000 node dist/index.js > /tmp/server.log 2>&1 &)
-          (cd server && GRIDWRIGHT_DATA=/tmp/gw-acl GRIDWRIGHT_TRUST_TAILSCALE=1 GRIDWRIGHT_ADMINS=boss@example.com PORT=8795 node dist/index.js > /tmp/server-acl.log 2>&1 &)
+          (cd server && GRIDWRIGHT_DATA=/tmp/gw-data PORT=8787 GRIDWRIGHT_PYTHON=/tmp/gw-py/bin/python GRIDWRIGHT_PYTHON_TIMEOUT_MS=5000 GRIDWRIGHT_PYTHON_QUEUE=3 node dist/index.js > /tmp/server.log 2>&1 &)
+          (cd server && GRIDWRIGHT_DATA=/tmp/gw-acl GRIDWRIGHT_TRUST_TAILSCALE=1 GRIDWRIGHT_ADMINS=boss@example.com GRIDWRIGHT_PYTHON=/tmp/gw-py/bin/python GRIDWRIGHT_PYTHON_USERS=alice@example.com GRIDWRIGHT_GPU_USERS=boss@example.com PORT=8795 node dist/index.js > /tmp/server-acl.log 2>&1 &)
           node e2e/mock-llm.mjs > /tmp/mock.log 2>&1 &
           for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8787/api/health >/dev/null && curl -fsS http://127.0.0.1:8795/api/health >/dev/null && break; sleep 1; done
           python3 e2e/smoke.py http://127.0.0.1:8787 --python
@@ -92,6 +102,18 @@ jobs:
           python3 e2e/features2.py http://127.0.0.1:8787 --pg 127.0.0.1:54329:demo:gw:gw --mock-llm http://127.0.0.1:8899/v1 --acl http://127.0.0.1:8795
           python3 e2e/features3.py http://127.0.0.1:8787 --pg 127.0.0.1:54329:demo:gw:gw --acl http://127.0.0.1:8795
           python3 e2e/features4.py http://127.0.0.1:8787 --data /tmp/gw-data
+          python3 e2e/ai_multiplayer.py http://127.0.0.1:8787
+      - name: Reference workbooks reconcile to independently computed figures
+        run: python3 e2e/reference.py http://127.0.0.1:8787
+      - name: Control gates (reviewer isolation, approval integrity, revocation, execution permissions)
+        run: node e2e/controls.mjs http://127.0.0.1:8795
+      - name: Worker isolation fails closed without bubblewrap
+        run: |
+          mkdir -p /tmp/fakebin && printf '#!/bin/sh\necho "bwrap: namespaces unavailable" >&2\nexit 1\n' > /tmp/fakebin/bwrap && chmod +x /tmp/fakebin/bwrap
+          (cd server && PATH=/tmp/fakebin:$PATH GRIDWRIGHT_DATA=/tmp/gw-fc GRIDWRIGHT_PYTHON=/tmp/gw-py/bin/python PORT=8796 node dist/index.js > /tmp/server-fc.log 2>&1 & echo $! > /tmp/server-fc.pid)
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8796/api/python 2>/dev/null | grep -qv '"not probed yet"' && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8796/api/python | tee /dev/stderr | grep -q '"available":false' && curl -fsS http://127.0.0.1:8796/api/python | grep -q 'stays off'
+          kill "$(cat /tmp/server-fc.pid)" || true
       - name: MCP and SQL policy from the command line
         run: |
           # the strongest sandbox must be the one in use on an Ubuntu 24.04 host (bubblewrap under AppArmor)
@@ -108,6 +130,8 @@ jobs:
           curl -fsS -X DELETE "http://127.0.0.1:8787/api/connections/$CONN" >/dev/null
       - name: SQL Server driver
         run: python3 e2e/sqlserver.py http://127.0.0.1:8787 --mssql '127.0.0.1:14333:master:sa:Gridwright!2026'
+      - name: MySQL driver and read-only policy (MariaDB)
+        run: python3 e2e/mysql.py http://127.0.0.1:8787 --mysql 127.0.0.1:33069:demo:gw:gw
       - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4

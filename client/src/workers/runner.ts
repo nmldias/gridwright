@@ -2,13 +2,14 @@
 // the Python or JavaScript worker, and writes results back through the engine.
 
 import { api, type SqlParam } from '../api/client';
+import { getClientId } from '../api/ws';
 import * as book from '../engine/book';
 import { isCodeKind, parseA1, type CellRef, type CellValue, type Rect } from '../engine/types';
 import { cellAt, getState, useStore } from '../state/store';
 import type { Plain, Snapshot } from './q';
 import JsWorker from './js.worker?worker';
 import PyWorker from './python.worker?worker';
-import { fnv, inputsHash, outputHash, record as recordRun, type RunRuntime } from './runs';
+import { fnv, inputsHashFromSnapshot, outputHash, record as recordRun, type RunRecord, type RunRuntime } from './runs';
 
 const PY_INDEX_KEY = 'gridwright.pyodideIndexURL';
 export const DEFAULT_PYODIDE_INDEX = 'https://cdn.jsdelivr.net/pyodide/v0.27.5/full/';
@@ -38,6 +39,10 @@ let pyWorker: Worker | null = null;
 let nextId = 1;
 const pending = new Map<number, CellRef>();
 const started = new Map<number, number>();
+/** the snapshot each run was given: inputs are hashed from it, never from the live sheet */
+const snapshots = new Map<number, Snapshot>();
+/** the newest run id per cell: results of superseded runs are dropped */
+const latest = new Map<string, number>();
 const queue = new Map<string, CellRef>();
 const lastRun = new Map<string, number[]>();
 let flushTimer: number | null = null;
@@ -66,31 +71,42 @@ function handleResult(e: MessageEvent) {
   pending.delete(d.id);
   const t0 = started.get(d.id) ?? Date.now();
   started.delete(d.id);
+  const snapshot = snapshots.get(d.id);
+  snapshots.delete(d.id);
+  const key = keyOf(ref);
+  if (latest.get(key) !== d.id) return; // a newer run of this cell started meanwhile: this result is superseded
   const runs = new Map(getState().runs);
-  runs.delete(keyOf(ref));
+  runs.delete(key);
   useStore.setState({ runs });
   const cell = cellAt(ref.table, ref.row, ref.col);
   if (!cell || !isCodeKind(cell.k)) return; // cell changed meanwhile
+  if (fnv(cell.i) !== fnv(d.code ?? cell.i)) return; // the code changed while this ran: its result is not the current code's
   const deps: Rect[] = (d.deps ?? []).map((x: Rect) => ({ table: x.table, r0: x.r0, c0: x.c0, r1: x.r1, c1: x.c1 }));
   const runtime: RunRuntime = d.runtime ?? { name: cell.k, version: '', packages: {} };
-  // the run record is computed before the result is written, over the inputs the run actually read
-  const inHash = inputsHash(deps);
+  // the record binds the code that ran, the inputs it was given (from its snapshot) and the output it produced
+  const inHash = snapshot ? inputsHashFromSnapshot(snapshot, deps) : d.inputsHash ?? fnv('');
   const finishRecord = (ok: boolean, output: CellValue[][] | null, error?: string) =>
-    recordRun({
-      table: ref.table,
-      row: ref.row,
-      col: ref.col,
-      kind: cell.k,
-      codeHash: fnv(cell.i),
-      inputsHash: inHash,
-      deps,
-      outputHash: outputHash(output),
-      ok,
-      error,
-      ms: Date.now() - t0,
-      runtime,
-      at: new Date().toISOString(),
-    });
+    recordRun(
+      d.record
+        ? { ...(d.record as RunRecord), deps, runtime, attested: 'server' }
+        : {
+            table: ref.table,
+            row: ref.row,
+            col: ref.col,
+            kind: cell.k,
+            codeHash: fnv(cell.i),
+            inputsHash: inHash,
+            deps,
+            outputHash: outputHash(output),
+            ok,
+            error,
+            ms: Date.now() - t0,
+            runtime,
+            at: new Date().toISOString(),
+            startedAt: new Date(t0).toISOString(),
+            attested: 'client',
+          },
+    );
   if (d.ok) {
     let output: CellValue[][] | null;
     if (d.output && !Array.isArray(d.output) && typeof d.output === 'object' && typeof d.output.image === 'string') {
@@ -169,14 +185,16 @@ async function runSqlCell(ref: CellRef, id: number, code: string, conn: string |
 // --- Python on the server -------------------------------------------------------------------
 // Same snapshot the browser worker gets, same `q` API, same output shape; the run record says
 // "python-server" with the sandbox level and the packages the host used.
-async function runServerPython(ref: CellRef, id: number, code: string, gpu: boolean) {
-  const finish = (d: any) => handleResult({ data: { id, ...d } } as MessageEvent);
-  const snapshot = buildSnapshot(ref);
+async function runServerPython(ref: CellRef, id: number, code: string, gpu: boolean, snapshot: Snapshot, startedAt: number) {
+  const finish = (d: any) => handleResult({ data: { id, code, ...d } } as MessageEvent);
   try {
-    const res = await api.python.run(code, snapshot, gpu);
+    // the server computes and logs the record itself (attested: server) when it knows which cell this is
+    const st = getState();
+    const cellRef = st.fileId ? { file: st.fileId, table: ref.table, row: ref.row, col: ref.col, kind: 'python', startedAt: new Date(startedAt).toISOString(), client: getClientId() } : undefined;
+    const res = await api.python.run(code, snapshot, gpu, cellRef);
     const runtime: RunRuntime = res.runtime ?? { name: 'python-server', version: '', packages: {} };
-    if (res.ok) finish({ ok: true, output: res.output ?? null, std_out: res.std_out, deps: res.deps, runtime });
-    else finish({ ok: false, error: res.error || 'error', std_out: res.std_out, deps: res.deps, runtime });
+    if (res.ok) finish({ ok: true, output: res.output ?? null, std_out: res.std_out, deps: res.deps, runtime, record: res.record });
+    else finish({ ok: false, error: res.error || 'error', std_out: res.std_out, deps: res.deps, runtime, record: res.record });
   } catch (e) {
     finish({ ok: false, error: (e as Error).message, deps: [], runtime: { name: 'python-server', version: '', packages: {} } });
   }
@@ -240,6 +258,7 @@ export function runCell(ref: CellRef) {
   const id = nextId++;
   pending.set(id, ref);
   started.set(id, now);
+  latest.set(k, id);
   const runs = new Map(getState().runs);
   runs.set(k, { running: true, startedAt: now });
   useStore.setState({ runs });
@@ -247,11 +266,12 @@ export function runCell(ref: CellRef) {
     void runSqlCell(ref, id, cell.i, cell.conn);
     return;
   }
+  const snapshot = buildSnapshot(ref);
+  snapshots.set(id, snapshot);
   if (cell.k === 'python' && cell.runtime === 'server') {
-    void runServerPython(ref, id, cell.i, !!cell.gpu);
+    void runServerPython(ref, id, cell.i, !!cell.gpu, snapshot, now);
     return;
   }
-  const snapshot = buildSnapshot(ref);
   const worker = cell.k === 'python' ? getPyWorker() : getJsWorker();
   worker.postMessage({ type: 'run', id, code: cell.i, snapshot });
 }

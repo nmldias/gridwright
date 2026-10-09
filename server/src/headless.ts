@@ -222,11 +222,19 @@ export interface DiffLine {
   where: string;
   before: string;
   after: string;
+  /** A consequence: the cell's formula is unchanged but its value moves because of the edits above. */
+  effect?: true;
 }
 
-/** Cell-level differences between two engine instances for the given tables (bounded). */
+/**
+ * Cell-level differences between two engine instances for the given tables (bounded): first the
+ * edits themselves (a changed input or formula), then their consequences — every cell whose
+ * formula stays the same but whose value moves — so that a reviewer sees what the change does,
+ * not only what it says.
+ */
 export function diffBooks(before: BookApi, after: BookApi, tableIds: number[], max = 500): DiffLine[] {
-  const out: DiffLine[] = [];
+  const edits: DiffLine[] = [];
+  const effects: DiffLine[] = [];
   const beforeMetas = new Map(tableMetas(before).map((t) => [t.id, t]));
   const afterMetas = new Map(tableMetas(after).map((t) => [t.id, t]));
   for (const id of tableIds) {
@@ -234,12 +242,12 @@ export function diffBooks(before: BookApi, after: BookApi, tableIds: number[], m
     const am = afterMetas.get(id);
     const name = am?.name ?? bm?.name ?? `table ${id}`;
     if (!bm && am) {
-      out.push({ where: name, before: '', after: `table ${am.rows}×${am.cols}` });
+      edits.push({ where: name, before: '', after: `table ${am.rows}×${am.cols}` });
     } else if (bm && !am) {
-      out.push({ where: name, before: `table ${bm.rows}×${bm.cols}`, after: '' });
+      edits.push({ where: name, before: `table ${bm.rows}×${bm.cols}`, after: '' });
       continue;
     } else if (bm && am && (bm.rows !== am.rows || bm.cols !== am.cols || bm.name !== am.name)) {
-      out.push({ where: name, before: `${bm.name} ${bm.rows}×${bm.cols}`, after: `${am.name} ${am.rows}×${am.cols}` });
+      edits.push({ where: name, before: `${bm.name} ${bm.rows}×${bm.cols}`, after: `${am.name} ${am.rows}×${am.cols}` });
     }
     const b = new Map((bm ? (JSON.parse(before.cells(id)) as CellViewJson[]) : []).map((c) => [c.r * 65536 + c.c, c]));
     const a = new Map((am ? (JSON.parse(after.cells(id)) as CellViewJson[]) : []).map((c) => [c.r * 65536 + c.c, c]));
@@ -247,12 +255,16 @@ export function diffBooks(before: BookApi, after: BookApi, tableIds: number[], m
     for (const k of keys) {
       const cb = b.get(k);
       const ca = a.get(k);
+      const where = `${name}::${a1(Math.floor(k / 65536), k % 65536)}`;
       const tb = cb ? (cb.i || displayOf(cb)) : '';
       const ta = ca ? (ca.i || displayOf(ca)) : '';
-      if (tb === ta) continue;
-      out.push({ where: `${name}::${a1(Math.floor(k / 65536), k % 65536)}`, before: tb, after: ta });
-      if (out.length >= max) return out;
+      if (tb !== ta) {
+        edits.push({ where, before: tb, after: ta });
+      } else if (cb && ca && cb.i && displayOf(cb) !== displayOf(ca)) {
+        effects.push({ where, before: displayOf(cb), after: displayOf(ca), effect: true });
+      }
+      if (edits.length + effects.length >= max) break;
     }
   }
-  return out;
+  return edits.concat(effects).slice(0, max);
 }

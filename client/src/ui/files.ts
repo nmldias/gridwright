@@ -9,7 +9,11 @@ export async function saveCurrentFile(): Promise<void> {
   const st = getState();
   const json = book.toJson();
   try {
-    if (st.fileId) {
+    if (st.fileId && st.permission === 'sign') {
+      // a sign-off share never sends a document: the server checkpoints its own replay of the log
+      const info = await api.files.checkpoint(st.fileId, getClientId());
+      if (info.seq > getState().seq) useStore.setState({ seq: info.seq });
+    } else if (st.fileId) {
       const info = await api.files.save(st.fileId, st.fileName, json, getClientId(), st.seq);
       if (info.seq > getState().seq) useStore.setState({ seq: info.seq });
     } else {

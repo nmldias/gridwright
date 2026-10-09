@@ -9,6 +9,8 @@ import pg from 'pg';
 import Cursor from 'pg-cursor';
 import { decrypt, type StoredConnection } from './storage.js';
 
+const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
 export interface QueryResult {
   columns: string[];
   rows: (string | number | boolean | null)[][];
@@ -198,10 +200,23 @@ async function runMysql(c: StoredConnection, password: string, sql: string, max:
   const conn = raw.promise();
   try {
     await conn.connect();
-    // MySQL ≥ 5.7.8 and MariaDB ≥ 10.1 spell the statement timeout differently; try both
-    await conn.query(`SET SESSION max_execution_time = ${Math.round(timeoutMs)}`).catch(() => undefined);
-    await conn.query(`SET SESSION max_statement_time = ${Math.max(1, Math.round(timeoutMs / 1000))}`).catch(() => undefined);
-    if (readOnly) await conn.query('START TRANSACTION READ ONLY').catch(() => undefined);
+    // MySQL ≥ 5.7.8 (max_execution_time, ms) and MariaDB ≥ 10.1 (max_statement_time, s) spell the
+    // statement timeout differently: one of the two must take, or the query does not run
+    const timeouts = await Promise.allSettled([conn.query(`SET SESSION max_execution_time = ${Math.round(timeoutMs)}`), conn.query(`SET SESSION max_statement_time = ${Math.max(1, Math.round(timeoutMs / 1000))}`)]);
+    if (!timeouts.some((t) => t.status === 'fulfilled')) {
+      throw new Error(`could not set a statement timeout on this server (${timeouts.map((t) => (t.status === 'rejected' ? errorText(t.reason) : '')).filter(Boolean).join('; ')})`);
+    }
+    // the database-side guard is not optional: a read-only connection whose session cannot be made
+    // read-only does not run the query at all
+    if (readOnly) {
+      try {
+        // the session (every transaction, autocommit included) and the transaction we run in
+        await conn.query('SET SESSION TRANSACTION READ ONLY');
+        await conn.query('START TRANSACTION READ ONLY');
+      } catch (e) {
+        throw new Error(`could not make the session read-only, query refused: ${errorText(e)}`);
+      }
+    }
     let columns: string[] = [];
     const rows: unknown[][] = [];
     let truncated = false;
@@ -209,11 +224,14 @@ async function runMysql(c: StoredConnection, password: string, sql: string, max:
       const q = raw.query({ sql, values: params, rowsAsArray: true });
       const stream = q.stream();
       q.on('fields', (fields: unknown) => {
+        // a statement without a result set (DDL, INSERT on a read-write connection) reports no fields
+        if (!fields || !Array.isArray(fields) || !fields.length) return;
         const f = fields as { name: string }[] | { name: string }[][];
         const list = (Array.isArray(f[0]) ? (f as { name: string }[][])[f.length - 1] : (f as { name: string }[])) ?? [];
         columns = list.map((x) => x.name);
       });
       stream.on('data', (row: unknown) => {
+        if (!Array.isArray(row) && !columns.length) return; // an OK packet, not a row
         if (rows.length < max) rows.push(Array.isArray(row) ? row : [row]);
         else if (!truncated) {
           truncated = true;

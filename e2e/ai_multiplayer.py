@@ -7,10 +7,22 @@ import time
 
 from playwright.sync_api import sync_playwright
 
-BASE = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8787"
+import json
+import urllib.request
+
+ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
+BASE = ARGS[0] if ARGS else "http://localhost:8787"
+MOCK = "http://127.0.0.1:8899/v1"
+for i, a in enumerate(sys.argv):
+    if a == "--mock-llm":
+        MOCK = sys.argv[i + 1]
 OUT = os.environ.get("E2E_OUT", "/tmp/gridwright-e2e")
 os.makedirs(OUT, exist_ok=True)
 results = []
+
+# point the assistant at the mock model (an administrator's setting, stored on the server)
+req = urllib.request.Request(BASE + "/api/ai/settings", method="PUT", data=json.dumps({"baseUrl": MOCK, "model": "mock"}).encode(), headers={"content-type": "application/json"})
+urllib.request.urlopen(req, timeout=30).read()
 
 
 def check(name, ok, detail=""):
@@ -37,18 +49,16 @@ with sync_playwright() as p:
     time.sleep(0.5)
 
     # --- AI panel -----------------------------------------------------------
-    page.click("button:has-text('AI')")
+    page.click(".topbar button:has-text('Ask')")
     page.wait_for_selector(".ai-panel textarea", timeout=5000)
     page.fill(".ai-panel textarea", "Summarise the table")
     page.keyboard.press("Enter")
-    deadline = time.time() + 15
-    applied = None
-    while time.time() < deadline:
-        applied = page.evaluate("() => { const el = document.querySelector('.ai-panel .actions'); return el ? el.textContent : null; }")
-        if applied and "Applied" in applied:
-            break
-        time.sleep(0.3)
-    check("assistant reply applied actions", bool(applied) and "Applied 2" in applied, str(applied))
+    # the assistant's edits arrive as a before → after diff and take effect only when a person applies them
+    page.wait_for_selector(".ai-panel table.diff", timeout=15000)
+    tables_before = tables(page)
+    page.click(".ai-panel button:has-text('Apply')")
+    time.sleep(0.5)
+    check("assistant reply proposed a diff that applies on request", len(tables(page)) == len(tables_before) + 1, str(tables(page)))
     ts = tables(page)
     summary = next((t for t in ts if t["name"] == "AI summary"), None)
     check("add_table action created a table", summary is not None, str(ts))

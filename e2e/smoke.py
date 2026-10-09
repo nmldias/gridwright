@@ -232,7 +232,8 @@ def main():
         # --- JavaScript code cell with spill ----------------------------------------
         x, y = cell_screen(first, 1, 5)
         page.mouse.click(x, y)
-        page.click("button:has-text('JS')")
+        page.click(".topbar button[data-menu='add']")
+        page.click(".menu button:has-text('JavaScript cell')")
         page.wait_for_selector(".cm-editor", timeout=5000)
         page.evaluate("() => { const v = document.querySelector('.cm-content'); v.focus(); }")
         page.keyboard.press("Control+a")
@@ -266,7 +267,8 @@ def main():
         if WITH_PY:
             x, y = cell_screen(first, 7, 2)
             page.mouse.click(x, y)
-            page.click("button:has-text('Py')")
+            page.click(".topbar button[data-menu='add']")
+            page.click(".menu button:has-text('Python cell')")
             page.wait_for_selector(".cm-editor", timeout=5000)
             page.evaluate("() => { const v = document.querySelector('.cm-content'); v.focus(); }")
             page.keyboard.press("Control+a")

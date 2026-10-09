@@ -2,6 +2,7 @@ import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from './App';
 import './styles.css';
+import { statusOf } from './workers/runs';
 import { getState } from './state/store';
 import { getRenderer } from './grid/actions';
 import * as book from './engine/book';
@@ -22,6 +23,11 @@ import { diffDocuments } from './ui/compare';
   applyTemplate,
   transformOp,
   diffDocuments,
+  /** execution-evidence status of a code cell (tests) */
+  runStatus: (ref: { table: number; row: number; col: number }) => {
+    const cell = getState().cells.get(ref.table)?.get(ref.row * 65536 + ref.col);
+    return statusOf(ref, cell?.i ?? '').status;
+  },
   viewport: () => {
     const r = getRenderer();
     return r ? { x: r.pan.x, y: r.pan.y, zoom: r.zoom } : { x: 0, y: 0, zoom: 1 };

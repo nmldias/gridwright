@@ -149,6 +149,20 @@ function connect() {
       case 'reload':
         // another client saved; edits are already relayed live, nothing to do
         break;
+      case 'permission':
+        // the owner changed this document's sharing while we are connected
+        if (typeof msg.permission === 'string') {
+          useStore.setState({ permission: msg.permission });
+          setStatus(msg.permission === 'edit' || msg.permission === 'own' ? 'You can edit this document again' : `Your access to this document is now ${msg.permission === 'sign' ? 'sign-off only' : 'read-only'}`, 8000);
+        }
+        break;
+      case 'revoked':
+        // access removed: stop reconnecting, show why
+        fileId = null;
+        pending.length = 0;
+        useStore.setState({ permission: 'none', presence: new Map() });
+        setStatus('Your access to this document was removed — the changes you make here will not be saved', 0);
+        break;
     }
   };
   sock.onclose = () => {
@@ -178,6 +192,7 @@ function connect() {
   if (!unsubRun) {
     unsubRun = onRecord((r) => {
       if (!fileId) return;
+      if (r.attested === 'server') return; // the server wrote this record itself
       send({ type: 'run', client: clientId, run: r });
     });
   }

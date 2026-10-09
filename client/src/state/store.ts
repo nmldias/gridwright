@@ -1,4 +1,4 @@
-import type { ServerPython } from '../api/client';
+import type { Proposal, ServerPython } from '../api/client';
 import { create } from 'zustand';
 import type { CellRef, CellView, Chart, NamedRange, TableId, TableMeta, Trace } from '../engine/types';
 
@@ -25,7 +25,7 @@ export interface Editing {
   source?: 'cell' | 'bar';
 }
 
-export type Panel = 'none' | 'code' | 'ai' | 'sql' | 'files' | 'table' | 'settings' | 'history' | 'format' | 'chart' | 'review';
+export type Panel = 'none' | 'code' | 'ai' | 'sql' | 'files' | 'share' | 'table' | 'settings' | 'history' | 'format' | 'chart' | 'review';
 
 export interface Presence {
   id: string;
@@ -106,6 +106,8 @@ interface State {
   runsVersion: number;
   /** bumped when the server reports a proposal filed or decided */
   proposalsVersion: number;
+  /** proposals of the open document, as last loaded from the server (see ui/proposals.ts) */
+  proposals: Proposal[];
   set: (patch: Partial<State>) => void;
 }
 
@@ -143,6 +145,7 @@ export const useStore = create<State>((set) => ({
   fileFolder: '',
   runsVersion: 0,
   proposalsVersion: 0,
+  proposals: [],
   touch: typeof window !== 'undefined' && (navigator.maxTouchPoints > 0 || 'ontouchstart' in window) && !matchMedia('(pointer: fine)').matches,
   set: (patch) => set(patch),
 }));

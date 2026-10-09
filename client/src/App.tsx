@@ -13,6 +13,8 @@ import { FormatPanel } from './ui/FormatPanel';
 import { FormulaBar } from './ui/FormulaBar';
 import { HistoryPanel } from './ui/HistoryPanel';
 import { SettingsPanel, prewarmEnabled } from './ui/SettingsPanel';
+import { SharePanel } from './ui/SharePanel';
+import { loadProposals } from './ui/proposals';
 import { SqlPanel } from './ui/SqlPanel';
 import { StatusBar } from './ui/StatusBar';
 import { TablePanel } from './ui/TablePanel';
@@ -101,6 +103,10 @@ export function App() {
 
   // keep ?file= in the URL in sync with the open document
   const fileId = useStore((s) => s.fileId);
+  const proposalsVersion = useStore((s) => s.proposalsVersion);
+  useEffect(() => {
+    void loadProposals();
+  }, [fileId, proposalsVersion]);
   useEffect(() => {
     const url = new URL(location.href);
     if (fileId) url.searchParams.set('file', fileId);
@@ -129,6 +135,7 @@ export function App() {
             {panel === 'ai' && <AiPanel />}
             {panel === 'sql' && <SqlPanel />}
             {panel === 'files' && <FilesPanel />}
+            {panel === 'share' && <SharePanel />}
             {panel === 'table' && <TablePanel />}
             {panel === 'format' && <FormatPanel />}
             {panel === 'history' && <HistoryPanel />}

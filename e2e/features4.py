@@ -92,6 +92,26 @@ def main():
     check("errors keep the user's frames and the message", not r["ok"] and 'File "<cell>"' in r["error"] and 'table "Nope" not found' in r["error"] and "gridwright_runner" not in r["error"], r["error"][:120])
     r = run("1", gpu=True)
     check("a GPU request on a host without cuDF runs on the CPU and says so", r["ok"] and str(r["runtime"]["packages"].get("gpu", "")).startswith(("cudf", "unavailable")), str(r["runtime"]["packages"].get("gpu")))
+    if not str(r["runtime"]["packages"].get("gpu", "")).startswith("cudf"):
+        r = run("x = bytearray(8 * 1024 ** 3); 1", gpu=True)
+        check("resource enforcement: a GPU request that fell back to the CPU keeps the CPU memory cap", not r["ok"] and ("MemoryError" in (r.get("error") or "") or "killed" in (r.get("error") or "")), (r.get("error") or "")[:60])
+    else:
+        print("SKIP CPU-fallback cap (this host has cuDF)")
+    # one admission budget for every run, bounded: beyond the queue a run is refused at once, never parked
+    import concurrent.futures as cf
+    pyinfo = rest("GET", "/api/python")
+    queue_max = pyinfo.get("limits", {}).get("queue")
+    conc = pyinfo.get("limits", {}).get("concurrency", 2)
+    if isinstance(queue_max, int) and queue_max <= 8:
+        n = conc + queue_max + 3
+        t0 = time.time()
+        with cf.ThreadPoolExecutor(n) as ex:
+            outs = list(ex.map(lambda i: rest("POST", "/api/python/run", {"code": "import time; time.sleep(1.5); 1", "snapshot": SNAP, "gpu": False}, raw=True), range(n)))
+        codes = [c for c, _ in outs]
+        busy = codes.count(429)
+        check("resource enforcement: runs beyond the shared budget are refused immediately (429), the rest complete", busy == 3 and codes.count(200) == n - 3 and time.time() - t0 < 1.5 * (n // conc + 1) + 5, f"codes={sorted(codes)} in {time.time()-t0:.1f}s")
+    else:
+        print(f"SKIP bounded-queue check (GRIDWRIGHT_PYTHON_QUEUE={queue_max}; set it to ≤ 8 for this test)")
 
     # ------------------------------------------------------------------ in the browser
     with sync_playwright() as p:
@@ -136,9 +156,10 @@ def main():
 
         T = 1
         apply({"type": "set_cells", "table": T, "row": 0, "col": 6, "values": [["Item", "Amount"], ["a", "10"], ["b", "20"], ["c", "30.5"]]})
-        # press Py on a cell: the new cell runs on the server by default
+        # Add → Python cell: the new cell runs on the server by default
         page.evaluate("([t,r,c]) => window.__gw.getState().set({ selection: { table: t, r0: r, c0: c, r1: r, c1: c, ar: r, ac: c }, selectedTable: null })", [T, 6, 6])
-        page.click(".topbar button[title='Turn the selected cell into a Python cell']")
+        page.click(".topbar button[data-menu='add']")
+        page.click(".menu button[title='Turn the selected cell into a Python cell']")
         time.sleep(0.4)
         made = cell(T, 6, 6)
         check("a new Python cell defaults to the server runtime", made is not None and made["k"] == "python" and made.get("runtime") == "server", str(made)[:120])
@@ -161,6 +182,18 @@ def main():
             time.sleep(0.25)
         rec = runs[0] if runs else {}
         check("the run record names the server runtime, the sandbox and the packages used", rec.get("runtime", {}).get("name") == "python-server" and rec["runtime"]["packages"].get("sandbox") == sandbox and "pandas" in rec["runtime"]["packages"], json.dumps(rec.get("runtime"))[:160])
+        check("the server wrote that record itself (attested: server) with the hashes it computed", rec.get("attested") == "server" and len(rec.get("codeHash", "")) == 16 and len(rec.get("outputHash", "")) == 16, f"attested={rec.get('attested')} code={rec.get('codeHash')}")
+        status = page.evaluate("([t,r,c]) => window.__gw.runStatus({ table: t, row: r, col: c })", [T, 6, 6])
+        check("execution integrity: the displayed output matches the recorded run", status == "matches", str(status))
+        # a forged result (an op that only a client could send) no longer counts as the recorded run
+        apply({"type": "code_result", "table": T, "row": 6, "col": 6, "output": [[{"s": "Item"}, {"s": "Amount"}, {"s": "Double"}], [{"s": "a"}, {"n": 10}, {"n": 999}], [{"s": "b"}, {"n": 20}, {"n": 40}], [{"s": "c"}, {"n": 30.5}, {"n": 61}]], "std_out": None, "std_err": None, "deps": [{"table": T, "r0": 0, "c0": 6, "r1": 3, "c1": 7}]}, origin="code")
+        status = page.evaluate("([t,r,c]) => window.__gw.runStatus({ table: t, row: r, col: c })", [T, 6, 6])
+        check("execution integrity: a changed output is reported as not matching the recorded run", status == "output-changed", str(status))
+        page.evaluate("() => window.__gw.getState().set({ panel: 'review' })")
+        page.wait_for_selector(".review-panel .run-item.output-changed", timeout=5000)
+        check("the Review panel says so", "output differs from recorded run" in (page.text_content(".review-panel .run-item.output-changed") or ""), "")
+        page.evaluate("([t,r,c]) => window.__gw.getState().set({ panel: 'code', codeCell: { table: t, row: r, col: c } })", [T, 6, 6])
+        page.wait_for_selector(".code-panel .runtime-select", timeout=5000)
         # editing an input re-runs the cell on the server
         apply({"type": "set_cell", "table": T, "row": 1, "col": 7, "input": "100"})
         for _ in range(100):
@@ -168,6 +201,9 @@ def main():
                 break
             time.sleep(0.1)
         check("changing a cell the code read re-runs it on the server", num(cell(T, 7, 8)) == 200, str(cell(T, 7, 8)))
+        time.sleep(0.5)
+        status = page.evaluate("([t,r,c]) => window.__gw.runStatus({ table: t, row: r, col: c })", [T, 6, 6])
+        check("execution integrity: after the re-run the displayed output matches the new recorded run", status == "matches", str(status))
         # errors show in the panel
         apply({"type": "set_cell", "table": T, "row": 6, "col": 6, "input": "1/0", "kind": "python", "runtime": "server"})
         for _ in range(100):
@@ -198,12 +234,45 @@ def main():
         stored = rest("GET", f"/api/files/{fid}/proposals/{prop.get('proposal')}") if prop.get("proposal") else {}
         op = (stored.get("ops") or [{}])[0]
         check("an agent can propose a server-side (GPU-requested) Python cell", op.get("type") == "set_cell" and op.get("runtime") == "server" and op.get("gpu") is True, json.dumps(op)[:160])
+        # a second proposal edits an input that a formula depends on: the preview carries the consequence
+        apply({"type": "set_cell", "table": T, "row": 0, "col": 8, "input": "=SUM(H2:H4)"})
+        time.sleep(0.3)
+        page.evaluate("() => document.querySelector('.topbar button[title^=\"Save\"]').click()")
+        time.sleep(1.0)
+        body = {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "propose_edit", "arguments": {"id": fid, "title": "Correct item a", "actions": [{"action": "set_cell", "table": "Table 1", "ref": "H2", "input": "40"}]}}}
+        code, text = rest("POST", "/mcp", body, raw=True)
+        res = json.loads(text).get("result", {})
+        prop2 = json.loads("".join(c.get("text", "") for c in res.get("content", []))) if not res.get("isError") else {}
+        stored2 = rest("GET", f"/api/files/{fid}/proposals/{prop2.get('proposal')}") if prop2.get("proposal") else {"preview": []}
+        effects = [l for l in stored2["preview"] if l.get("effect")]
+        edits = [l for l in stored2["preview"] if not l.get("effect")]
+        check("a proposal's preview lists the edit and, separately, the cells that move as a result", len(edits) == 1 and edits[0]["after"] == "40" and any(l["where"].endswith("::I1") and l["before"] == "150.5" and l["after"] == "90.5" for l in effects), json.dumps(stored2["preview"])[:200])
+
+        # ------------------------------------------------------------------ the interface: a primary bar, a Review panel that leads with the decision
+        try:
+            page.wait_for_function("() => document.querySelector('.topbar button .count')?.textContent === '2'", timeout=5000)
+        except Exception:
+            pass
+        bar = page.evaluate("() => [...document.querySelectorAll('.topbar > button, .topbar > .menu-wrap > button')].map((b) => b.textContent.trim().replace(/▾$/, '').trim())")
+        check("the primary bar is: name · Save · undo/redo · Add · Ask · Review · Share (+ contextual Format, Code, More)", bar[1:4] == ["Save", "↶", "↷"] and bar[4:8] == ["Add", "Ask", "Review2", "Share"] and "Py" not in bar and "SQL" not in bar and bar[-1] == "More", str(bar))
+        check("the Review button carries the number of changes awaiting approval, pushed by the server as proposals arrive", page.locator(".topbar button .count").text_content() == "2", "")
         page.evaluate("() => window.__gw.getState().set({ panel: 'review' })")
         page.wait_for_selector(".review-panel .proposal.pending", timeout=8000)
+        lead = page.text_content(".review-panel .review-summary .lead") or ""
+        check("the Review panel leads with the decision to make", lead == "2 changes awaiting approval", lead)
+        card2 = page.locator(".review-panel .proposal.pending", has_text="Correct item a")
+        check("a proposal card shows the changed number and what moves as a result, with the evidence folded away", "1 change · 1 cell would move as a result" in (card2.text_content() or "") and card2.locator("table.diff-table.effects tr.effect").count() == 1 and card2.locator("details.evidence").count() == 1 and not card2.locator("details.evidence[open]").count(), (card2.text_content() or "")[:200])
+        page.evaluate("() => { const s = window.__gw.getState(); s.set({ selection: { table: 1, r0: 1, c0: 1, r1: 1, c1: 1, ar: 1, ac: 1 } }); }")
+        time.sleep(0.2)
+        page.click(".topbar button[data-menu='format']")
+        check("formatting controls appear contextually, under Format, when cells are selected", page.locator(".menu .swatch").count() >= 7 and page.locator(".menu button[title^='Bold']").count() == 1, "")
+        page.keyboard.press("Escape")
+        page.screenshot(path=f"{OUT}/f4-03-review.png")
+        card2.locator("button", has_text="Reject").click()
+        time.sleep(0.5)
         page.locator(".review-panel .proposal.pending", has_text="Totals by item").locator("button.primary").click()
         v = wait_result(T, 0, 5)
         check("applying it runs the cell on the server", v is not None and v.get("runtime") == "server" and num(v) == 150.5, str(v)[:120])
-        page.screenshot(path=f"{OUT}/f4-03-review.png")
         browser.close()
     check("no uncaught errors in the page", not errors, "; ".join(errors[:2])[:160])
 

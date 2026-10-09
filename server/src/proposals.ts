@@ -6,7 +6,7 @@
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { appendEntry, type Author } from './history.js';
+import { appendEntry, currentSeq, type Author, type LogEntry } from './history.js';
 import { a1, diffBooks, engine, nowSerial, openDocument, parseA1, tableByName, type DiffLine, errorMessage } from './headless.js';
 import { DATA_DIR } from './storage.js';
 import { pythonStatus } from './pyrun.js';
@@ -56,7 +56,12 @@ export interface Proposal {
   decidedBy?: Author;
   decidedAt?: string;
   decisionNote?: string;
+  /** log position of the last committed operation */
   appliedSeq?: number;
+  /** log positions of every committed operation (the receipt) */
+  appliedSeqs?: number[];
+  /** caller-supplied command id: repeating it returns the same receipt instead of applying again */
+  command?: string;
 }
 
 const safeId = (id: string) => /^[a-zA-Z0-9_-]{1,64}$/.test(id);
@@ -286,16 +291,75 @@ export function createProposal(doc: string, by: Author, agent: string, title: st
   return p;
 }
 
-export function decideProposal(doc: string, id: string, decision: 'applied' | 'rejected', by: Author, note?: string, appliedSeq?: number): Proposal {
+export class ProposalConflict extends Error {
+  constructor(
+    message: string,
+    public proposal: Proposal,
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * Decide a proposal. "applied" is a server-side commit: the stored actions are validated again
+ * against the document as it is now (the reviewer's expected revision must match; if the document
+ * moved on and the preview is no longer what was reviewed, the proposal gets a fresh preview and
+ * the caller must decide again), then the exact operations and the decision are appended to the
+ * log together. A repeated `command` returns the same receipt instead of applying twice.
+ */
+export function decideProposal(doc: string, id: string, decision: 'applied' | 'rejected', by: Author, note?: string, expectedSeq?: number, command?: string): { proposal: Proposal; committed: LogEntry[] } {
   const p = getProposal(doc, id);
   if (!p) throw new Error('proposal not found');
-  if (p.status !== 'pending') throw new Error(`proposal already ${p.status}`);
+  if (p.status !== 'pending') {
+    if (command && p.command === command) return { proposal: p, committed: [] }; // idempotent repeat
+    throw new Error(`proposal already ${p.status}`);
+  }
+  if (expectedSeq !== undefined && expectedSeq !== p.seq) {
+    throw new ProposalConflict(`this proposal was reviewed at revision ${p.seq}, not ${expectedSeq} — review the current preview`, p);
+  }
+  const committed: LogEntry[] = [];
+  if (decision === 'applied') {
+    let ops = p.ops;
+    if (currentSeq(doc) !== p.seq) {
+      // the document changed since the preview was made: only an identical preview may proceed
+      const v = validateActions(doc, p.actions);
+      const same = JSON.stringify(v.preview) === JSON.stringify(p.preview) && JSON.stringify(v.errors) === JSON.stringify(p.errors);
+      p.preview = v.preview;
+      p.ops = v.ops;
+      p.errors = v.errors;
+      p.seq = v.seq;
+      writeProposal(p);
+      if (!same) throw new ProposalConflict('the document changed since this proposal was reviewed — a fresh preview is attached, decide again', p);
+      ops = v.ops;
+    }
+    if (!ops.length) throw new Error(`nothing to apply: ${p.errors.join('; ') || 'no valid actions'}`);
+    for (const op of ops) {
+      const seq = appendEntry(doc, { author: by, origin: 'agent', op, note: `proposal ${id}` });
+      committed.push({ seq, ts: new Date().toISOString(), author: by, origin: 'agent', op });
+    }
+    p.appliedSeqs = committed.map((e) => e.seq);
+    p.appliedSeq = p.appliedSeqs[p.appliedSeqs.length - 1];
+  }
   p.status = decision;
   p.decidedBy = by;
   p.decidedAt = new Date().toISOString();
   p.decisionNote = note?.slice(0, 1000);
-  if (appliedSeq) p.appliedSeq = appliedSeq;
+  if (command) p.command = command.slice(0, 80);
   writeProposal(p);
-  appendEntry(doc, { author: by, origin: 'user', note: `proposal ${id} ${decision}${note ? ': ' + note : ''}` });
+  appendEntry(doc, { author: by, origin: 'user', note: `proposal ${id} ${decision}${note ? ': ' + note : ''}${committed.length ? ` (${committed.length} operation${committed.length === 1 ? '' : 's'} committed, seq ${p.appliedSeqs?.join(',')})` : ''}` });
+  return { proposal: p, committed };
+}
+
+/** Re-validate a pending proposal against the document as it is now (fresh preview and revision). */
+export function refreshProposal(doc: string, id: string): Proposal {
+  const p = getProposal(doc, id);
+  if (!p) throw new Error('proposal not found');
+  if (p.status !== 'pending') return p;
+  const v = validateActions(doc, p.actions);
+  p.preview = v.preview;
+  p.ops = v.ops;
+  p.errors = v.errors;
+  p.seq = v.seq;
+  writeProposal(p);
   return p;
 }

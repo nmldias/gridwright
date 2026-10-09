@@ -79,7 +79,8 @@ export interface Proposal {
   rationale: string;
   actions: Record<string, unknown>[];
   ops: Record<string, unknown>[];
-  preview: { where: string; before: string; after: string }[];
+  /** before → after of each edit, then (`effect`) every cell whose value moves as a consequence */
+  preview: { where: string; before: string; after: string; effect?: true }[];
   errors: string[];
   seq: number;
   status: 'pending' | 'applied' | 'rejected';
@@ -87,6 +88,8 @@ export interface Proposal {
   decidedAt?: string;
   decisionNote?: string;
   appliedSeq?: number;
+  appliedSeqs?: number[];
+  command?: string;
 }
 
 export type ToolEvent =
@@ -115,6 +118,8 @@ export interface ServerPython {
   gpu: string | null;
   timeoutMs: number;
   memoryMb: number;
+  /** what the signed-in person may do: run on the server, ask for the GPU */
+  can?: { run: boolean; gpu: boolean };
 }
 export interface ServerPythonResult {
   ok: boolean;
@@ -124,6 +129,17 @@ export interface ServerPythonResult {
   deps: { table: number; r0: number; c0: number; r1: number; c1: number }[];
   runtime: { name: string; version: string; packages: Record<string, string> };
   ms: number;
+  /** the run record the server computed and logged itself (server-side runs of a saved document) */
+  record?: Record<string, unknown>;
+}
+
+export class ProposalConflictError extends Error {
+  constructor(
+    message: string,
+    public proposal?: Proposal,
+  ) {
+    super(message);
+  }
 }
 
 export const api = {
@@ -131,8 +147,8 @@ export const api = {
     return j(await fetch('/api/health'));
   },
   python: {
-    async run(code: string, snapshot: unknown, gpu: boolean): Promise<ServerPythonResult> {
-      return j(await fetch('/api/python/run', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code, snapshot, gpu }) }));
+    async run(code: string, snapshot: unknown, gpu: boolean, cell?: { file: string; table: number; row: number; col: number; kind: string; startedAt: string; client: string }): Promise<ServerPythonResult> {
+      return j(await fetch('/api/python/run', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code, snapshot, gpu, cell }) }));
     },
     async status(): Promise<ServerPython & { available: boolean; reason?: string }> {
       return j(await fetch('/api/python'));
@@ -170,8 +186,21 @@ export const api = {
     async propose(id: string, body: { title: string; rationale?: string; actions: Record<string, unknown>[]; agent?: string; client?: string }): Promise<Proposal> {
       return j(await fetch(`/api/files/${encodeURIComponent(id)}/proposals`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));
     },
-    async decide(id: string, pid: string, decision: 'applied' | 'rejected', note?: string, seq?: number, client?: string): Promise<Proposal> {
-      return j(await fetch(`/api/files/${encodeURIComponent(id)}/proposals/${encodeURIComponent(pid)}/decide`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ decision, note, seq, client }) }));
+    /** The server commits (or refuses) the decision; a 409 carries the fresh preview to review again. */
+    async decide(id: string, pid: string, decision: 'applied' | 'rejected', note?: string, seq?: number, client?: string, command?: string): Promise<Proposal> {
+      const res = await fetch(`/api/files/${encodeURIComponent(id)}/proposals/${encodeURIComponent(pid)}/decide`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ decision, note, seq, client, command }) });
+      if (res.status === 409) {
+        const body = (await res.json()) as { error?: string; proposal?: Proposal };
+        throw new ProposalConflictError(body.error ?? 'the document changed since this proposal was reviewed', body.proposal);
+      }
+      return j(res);
+    },
+    async refreshProposal(id: string, pid: string): Promise<Proposal> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/proposals/${encodeURIComponent(pid)}/refresh`, { method: 'POST' }));
+    },
+    /** A checkpoint built by the server from the log — how a sign-off share persists. */
+    async checkpoint(id: string, client?: string): Promise<{ id: string; seq: number }> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/checkpoint`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ client }) }));
     },
     async save(id: string, name: string, json: string, client?: string, seq?: number): Promise<FileInfo & { seq: number }> {
       return j(

@@ -149,14 +149,14 @@ export function CodePanel() {
             title={serverPython ? `Where this cell runs. Server: CPython ${serverPython.version} (${serverPython.memoryMb} MB, ${Math.round(serverPython.timeoutMs / 1000)} s per run)` : 'This server has no Python runtime; the browser runs the cell'}
           >
             <option value="browser">run in the browser (Pyodide)</option>
-            <option value="server" disabled={!serverPython}>
-              {serverPython ? `run on the server (CPython ${serverPython.version})` : 'run on the server (not available)'}
+            <option value="server" disabled={!serverPython || serverPython.can?.run === false}>
+              {serverPython ? (serverPython.can?.run === false ? 'run on the server (not permitted for your login)' : `run on the server (CPython ${serverPython.version})`) : 'run on the server (not available)'}
             </option>
           </select>
         )}
         {onServer && (
           <label className="check" title={serverPython?.gpu?.startsWith('cudf') ? `cudf.pandas on ${serverPython.gpu} — pandas code runs on the GPU when the data is large` : `GPU not available on the server: ${serverPython?.gpu ?? 'unknown'}. The cell runs on the CPU.`}>
-            <input type="checkbox" checked={!!cell.gpu} onChange={(e) => setMeta({ gpu: e.target.checked })} /> GPU{serverPython?.gpu?.startsWith('cudf') ? '' : ' (unavailable)'}
+            <input type="checkbox" checked={!!cell.gpu} disabled={serverPython?.can?.gpu === false} onChange={(e) => setMeta({ gpu: e.target.checked })} /> GPU{serverPython?.can?.gpu === false ? ' (not permitted)' : serverPython?.gpu?.startsWith('cudf') ? '' : ' (unavailable)'}
           </label>
         )}
         {lang === 'sql' && (

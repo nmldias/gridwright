@@ -45,6 +45,10 @@ export interface RunRecord {
   ms: number;
   runtime: { name: string; version: string; packages: Record<string, string> };
   at: string;
+  /** when the run started (an older run can never supersede a newer result) */
+  startedAt?: string;
+  /** who computed the hashes: the server (a server-side run it executed itself) or the client's runtime */
+  attested?: 'server' | 'client';
 }
 
 /** Validate a run record sent by a client (shape only; hashes are the client's statement). */
@@ -79,6 +83,7 @@ export function sanitiseRun(raw: unknown): RunRecord | null {
     ms: Math.max(0, num('ms') ?? 0),
     runtime: { name: String(rt.name ?? '').slice(0, 40), version: String(rt.version ?? '').slice(0, 200), packages },
     at: typeof r.at === 'string' ? r.at.slice(0, 40) : new Date().toISOString(),
+    startedAt: typeof r.startedAt === 'string' ? r.startedAt.slice(0, 40) : undefined,
   };
 }
 

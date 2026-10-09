@@ -12,11 +12,13 @@ import { canEdit, canManage, canSign, canView, deleteAccess, normalise, permissi
 import { chat } from './ai.js';
 import { appendEntry, checkpointSeqs, compactCheckpoints, currentSeq, deleteHistory, historyCsv, opTouchesCell, readAll, recentEntries, replayBundle, writeCheckpoint } from './history.js';
 import { identityEnabled, identityOf } from './identity.js';
-import { attachMultiplayer, notifyProposal as notifyProposalRoom, notifySaved } from './multiplayer.js';
+import { accessChanged, attachMultiplayer, broadcastEntries, notifyProposal as notifyProposalRoom, notifySaved } from './multiplayer.js';
 import { handleMcp, setProposalNotifier } from './mcp.js';
-import { engineAvailable, errorMessage } from './headless.js';
-import { createProposal, decideProposal, getProposal, listProposals } from './proposals.js';
-import { probeGpu, probePython, pythonStatus, runPython, type Snapshot } from './pyrun.js';
+import { engineAvailable, errorMessage, openDocument } from './headless.js';
+import { createProposal, decideProposal, getProposal, listProposals, ProposalConflict, refreshProposal } from './proposals.js';
+import { admissionState, probeGpu, probePython, pythonStatus, QUEUE_MAX, runPython, type Snapshot } from './pyrun.js';
+import { fnv, inputsHashFromSnapshot, outputHashOf } from './evidence.js';
+import { canRunPython, canUseGpu, executionPolicy } from './execpolicy.js';
 import { runQuery, testConnection, type Param } from './sql.js';
 import { authorizeQuery, canSeeConnection, SqlRefused } from './sqlpolicy.js';
 import {
@@ -36,7 +38,7 @@ import {
   type StoredConnection,
 } from './storage.js';
 
-const VERSION = '0.5.2';
+const VERSION = '0.6.0';
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? '0.0.0.0';
 const TOKEN = process.env.GRIDWRIGHT_TOKEN ?? '';
@@ -89,18 +91,20 @@ const requireRole = (min: 'editor' | 'admin') => (req: Request, res: Response, n
   next();
 };
 
-const publicPython = () => {
+const publicPython = (req: Request) => {
   const p = pythonStatus();
-  return p.available ? { version: p.version, sandbox: p.sandbox, gpu: p.gpu, timeoutMs: p.limits.timeoutMs, memoryMb: p.limits.memoryMb } : null;
+  const who = identityOf(req);
+  return p.available ? { version: p.version, sandbox: p.sandbox, gpu: p.gpu, timeoutMs: p.limits.timeoutMs, memoryMb: p.limits.memoryMb, can: { run: canRunPython(who), gpu: canUseGpu(who) } } : null;
 };
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, version: VERSION, multiplayer: true, pyodide: !!pyodideDir(), identity: identityEnabled, token: !!TOKEN, tools: true, defaultSharing: DEFAULT_SHARING, mcp: engineAvailable(), python: publicPython() });
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, version: VERSION, multiplayer: true, pyodide: !!pyodideDir(), identity: identityEnabled, token: !!TOKEN, tools: true, defaultSharing: DEFAULT_SHARING, mcp: engineAvailable(), python: publicPython(req) });
 });
 
 // --- server-side Python cells -------------------------------------------------------------
-app.get('/api/python', (_req, res) => {
+app.get('/api/python', (req, res) => {
   const p = pythonStatus();
-  res.json({ available: p.available, version: p.version, sandbox: p.sandbox, gpu: p.gpu, reason: p.reason, fallbacks: p.fallbacks, limits: p.limits, interpreter: p.interpreter });
+  const who = identityOf(req);
+  res.json({ available: p.available, version: p.version, sandbox: p.sandbox, gpu: p.gpu, reason: p.reason, fallbacks: p.fallbacks, limits: { ...p.limits, queue: QUEUE_MAX }, interpreter: p.interpreter, policy: executionPolicy(), admission: admissionState(), can: { run: canRunPython(who), gpu: canUseGpu(who) } });
 });
 // re-probe (after installing python, bubblewrap or cuDF) — administrators only
 app.post('/api/python/probe', requireRole('admin'), async (_req, res) => {
@@ -108,17 +112,50 @@ app.post('/api/python/probe', requireRole('admin'), async (_req, res) => {
   if (p.available) await probeGpu();
   res.json(pythonStatus());
 });
-// the client sends the code and a snapshot of the workbook (what the browser runtime would see)
+// the client sends the code and a snapshot of the workbook (what the browser runtime would see);
+// when it names the cell of a saved document, the server writes the run record itself, with hashes
+// it computed from what it ran — evidence the client cannot forge
 app.post('/api/python/run', requireRole('editor'), async (req, res) => {
   const b = req.body ?? {};
+  const requester = identityOf(req);
+  if (!canRunPython(requester)) return res.status(403).json({ error: 'running code on the server is not permitted for your login (GRIDWRIGHT_PYTHON_USERS)' });
+  if (b.gpu === true && !canUseGpu(requester)) return res.status(403).json({ error: 'GPU execution is not permitted for your login (GRIDWRIGHT_GPU_USERS)' });
   const code = typeof b.code === 'string' ? b.code : '';
   const snapshot = b.snapshot && Array.isArray(b.snapshot.tables) ? (b.snapshot as Snapshot) : { tables: [], current: { table: 0, row: 0, col: 0 } };
+  const startedAt = new Date().toISOString();
   const r = await runPython(code, snapshot, b.gpu === true);
+  if (r.busy) return res.status(429).json(r);
+  const cell = b.cell && typeof b.cell === 'object' ? (b.cell as { file?: unknown; table?: unknown; row?: unknown; col?: unknown; kind?: unknown; startedAt?: unknown; client?: unknown }) : null;
+  const fileId = cell && typeof cell.file === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(cell.file) ? cell.file : null;
+  if (fileId && [cell!.table, cell!.row, cell!.col].every((x) => Number.isFinite(Number(x))) && readFile(fileId)) {
+    const who = identityOf(req);
+    if (canView(permissionFor(readAccess(fileId), who))) {
+      const run = {
+        table: Number(cell!.table),
+        row: Number(cell!.row),
+        col: Number(cell!.col),
+        kind: 'python',
+        codeHash: fnv(code),
+        inputsHash: inputsHashFromSnapshot(snapshot, r.deps),
+        deps: r.deps,
+        outputHash: outputHashOf(r.ok ? r.output : null),
+        ok: r.ok,
+        error: r.error?.slice(0, 500),
+        ms: r.ms,
+        runtime: r.runtime,
+        at: new Date().toISOString(),
+        startedAt: typeof cell!.startedAt === 'string' ? cell!.startedAt.slice(0, 40) : startedAt,
+        attested: 'server' as const,
+      };
+      const seq = appendEntry(fileId, { author: { id: typeof cell!.client === 'string' ? cell!.client : 'api', name: who.name || 'Guest', login: who.login || undefined }, origin: 'code', run });
+      return res.json({ ...r, record: { ...run, seq } });
+    }
+  }
   res.json(r);
 });
 app.get('/api/me', (req, res) => {
   const id = identityOf(req);
-  res.json({ login: id.login, name: id.name, role: id.role, identity: identityEnabled });
+  res.json({ login: id.login, name: id.name, role: id.role, identity: identityEnabled, can: { python: canRunPython(id), gpu: canUseGpu(id) } });
 });
 
 // --- documents --------------------------------------------------------------------
@@ -171,15 +208,14 @@ app.post('/api/files', requireRole('editor'), (req, res) => {
     res.status(400).json({ error: errorMessage(e) });
   }
 });
+// whole-document replacement is an edit: a sign-off share persists through /checkpoint instead
 app.put('/api/files/:id', requireRole('editor'), (req, res) => {
   try {
-    const p = docPermission(req, res, 'sign');
+    const p = docPermission(req, res, 'edit');
     if (!p) return;
     const { name, json, client, seq } = req.body ?? {};
     if (typeof json !== 'string') return res.status(400).json({ error: 'json (string) required' });
-    const current = readFile(req.params.id)!;
-    // a sign-only peer may only persist sign-offs: keep the stored name
-    const meta = writeFile(req.params.id, canEdit(p.permission) ? String(name || 'Untitled').slice(0, 120) : current.name, json);
+    const meta = writeFile(req.params.id, String(name || 'Untitled').slice(0, 120), json);
     // checkpoint the saved state at the log position the client had applied (falls back to the current seq)
     const at = Number.isFinite(Number(seq)) && Number(seq) > 0 ? Number(seq) : currentSeq(req.params.id);
     if (!checkpointSeqs(req.params.id).includes(at)) {
@@ -193,6 +229,28 @@ app.put('/api/files/:id', requireRole('editor'), (req, res) => {
     }
     notifySaved(req.params.id, typeof client === 'string' ? client : undefined);
     res.json({ ...meta, seq: currentSeq(req.params.id) });
+  } catch (e) {
+    res.status(400).json({ error: errorMessage(e) });
+  }
+});
+// a checkpoint built by the server from the log (latest checkpoint + every operation since): the
+// way a sign-off share — or anyone — persists the current state without sending a document
+app.post('/api/files/:id/checkpoint', requireRole('editor'), (req, res) => {
+  const p = docPermission(req, res, 'sign');
+  if (!p) return;
+  try {
+    const { book, name, json, seq } = openDocument(req.params.id);
+    book.free();
+    const id = identityOf(req);
+    const client = typeof req.body?.client === 'string' ? req.body.client : 'api';
+    writeFile(req.params.id, name, json);
+    let at = seq;
+    if (!checkpointSeqs(req.params.id).includes(at)) {
+      at = appendEntry(req.params.id, { author: { id: client, name: id.name || 'Guest', login: id.login || undefined }, origin: 'user', checkpoint: true, note: 'checkpoint' });
+      writeCheckpoint(req.params.id, at, json);
+    }
+    notifySaved(req.params.id, client);
+    res.json({ id: req.params.id, seq: at });
   } catch (e) {
     res.status(400).json({ error: errorMessage(e) });
   }
@@ -229,6 +287,7 @@ app.put('/api/files/:id/access', requireRole('editor'), (req, res) => {
   }
   const saved = normalise(next);
   writeAccess(req.params.id, saved);
+  accessChanged(req.params.id); // connected sessions are downgraded or closed at once
   res.json({ ...saved, permission: permissionFor(saved, identityOf(req)), identity: identityEnabled });
 });
 
@@ -297,6 +356,7 @@ app.post('/api/files/:id/proposals', requireRole('editor'), (req, res) => {
     res.status(400).json({ error: errorMessage(e) });
   }
 });
+// the decision is a server-side commit: expected revision, exact operations and decision together, once
 app.post('/api/files/:id/proposals/:pid/decide', requireRole('editor'), (req, res) => {
   if (!docPermission(req, res, 'edit')) return;
   try {
@@ -304,7 +364,31 @@ app.post('/api/files/:id/proposals/:pid/decide', requireRole('editor'), (req, re
     const b = req.body ?? {};
     const decision = b.decision === 'applied' ? 'applied' : b.decision === 'rejected' ? 'rejected' : null;
     if (!decision) return res.status(400).json({ error: 'decision must be applied or rejected' });
-    const p = decideProposal(req.params.id, req.params.pid, decision, { id: typeof b.client === 'string' ? b.client : 'api', name: id.name || 'Guest', login: id.login || undefined }, typeof b.note === 'string' ? b.note : undefined, Number.isFinite(Number(b.seq)) ? Number(b.seq) : undefined);
+    const { proposal, committed } = decideProposal(
+      req.params.id,
+      req.params.pid,
+      decision,
+      { id: typeof b.client === 'string' ? b.client : 'api', name: id.name || 'Guest', login: id.login || undefined },
+      typeof b.note === 'string' ? b.note : undefined,
+      Number.isFinite(Number(b.seq)) ? Number(b.seq) : undefined,
+      typeof b.command === 'string' ? b.command : undefined,
+    );
+    if (committed.length) broadcastEntries(req.params.id, committed);
+    notifyProposalRoom(req.params.id, proposal);
+    res.json(proposal);
+  } catch (e) {
+    if (e instanceof ProposalConflict) {
+      notifyProposalRoom(req.params.id, e.proposal);
+      return res.status(409).json({ error: e.message, proposal: e.proposal });
+    }
+    res.status(400).json({ error: errorMessage(e) });
+  }
+});
+// a fresh preview of a pending proposal against the document as it is now
+app.post('/api/files/:id/proposals/:pid/refresh', requireRole('editor'), (req, res) => {
+  if (!docPermission(req, res, 'view')) return;
+  try {
+    const p = refreshProposal(req.params.id, req.params.pid);
     notifyProposalRoom(req.params.id, p);
     res.json(p);
   } catch (e) {

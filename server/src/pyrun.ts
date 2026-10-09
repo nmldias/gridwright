@@ -43,6 +43,8 @@ export interface Snapshot {
 
 export interface RunResult {
   ok: boolean;
+  /** refused at admission (queue full) — nothing ran */
+  busy?: boolean;
   output?: unknown;
   error?: string;
   std_out: string;
@@ -240,8 +242,11 @@ export function probePython(force = false): Promise<PythonStatus> {
       status = { ...status, available: false, interpreter: '', version: '', sandbox: null, gpu: null, reason: process.env.GRIDWRIGHT_PYTHON?.toLowerCase() === 'off' ? 'disabled (GRIDWRIGHT_PYTHON=off)' : 'no python3 on this host (set GRIDWRIGHT_PYTHON or run the installer with --python)' };
       return status;
     }
+    // Fail closed: only bubblewrap hides the data directory and other people's files from a cell.
+    // `auto` and `require` therefore mean bubblewrap or nothing; the weaker modes (a user+network
+    // namespace with the filesystem visible, or a plain process) must be chosen by name.
     const want = (process.env.GRIDWRIGHT_PYTHON_SANDBOX ?? 'auto').toLowerCase();
-    const order: Sandbox[] = want === 'bwrap' ? ['bwrap'] : want === 'unshare' ? ['unshare'] : want === 'none' ? ['none'] : want === 'require' ? ['bwrap', 'unshare'] : ['bwrap', 'unshare', 'none'];
+    const order: Sandbox[] = want === 'unshare' ? ['unshare'] : want === 'none' ? ['none'] : ['bwrap'];
     const reasons: string[] = [];
     for (const sb of order) {
       if (sb !== 'none' && !(await which(sb))) {
@@ -257,7 +262,8 @@ export function probePython(force = false): Promise<PythonStatus> {
       }
       reasons.push(`${sb}: ${p.reason}`);
     }
-    status = { available: false, interpreter: py, version: '', sandbox: null, gpu: null, reason: reasons.join('; ') || 'no sandbox', limits: LIMITS };
+    const hint = order[0] === 'bwrap' ? ' — server-side Python stays off without a bubblewrap sandbox: run scripts/install.sh --sandbox, or set GRIDWRIGHT_PYTHON_SANDBOX=unshare|none to accept weaker isolation knowingly' : '';
+    status = { available: false, interpreter: py, version: '', sandbox: null, gpu: null, reason: (reasons.join('; ') || 'no sandbox') + hint, limits: LIMITS };
     return status;
   })();
   return probing;
@@ -446,21 +452,28 @@ export function stopPool() {
   }
 }
 
-// GPU runs: a fresh process each time, at most `concurrency` at once
-let gpuRunning = 0;
-const gpuWaiting: (() => void)[] = [];
-const acquireGpu = () =>
-  new Promise<void>((res) => {
-    if (gpuRunning < LIMITS.concurrency) {
-      gpuRunning++;
+// --- admission ----------------------------------------------------------------------------
+// One budget for every run, CPU or GPU: at most `concurrency` executing and at most `queue`
+// waiting; beyond that a run is refused at once ("busy") rather than piling up behind the models
+// this host may also be serving.
+export const QUEUE_MAX = num(process.env.GRIDWRIGHT_PYTHON_QUEUE, 64, 10_000);
+let executing = 0;
+const admission: (() => void)[] = [];
+export class Busy extends Error {}
+const admit = () =>
+  new Promise<void>((res, rej) => {
+    if (executing < LIMITS.concurrency) {
+      executing++;
       res();
-    } else gpuWaiting.push(res);
+    } else if (admission.length >= QUEUE_MAX) rej(new Busy(`server busy: ${executing} running and ${admission.length} queued (limit ${QUEUE_MAX}) — try again shortly`));
+    else admission.push(res);
   });
-const releaseGpu = () => {
-  const next = gpuWaiting.shift();
+const leave = () => {
+  const next = admission.shift();
   if (next) next();
-  else gpuRunning--;
+  else executing--;
 };
+export const admissionState = () => ({ executing, queued: admission.length, concurrency: LIMITS.concurrency, queue: QUEUE_MAX });
 
 /** Run one cell. Never throws: every failure is an `ok: false` result the client can show. */
 export async function runPython(code: string, snapshot: Snapshot, gpu: boolean): Promise<RunResult> {
@@ -468,17 +481,21 @@ export async function runPython(code: string, snapshot: Snapshot, gpu: boolean):
   const base = { std_out: '', deps: [] as RunResult['deps'], runtime: { name: 'python-server', version: st.version, packages: { sandbox: st.sandbox ?? 'none' } }, ms: 0 };
   if (!st.available || !st.sandbox) return { ...base, ok: false, error: `server-side Python is not available: ${st.reason ?? 'unknown'}` };
   const limits = { cpuSeconds: Math.ceil(LIMITS.timeoutMs / 1000), memoryMb: LIMITS.memoryMb, maxCells: LIMITS.maxCells, fileMb: 64 };
-  if (!gpu) {
-    const r = await pooledRun(st.sandbox, st.interpreter, { id: Date.now(), code, snapshot, gpu: false, limits, timeoutMs: LIMITS.timeoutMs, retries: 0 }, LIMITS.timeoutMs);
-    if (r.result) {
-      const runtime = (r.result.runtime as RunResult['runtime']) ?? base.runtime;
-      runtime.packages = { ...(runtime.packages ?? {}), sandbox: st.sandbox };
-      return { ok: !!r.result.ok, output: r.result.output ?? null, error: r.result.error as string | undefined, std_out: String(r.result.std_out ?? ''), deps: (r.result.deps as RunResult['deps']) ?? [], runtime, ms: r.ms };
-    }
-    return { ...base, ok: false, error: `the Python host did not answer within ${Math.round(LIMITS.timeoutMs / 1000)} s and was restarted`, ms: r.ms };
-  }
-  await acquireGpu();
   try {
+    await admit();
+  } catch (e) {
+    return { ...base, ok: false, error: errorMessageOf(e), busy: true };
+  }
+  try {
+    if (!gpu) {
+      const r = await pooledRun(st.sandbox, st.interpreter, { id: Date.now(), code, snapshot, gpu: false, limits, timeoutMs: LIMITS.timeoutMs, retries: 0 }, LIMITS.timeoutMs);
+      if (r.result) {
+        const runtime = (r.result.runtime as RunResult['runtime']) ?? base.runtime;
+        runtime.packages = { ...(runtime.packages ?? {}), sandbox: st.sandbox };
+        return { ok: !!r.result.ok, output: r.result.output ?? null, error: r.result.error as string | undefined, std_out: String(r.result.std_out ?? ''), deps: (r.result.deps as RunResult['deps']) ?? [], runtime, ms: r.ms };
+      }
+      return { ...base, ok: false, error: `the Python host did not answer within ${Math.round(LIMITS.timeoutMs / 1000)} s and was restarted`, ms: r.ms };
+    }
     const r = await execute(wrap(st.sandbox, st.interpreter, true), { code, snapshot, gpu: true, limits }, LIMITS.timeoutMs + 2000);
     if (r.result) {
       const runtime = (r.result.runtime as RunResult['runtime']) ?? base.runtime;
@@ -489,6 +506,8 @@ export async function runPython(code: string, snapshot: Snapshot, gpu: boolean):
     const error = r.timedOut ? `time limit of ${Math.round(LIMITS.timeoutMs / 1000)} s exceeded` : r.signal === 'SIGKILL' ? `the process was killed (memory limit ${LIMITS.memoryMb} MB?)${tail ? `: ${tail}` : ''}` : `python exited with ${r.code ?? r.signal}${tail ? `: ${tail}` : ''}`;
     return { ...base, ok: false, error, ms: r.ms };
   } finally {
-    releaseGpu();
+    leave();
   }
 }
+
+const errorMessageOf = (e: unknown) => (e instanceof Error ? e.message : String(e));
