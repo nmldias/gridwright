@@ -1,14 +1,28 @@
 :root {
-  --bg: #f3f4f6;
-  --panel: #ffffff;
-  --border: #e5e7eb;
-  --text: #111827;
-  --muted: #6b7280;
-  --accent: #2563eb;
-  --accent-soft: #dbeafe;
-  --danger: #b91c1c;
+  /* the values come from src/theme.ts (applyThemeCss); the fallbacks mirror it */
+  --bg: var(--c-canvas, #f3f4f6);
+  --panel: var(--c-panel, #ffffff);
+  --border: var(--c-border, #e5e7eb);
+  --border-strong: var(--c-border-strong, #9ca3af);
+  --text: var(--c-text, #111827);
+  --muted: var(--c-muted, #5f5e5a);
+  --accent: var(--c-accent, #0c447c);
+  --accent-soft: var(--c-accent-soft, #e4edf7);
+  --primary: var(--c-primary, #1f2937);
+  --primary-hover: var(--c-primary-hover, #111827);
+  --quiet: var(--c-quiet, #f3f4f6);
+  --quiet-hover: var(--c-quiet-hover, #e9eaee);
+  --danger: var(--c-danger, #b91c1c);
+  --amber: var(--c-amber, #8a5200);
+  --amber-soft: var(--c-amber-soft, #fdf1d6);
+  --green: var(--c-green, #2e7d32);
+  --green-soft: var(--c-green-soft, #dcfce7);
   --font: Inter, "Segoe UI", Helvetica, Arial, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --ui-base: 14px;
+  --ui-small: 12.5px;
+  --ui-title: 17px;
+  --ui-section: 12px;
 }
 * {
   box-sizing: border-box;
@@ -19,7 +33,8 @@ body,
   margin: 0;
   height: 100%;
   font-family: var(--font);
-  font-size: 13px;
+  font-size: var(--ui-base);
+  line-height: 1.45;
   color: var(--text);
   background: var(--bg);
 }
@@ -30,34 +45,41 @@ textarea {
   font: inherit;
   color: inherit;
 }
+/* controls are quiet by default: one charcoal primary per view, borders kept for fields and selection */
 button {
-  background: var(--panel);
-  border: 1px solid var(--border);
+  background: var(--quiet);
+  border: 1px solid transparent;
   border-radius: 6px;
-  padding: 4px 9px;
+  padding: 5px 10px;
   cursor: pointer;
   line-height: 1.3;
+  min-height: 30px;
 }
 button:hover:not(:disabled) {
-  background: #f9fafb;
-  border-color: #d1d5db;
+  background: var(--quiet-hover);
 }
 button:disabled {
   opacity: 0.45;
   cursor: default;
 }
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
 button.active {
   background: var(--accent-soft);
-  border-color: #93c5fd;
-  color: #1e3a8a;
+  color: var(--accent);
 }
 button.primary {
-  background: var(--accent);
-  border-color: var(--accent);
+  background: var(--primary);
+  border-color: var(--primary);
   color: white;
 }
 button.primary:hover:not(:disabled) {
-  background: #1d4ed8;
+  background: var(--primary-hover);
 }
 button.danger {
   color: var(--danger);
@@ -82,22 +104,32 @@ button.small {
 input,
 select,
 textarea {
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   border-radius: 6px;
-  padding: 4px 7px;
+  padding: 5px 8px;
   background: white;
+  min-height: 30px;
 }
 input:focus,
 select:focus,
 textarea:focus {
-  outline: 2px solid #bfdbfe;
-  border-color: #93c5fd;
+  outline: 2px solid var(--accent-soft);
+  border-color: var(--accent);
+}
+input[type='checkbox'],
+input[type='radio'] {
+  min-height: 0;
+  width: 16px;
+  height: 16px;
+  margin: 0 4px 0 0;
+  vertical-align: middle;
+  accent-color: var(--primary);
 }
 .muted {
   color: var(--muted);
 }
 .small {
-  font-size: 12px;
+  font-size: var(--ui-small);
 }
 .err {
   color: var(--danger);
@@ -161,11 +193,31 @@ code {
 }
 .topbar .filename {
   font-weight: 600;
-  border: 1px solid transparent;
-  max-width: 260px;
+  max-width: 240px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  display: inline-block;
+  vertical-align: bottom;
+}
+.topbar .doc-menu .menu-trigger {
+  background: none;
+}
+.topbar .save-btn {
+  position: relative;
+}
+.topbar .save-btn.done {
+  color: var(--muted);
+  background: none;
+}
+.topbar .save-btn .dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--amber);
+  margin-left: 6px;
+  vertical-align: middle;
 }
 .topbar .filename-input {
   width: 220px;
@@ -185,9 +237,9 @@ code {
   min-width: 18px;
   padding: 0 5px;
   border-radius: 999px;
-  background: #fef3c7;
-  color: #92400e;
-  font-size: 11px;
+  background: var(--amber-soft);
+  color: var(--amber);
+  font-size: 11.5px;
   line-height: 18px;
   text-align: center;
 }
@@ -346,12 +398,34 @@ code {
 .side {
   width: 420px;
   min-width: 320px;
-  max-width: 50vw;
+  max-width: 60vw;
   background: var(--panel);
   border-left: 1px solid var(--border);
   overflow: auto;
   display: flex;
   flex-direction: column;
+  position: relative;
+}
+.side-resizer {
+  flex: none;
+  width: 6px;
+  margin-right: -6px;
+  cursor: col-resize;
+  z-index: 5;
+  position: relative;
+}
+.side-resizer:hover {
+  background: var(--accent-soft);
+}
+.panel-title .panel-name {
+  font-size: var(--ui-title);
+  font-weight: 600;
+}
+.panel-title .panel-sub {
+  font-family: var(--mono);
+}
+.panel-close {
+  font-size: 14px;
 }
 .panel {
   padding: 12px;
@@ -363,15 +437,16 @@ code {
 }
 .panel-title {
   font-weight: 600;
-  font-size: 14px;
+  font-size: var(--ui-title);
   display: flex;
   align-items: center;
   gap: 8px;
+  min-height: 32px;
 }
 .panel-subtitle {
   font-weight: 600;
   color: var(--muted);
-  font-size: 11px;
+  font-size: var(--ui-section);
   text-transform: uppercase;
   letter-spacing: 0.04em;
   margin-top: 4px;
@@ -395,7 +470,7 @@ code {
   color: var(--text);
 }
 .pill {
-  font-size: 11px;
+  font-size: 12px;
   padding: 2px 8px;
   border-radius: 999px;
   background: #f3f4f6;
@@ -897,30 +972,62 @@ table.diff .arrow {
   width: 14px;
 }
 
-/* touch / narrow screens */
+/* touch / narrow screens: review first — a compact header, Ask and Review in reach, the panel on top */
 @media (max-width: 760px), (pointer: coarse) {
   button {
-    padding: 7px 11px;
-    min-height: 34px;
+    padding: 8px 12px;
+    min-height: 44px;
+  }
+  button.icon,
+  .tb-icon,
+  button.link,
+  button.small {
+    min-height: 0;
   }
   .topbar {
     flex-wrap: nowrap;
     overflow-x: auto;
-    scrollbar-width: thin;
+    scrollbar-width: none;
     -webkit-overflow-scrolling: touch;
+    padding: 6px 8px;
   }
   .topbar > * {
     flex: none;
+  }
+  .topbar .phone-hide {
+    display: none;
+  }
+  .topbar .filename {
+    max-width: 96px;
+  }
+  .topbar button {
+    padding-left: 10px;
+    padding-right: 10px;
   }
   .side {
     position: absolute;
     right: 0;
     top: 0;
     bottom: 0;
-    width: 100%;
+    width: 100% !important;
     max-width: 100%;
     z-index: 30;
     box-shadow: -8px 0 24px rgba(0, 0, 0, 0.12);
+  }
+  button.icon.panel-close {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .proposal .decision {
+    position: sticky;
+    bottom: 0;
+    background: var(--panel);
+    padding-top: 4px;
+  }
+  .start-card {
+    right: 12px;
+    left: 12px;
+    width: auto;
   }
   .main {
     position: relative;
@@ -943,13 +1050,13 @@ table.diff .arrow {
 /* ---- round 2: charts, review, sharing, AI tools ---- */
 .panel h3 {
   font-weight: 600;
-  font-size: 14px;
+  font-size: var(--ui-title);
   margin: 0;
 }
 .panel h4 {
   font-weight: 600;
   color: var(--muted);
-  font-size: 11px;
+  font-size: var(--ui-section);
   text-transform: uppercase;
   letter-spacing: 0.04em;
   margin: 6px 0 0;
@@ -999,7 +1106,7 @@ label.check {
 }
 .badge {
   display: inline-block;
-  font-size: 10px;
+  font-size: 11.5px;
   font-weight: 500;
   padding: 1px 7px;
   border-radius: 999px;
@@ -1009,12 +1116,12 @@ label.check {
   color: #374151;
 }
 .badge.green {
-  background: #dcfce7;
+  background: var(--green-soft);
   color: #166534;
 }
 .badge.amber {
-  background: #fef3c7;
-  color: #92400e;
+  background: var(--amber-soft);
+  color: var(--amber);
 }
 .signoff-list {
   display: flex;
@@ -1200,10 +1307,101 @@ label.check {
   color: #0c447c;
 }
 .review-summary .lead.amber {
-  color: #b26a00;
+  color: var(--amber);
 }
 .amber-text {
-  color: #b26a00;
+  color: var(--amber);
+}
+.ok-text {
+  color: #166534;
+}
+.attention {
+  background: var(--amber-soft);
+  color: var(--amber);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: var(--ui-small);
+}
+.attention::before {
+  content: '⚠ ';
+}
+.effect-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: var(--ui-base);
+}
+.delta {
+  color: #166534;
+}
+.delta.neg {
+  color: var(--danger);
+}
+.diff-table th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 4px;
+}
+.diff-table td.delta {
+  white-space: nowrap;
+}
+button.link.where {
+  padding: 0;
+  text-align: left;
+}
+.proposal-title {
+  font-size: var(--ui-base);
+}
+details.proposal-detail > summary {
+  cursor: pointer;
+  font-size: var(--ui-small);
+  color: var(--muted);
+  user-select: none;
+}
+.proposal .decision {
+  margin-top: 2px;
+}
+.draft-note {
+  background: var(--amber-soft);
+  color: var(--amber);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+.overflow-note {
+  color: var(--amber);
+}
+.nav-item.current {
+  background: var(--accent-soft);
+}
+
+/* the start card: three ways in, on a fresh document */
+.start-card {
+  position: absolute;
+  right: 24px;
+  bottom: 24px;
+  width: 320px;
+  max-width: calc(100% - 32px);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(17, 24, 39, 0.12);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  z-index: 20;
+}
+.start-card .start-choice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  text-align: left;
+  padding: 8px 10px;
 }
 details.evidence {
   margin-top: 2px;

@@ -11,6 +11,8 @@ import * as book from '../engine/book';
 import { a1, isCodeKind, type CellKind } from '../engine/types';
 import { cellAt, useStore } from '../state/store';
 import { runCell } from '../workers/runner';
+import { clearDraft, draftKey, getDraft, hasDraft, setDraft as keepDraft } from './drafts';
+import { PanelHeader } from './PanelHeader';
 
 const REFRESH_OPTIONS: { label: string; value: number }[] = [
   { label: 'no auto-refresh', value: 0 },
@@ -28,12 +30,20 @@ export function CodePanel() {
   const runs = useStore((s) => s.runs);
   const pythonStatus = useStore((s) => s.pythonStatus);
   const serverPython = useStore((s) => s.serverPython);
+  const fileId = useStore((s) => s.fileId);
   const host = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const langRef = useRef(new Compartment());
   const [draft, setDraft] = useState('');
   const [conns, setConns] = useState<ConnectionInfo[]>([]);
   const cell = codeCell ? cellAt(codeCell.table, codeCell.row, codeCell.col) : undefined;
+  const dkey = codeCell ? draftKey(fileId, codeCell) : '';
+  const rememberDraft = (text: string) => {
+    setDraft(text);
+    if (!codeCell) return;
+    if (text === (cellAt(codeCell.table, codeCell.row, codeCell.col)?.i ?? '')) clearDraft(dkey);
+    else keepDraft(dkey, text);
+  };
   const meta = codeCell ? tables.get(codeCell.table) : undefined;
   const lang: CellKind | null = cell && isCodeKind(cell.k) ? cell.k : null;
   const running = codeCell ? runs.get(`${codeCell.table}:${codeCell.row}:${codeCell.col}`)?.running : false;
@@ -46,6 +56,7 @@ export function CodePanel() {
   const save = (run: boolean) => {
     if (!codeCell || !viewRef.current || !lang) return;
     const text = viewRef.current.state.doc.toString();
+    clearDraft(dkey);
     if (text !== cell?.i) {
       book.apply({ type: 'set_cell', table: codeCell.table, row: codeCell.row, col: codeCell.col, input: text, kind: lang, conn: cell?.conn ?? null, refresh: cell?.refresh ?? 0, runtime: cell?.runtime ?? null, gpu: cell?.gpu ?? null });
     } else if (run) {
@@ -77,8 +88,10 @@ export function CodePanel() {
     viewRef.current?.destroy();
     viewRef.current = null;
     if (!codeCell || !lang) return;
+    // an unsaved edit left here earlier comes back; the committed code otherwise
+    const initial = getDraft(dkey) ?? cell?.i ?? '';
     const state = EditorState.create({
-      doc: cell?.i ?? '',
+      doc: initial,
       extensions: [
         basicSetup,
         Prec.highest(
@@ -90,13 +103,13 @@ export function CodePanel() {
         ),
         langRef.current.of(lang === 'python' ? python() : lang === 'sql' ? sql() : javascript()),
         EditorView.updateListener.of((u) => {
-          if (u.docChanged) setDraft(u.state.doc.toString());
+          if (u.docChanged) rememberDraft(u.state.doc.toString());
         }),
         EditorView.theme({ '&': { fontSize: '13px', height: '100%' }, '.cm-scroller': { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' } }),
       ],
     });
     viewRef.current = new EditorView({ state, parent: host.current });
-    setDraft(cell?.i ?? '');
+    setDraft(initial);
     viewRef.current.focus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [codeCell?.table, codeCell?.row, codeCell?.col, lang]);
@@ -105,7 +118,8 @@ export function CodePanel() {
   useEffect(() => {
     const v = viewRef.current;
     if (!v || !cell) return;
-    if (cell.i !== v.state.doc.toString() && cell.i !== draft) {
+    // only when nothing is being edited here: an unsaved draft is never overwritten silently
+    if (cell.i !== v.state.doc.toString() && !hasDraft(dkey)) {
       v.dispatch({ changes: { from: 0, to: v.state.doc.length, insert: cell.i } });
       setDraft(cell.i);
     }
@@ -115,9 +129,9 @@ export function CodePanel() {
   if (!codeCell || !cell || !lang) {
     return (
       <div className="panel">
-        <div className="panel-title">Code</div>
+        <PanelHeader title="Code" />
         <p className="muted">
-          Select a cell and press <b>Py</b>, <b>JS</b> or <b>SQL</b> in the toolbar to turn it into a code cell. Results are written to the cell; lists and tables spill into the cells to the right and below.
+          Select a cell and press <b>Python</b> in the toolbar (JavaScript and SQL cells are under its caret) to turn it into a code cell. Results are written to the cell; lists and tables spill into the cells to the right and below.
         </p>
         <p className="muted">
           Inside code, <code>q.cells("A1:B5")</code> reads a range (use <code>"Table 2::A1"</code> for another table), <code>q.table()</code> reads the whole table. Python: the last expression is the output (DataFrames spill with a header row). JavaScript: <code>return</code> the value. SQL: the query result spills; <code>{'{{A1}}'}</code> binds a cell as a parameter.
@@ -127,19 +141,31 @@ export function CodePanel() {
   }
 
   const title = lang === 'python' ? 'Python' : lang === 'javascript' ? 'JavaScript' : 'SQL';
+  const unsaved = draft !== cell.i;
   return (
     <div className="panel code-panel">
-      <div className="panel-title">
-        <span>
-          {title} · {meta?.name}::{a1(codeCell.row, codeCell.col)}
-        </span>
-        <span className="grow" />
+      <PanelHeader title={title} subtitle={`${meta?.name}::${a1(codeCell.row, codeCell.col)}`}>
         {lang === 'python' && !onServer && <span className={`pill ${pythonStatus}`}>{pythonStatus === 'ready' ? 'runtime ready' : pythonStatus === 'loading' ? 'loading Pyodide…' : pythonStatus === 'error' ? 'runtime error' : 'runtime idle'}</span>}
         {onServer && <span className={`pill ${serverPython ? 'ready' : 'error'}`} title={serverPython ? `CPython ${serverPython.version} on the server · sandbox: ${serverPython.sandbox} · ${serverPython.gpu?.startsWith('cudf') ? 'GPU: ' + serverPython.gpu : 'no GPU'}` : 'the server has no Python runtime'}>{serverPython ? `server · ${serverPython.sandbox === 'bwrap' ? 'sandboxed' : serverPython.sandbox === 'unshare' ? 'no network' : 'unsandboxed'}` : 'server runtime off'}</span>}
         <button className="primary" disabled={!!running} onClick={() => save(true)} title="Run (Ctrl+Enter)">
           {running ? 'Running…' : '▶ Run'}
         </button>
-      </div>
+      </PanelHeader>
+      {unsaved && (
+        <div className="small draft-note">
+          Unsaved edit — Ctrl+S keeps it without running, Run commits and runs it.{' '}
+          <button
+            className="link small"
+            onClick={() => {
+              clearDraft(dkey);
+              viewRef.current?.dispatch({ changes: { from: 0, to: viewRef.current.state.doc.length, insert: cell.i } });
+              setDraft(cell.i);
+            }}
+          >
+            discard
+          </button>
+        </div>
+      )}
       <div className="row wrap small-row">
         {lang === 'python' && (
           <select

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { PanelHeader } from './PanelHeader';
 import { api, type HistoryEntry } from '../api/client';
 import * as book from '../engine/book';
 import { a1, colToLetters, type Op } from '../engine/types';
@@ -216,7 +217,7 @@ export function HistoryPanel() {
   if (!fileId) {
     return (
       <div className="panel">
-        <div className="panel-title">History</div>
+        <PanelHeader title="History" />
         <p className="muted">Save the document to start its audit trail: every change is then recorded with who made it, when, and whether it came from a person, the AI assistant or a code cell.</p>
       </div>
     );
@@ -224,9 +225,7 @@ export function HistoryPanel() {
 
   return (
     <div className="panel history-panel">
-      <div className="panel-title">
-        <span>{historyCell ? `History of ${tableName(historyCell.table)}::${a1(historyCell.row, historyCell.col)}` : 'History'}</span>
-        <span className="grow" />
+      <PanelHeader title="History" subtitle={historyCell ? `${tableName(historyCell.table)}::${a1(historyCell.row, historyCell.col)}` : undefined}>
         {historyCell && (
           <button className="link" onClick={() => useStore.setState({ historyCell: null })}>
             whole document
@@ -238,7 +237,7 @@ export function HistoryPanel() {
         <button onClick={() => void refresh()} title="Refresh">
           ↻
         </button>
-      </div>
+      </PanelHeader>
       {error && <div className="err small">{error}</div>}
       {compareA !== null && (
         <div className="small">

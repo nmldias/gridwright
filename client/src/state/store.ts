@@ -25,7 +25,7 @@ export interface Editing {
   source?: 'cell' | 'bar';
 }
 
-export type Panel = 'none' | 'code' | 'ai' | 'sql' | 'files' | 'share' | 'table' | 'settings' | 'history' | 'format' | 'chart' | 'review';
+export type Panel = 'none' | 'code' | 'ai' | 'sql' | 'files' | 'share' | 'table' | 'settings' | 'history' | 'format' | 'chart' | 'review' | 'navigate';
 
 export interface Presence {
   id: string;
@@ -108,6 +108,18 @@ interface State {
   proposalsVersion: number;
   /** proposals of the open document, as last loaded from the server (see ui/proposals.ts) */
   proposals: Proposal[];
+  /** a save is in flight */
+  saving: boolean;
+  /** when the open document was last saved to the server in this session (ms), null = never */
+  savedAt: number | null;
+  /** side panel width in px (desktop) */
+  panelWidth: number;
+  /** grid text density */
+  density: 'comfortable' | 'compact';
+  /** the start card (first use: import, template, blank, example) */
+  start: boolean;
+  /** what the Files panel shows */
+  filesView: 'documents' | 'templates';
   set: (patch: Partial<State>) => void;
 }
 
@@ -146,6 +158,25 @@ export const useStore = create<State>((set) => ({
   runsVersion: 0,
   proposalsVersion: 0,
   proposals: [],
+  saving: false,
+  savedAt: null,
+  panelWidth: (() => {
+    try {
+      const v = Number(localStorage.getItem('gridwright.panelWidth'));
+      return v >= 320 && v <= 900 ? v : 420;
+    } catch {
+      return 420;
+    }
+  })(),
+  density: (() => {
+    try {
+      return localStorage.getItem('gridwright.density') === 'compact' ? 'compact' : 'comfortable';
+    } catch {
+      return 'comfortable';
+    }
+  })(),
+  start: false,
+  filesView: 'documents',
   touch: typeof window !== 'undefined' && (navigator.maxTouchPoints > 0 || 'ontouchstart' in window) && !matchMedia('(pointer: fine)').matches,
   set: (patch) => set(patch),
 }));

@@ -10,38 +10,41 @@ import { CHART_HANDLE, FILTER_BTN, HANDLE, HANDLE_GAP, TAB_SIZE, TITLE_H, indexA
 import { alignOf, displayOf } from './format';
 import { condStyle } from './condfmt';
 import { chartData, chartLayout, type ChartData, type Prim } from './charts';
+import { THEME, hex } from '../theme';
 
-export const FONT = 'Inter, "Segoe UI", Helvetica, Arial, sans-serif';
-export const FONT_SIZE = 13;
+export const FONT = THEME.font;
+/** grid text size; `setGridFontSize` switches density at runtime */
+export let FONT_SIZE: number = THEME.gridFont.comfortable;
 const PAD = 6;
 
+const T = THEME.colors;
 const COLORS = {
-  canvas: 0xf3f4f6,
-  tableBg: 0xffffff,
-  headerBg: 0xf1f5f9,
-  grid: 0xe5e7eb,
-  border: 0x9ca3af,
-  borderSelected: 0x2563eb,
-  text: 0x111827,
-  textMuted: 0x6b7280,
-  error: 0xb91c1c,
-  spill: 0x60a5fa,
-  python: 0x2563eb,
+  canvas: hex(T.canvas),
+  tableBg: hex(T.panel),
+  headerBg: hex(T.headerBg),
+  grid: hex(T.grid),
+  border: hex(T.borderStrong),
+  borderSelected: hex(T.selection),
+  text: hex(T.text),
+  textMuted: hex(T.muted),
+  error: hex(T.danger),
+  spill: hex(T.spill),
+  python: hex(T.selection),
   javascript: 0xd97706,
   sql: 0x0f766e,
   invalid: 0xdc2626,
   pivotBg: 0xf8fafc,
-  filterBtn: 0x9ca3af,
-  filterActive: 0x2563eb,
-  selectionFill: 0x3b82f6,
-  tab: 0xe5e7eb,
-  tabText: 0x4b5563,
-  handle: 0x2563eb,
-  signed: 0x2e7d32,
-  stale: 0xb26a00,
-  traceIn: 0x0c447c,
-  traceOut: 0x993c1d,
-  merge: 0xcbd5e1,
+  filterBtn: hex(T.borderStrong),
+  filterActive: hex(T.selection),
+  selectionFill: hex(T.selectionSoft),
+  tab: hex(T.tab),
+  tabText: hex(T.tabText),
+  handle: hex(T.selection),
+  signed: hex(T.green),
+  stale: hex(T.amber),
+  traceIn: hex(T.accent),
+  traceOut: hex(T.traceOut),
+  merge: hex(T.merge),
 };
 const LINE_H = 16; // wrapped text line height
 
@@ -53,8 +56,16 @@ const titleStyle = { fontFamily: FONT, fontSize: 12, fill: 0xffffff, fontWeight:
 // --- text measurement (canvas 2D, cached) ---------------------------------
 const measureCtx = document.createElement('canvas').getContext('2d')!;
 const widthCache = new Map<string, number>();
-function textWidth(s: string, bold: boolean): number {
-  const key = (bold ? 'b' : 'n') + s;
+/** Change the grid text size (density); measurements and text styles follow. */
+export function setGridFontSize(px: number) {
+  if (px === FONT_SIZE) return;
+  FONT_SIZE = px;
+  normalStyle.fontSize = px;
+  boldStyle.fontSize = px;
+  widthCache.clear();
+}
+export function textWidth(s: string, bold: boolean): number {
+  const key = (bold ? 'b' : 'n') + FONT_SIZE + s;
   let w = widthCache.get(key);
   if (w === undefined) {
     measureCtx.font = `${bold ? 'bold ' : ''}${FONT_SIZE}px ${FONT}`;
@@ -75,6 +86,30 @@ function fit(s: string, maxW: number, bold: boolean): string {
     else hi = mid - 1;
   }
   return s.slice(0, lo);
+}
+/** Truncate text with an ellipsis, so that a cut is visible. */
+function fitEllipsis(s: string, maxW: number, bold: boolean): string {
+  if (textWidth(s, bold) <= maxW) return s;
+  const cut = fit(s, Math.max(0, maxW - textWidth('…', bold)), bold);
+  return cut.length ? cut.replace(/\s+$/, '') + '…' : fit(s, maxW, bold);
+}
+/**
+ * A number that does not fit is never shortened: 1 234 567 shown as "1 234 5" reads as a different
+ * amount. The cell shows an overflow marker instead (the spreadsheet convention), and the full
+ * value is in the status bar and the formula bar; fitting the column restores it.
+ */
+export const OVERFLOW = '#';
+function overflowMarker(maxW: number, bold: boolean): string {
+  const n = Math.max(1, Math.floor(maxW / Math.max(1, textWidth(OVERFLOW, bold))));
+  return OVERFLOW.repeat(Math.min(n, 40));
+}
+/** Pixels needed to show a cell's text in full (padding included). */
+export function neededWidth(text: string, bold: boolean): number {
+  return Math.ceil(textWidth(text, bold)) + PAD * 2 + 2;
+}
+/** True when a numeric display text does not fit the given column width. */
+export function numberOverflows(text: string, bold: boolean, colWidth: number): boolean {
+  return textWidth(text, bold) > colWidth - PAD * 2;
 }
 
 /** Greedy word wrap into at most `maxLines` lines (long words are cut). */
@@ -337,6 +372,7 @@ export class GridRenderer {
     this.world.position.set(panX, panY);
     this.world.scale.set(zoom);
     this.markDirty();
+    if (getState().zoom !== zoom) getState().set({ zoom });
     this.viewportListeners.forEach((l) => l());
   }
 
@@ -365,6 +401,26 @@ export class GridRenderer {
 
   tableOrder(): TableId[] {
     return Array.from(getState().tables.keys());
+  }
+
+  /** Zoom and pan so that a world rectangle fills the view (with a margin), zoom clamped to 0.2–4. */
+  fitRect(x0: number, y0: number, x1: number, y1: number, margin = 40, maxZoom = 1.5) {
+    const w = Math.max(1, x1 - x0);
+    const h = Math.max(1, y1 - y0);
+    const vw = Math.max(1, this.viewWidth - margin * 2);
+    const vh = Math.max(1, this.viewHeight - margin * 2 - TITLE_H);
+    const z = Math.min(maxZoom, Math.max(0.2, Math.min(vw / w, vh / h)));
+    const panX = (this.viewWidth - w * z) / 2 - x0 * z;
+    const panY = (this.viewHeight + TITLE_H - h * z) / 2 - y0 * z;
+    this.setViewport(panX, panY, z);
+  }
+
+  /** 100 % with the given world point at the top-left corner (or the current view centre kept). */
+  resetZoom() {
+    const cx = this.viewWidth / 2;
+    const cy = this.viewHeight / 2;
+    const before = this.screenToWorld(cx, cy);
+    this.setViewport(cx - before.x, cy - before.y, 1);
   }
 
   // ------------------------------------------------------------------
@@ -738,13 +794,15 @@ export class GridRenderer {
             }
           }
           const maxW = Math.max(4, avail - PAD * 2 - (avail === w ? headerReserve : 0));
-          const fitted = fit(text, maxW, bold);
+          const isNumber = !!cell.v && typeof cell.v === 'object' && 'n' in cell.v;
+          const overflow = isNumber && textWidth(text, bold) > maxW;
+          const fitted = overflow ? overflowMarker(maxW, bold) : fitEllipsis(text, maxW, bold);
           if (t.text !== fitted) t.text = fitted;
           const isErr = !!cell.v && typeof cell.v === 'object' && 'e' in cell.v;
           let color = hexToNum(cond?.color ?? cell?.f?.color);
           // dark conditional fills get light text
           if (color === null && cond?.fill && fill !== null && luminance(fill) < 0.45) color = 0xffffff;
-          t.tint = isErr ? COLORS.error : color !== null ? color : cell.s ? 0x1e3a8a : COLORS.text;
+          t.tint = isErr ? COLORS.error : overflow ? COLORS.textMuted : color !== null ? color : cell.s ? 0x1e3a8a : COLORS.text;
           const tw = Math.min(t.width, maxW);
           t.x = align === 'right' ? x0 + w - PAD - tw - (avail === w ? headerReserve : 0) : align === 'center' ? x0 + (w - tw) / 2 : x0 + PAD;
           t.y = y0 + (h - t.height) / 2 + 0.5;

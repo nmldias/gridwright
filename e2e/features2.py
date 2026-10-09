@@ -118,7 +118,8 @@ def main():
         cid = page.evaluate("() => window.__gw.review.insertChart('bar')")
         st = state()
         chart = next((c for c in st["charts"] if c["id"] == cid), None)
-        check("chart inserted from the selection (categories + 3 series from the header row)", chart is not None and chart["categories"].endswith("A2:A5") and [s["name"] for s in chart["series"]] == ["Units", "Unit price", "Revenue"], json.dumps(chart)[:200] if chart else str(st["charts"]))
+        # units, unit prices and revenue do not share an axis: the chart takes one measure and says which were left out
+        check("chart inserted from the selection: categories from the first column, one measure (not three incompatible columns)", chart is not None and chart["categories"].endswith("A2:A5") and [s["name"] for s in chart["series"]] == ["Revenue"] and "Chart shows Revenue only" in st["status"], json.dumps(chart)[:200] if chart else str(st["charts"]))
         check("chart panel opens with the new chart selected", st["panel"] == "chart" and st["selectedChart"] == cid, f"{st['panel']} {st['selectedChart']}")
         svg = page.evaluate("(id) => { const c = window.__gw.getState().charts.find((x) => x.id === id); const d = window.__gw.charts.chartData(c); return window.__gw.charts.chartSvg({ ...c, title: 'Units lead in East', exhibit: 'Exhibit 1 — Regions', reference: { value: 100, label: 'Target' }, highlight: 2 }, d); }", cid)
         check("chart SVG carries the exhibit tag, action title, bars, reference line and footnote", "EXHIBIT 1 — REGIONS" in svg and "Units lead in East" in svg and svg.count("<rect") > 6 and 'stroke-dasharray' in svg and "#993C1D" in svg and "Source:" in svg, f"{len(svg)} chars")
@@ -239,7 +240,7 @@ def main():
 
         # ------------------------------------------------------------------ save, undo as ops, audit CSV, compaction
         page.evaluate("() => window.__gw.getState().set({ fileName: 'Round two' })")
-        page.evaluate("() => document.querySelector('.topbar button[title^=\"Save\"]').click()")
+        page.evaluate("() => document.querySelector('.topbar .save-btn').click()")
         for _ in range(50):
             if state()["fileId"]:
                 break

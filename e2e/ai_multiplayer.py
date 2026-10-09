@@ -70,7 +70,7 @@ with sync_playwright() as p:
     page.screenshot(path=f"{OUT}/07-ai.png")
 
     # --- save, then open the same document in a second page (multiplayer) ----------
-    page.click("button[title='Save (Ctrl+S)']")
+    page.click(".topbar .save-btn")
     time.sleep(0.8)
     file_id = page.evaluate("() => window.__gw.getState().fileId")
     check("document saved", bool(file_id), str(file_id))

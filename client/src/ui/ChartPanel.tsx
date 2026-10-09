@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { PanelHeader } from './PanelHeader';
 import * as book from '../engine/book';
 import { refText, type Chart, type ChartKind } from '../engine/types';
 import { chartData, chartPng, chartSvg, downloadBlob } from '../grid/charts';
@@ -27,7 +28,7 @@ export function ChartPanel() {
   if (!chart || !draft || !data) {
     return (
       <div className="panel">
-        <h3>Chart</h3>
+        <PanelHeader title="Chart" />
         <p className="muted small">Select a table or a block of cells (a header row with numbers underneath), then insert a chart. Charts are exhibits: an action title, a grey subtitle with the dataset and units, direct labels instead of a legend, one highlighted observation, a benchmark line and a source footnote.</p>
         <div className="row wrap">
           {KINDS.map((k) => (
@@ -87,7 +88,7 @@ export function ChartPanel() {
 
   return (
     <div className="panel chart-panel">
-      <h3>Chart</h3>
+      <PanelHeader title="Chart" />
       <label>
         Type
         <select value={draft.kind} onChange={(e) => commit({ kind: e.target.value as ChartKind })}>

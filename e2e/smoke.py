@@ -284,7 +284,7 @@ def main():
             page.screenshot(path=f"{OUT}/05-python.png")
 
         # --- save & reopen ----------------------------------------------------------------
-        page.click("button[title='Save (Ctrl+S)']")
+        page.click(".topbar .save-btn")
         time.sleep(0.8)
         file_id = page.evaluate("() => window.__gw.getState().fileId")
         check("save creates a document", bool(file_id), str(file_id))

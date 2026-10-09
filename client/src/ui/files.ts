@@ -4,10 +4,14 @@ import { api } from '../api/client';
 import { getClientId, joinFile } from '../api/ws';
 import * as book from '../engine/book';
 import { getState, setStatus, useStore } from '../state/store';
+import { adoptUnsaved } from './chat';
+import { adoptUnsavedDrafts } from './drafts';
 
 export async function saveCurrentFile(): Promise<void> {
   const st = getState();
+  if (st.saving) return;
   const json = book.toJson();
+  useStore.setState({ saving: true });
   try {
     if (st.fileId && st.permission === 'sign') {
       // a sign-off share never sends a document: the server checkpoints its own replay of the log
@@ -19,12 +23,17 @@ export async function saveCurrentFile(): Promise<void> {
     } else {
       const info = await api.files.create(st.fileName, json, getClientId(), st.fileFolder);
       useStore.setState({ fileId: info.id, seq: info.seq ?? 0, permission: info.permission ?? 'own' });
+      // the conversation and code drafts of the unsaved document follow it
+      adoptUnsaved(info.id);
+      adoptUnsavedDrafts(info.id);
       joinFile(info.id);
     }
-    useStore.setState({ dirty: false });
+    useStore.setState({ dirty: false, savedAt: Date.now() });
     setStatus('Saved', 1500);
   } catch (e) {
     setStatus(`Save failed: ${(e as Error).message}`, 6000);
+  } finally {
+    useStore.setState({ saving: false });
   }
 }
 
@@ -32,7 +41,7 @@ export async function openFile(id: string): Promise<void> {
   try {
     const f = await api.files.get(id);
     await book.loadBook(f.json, f.name, f.id);
-    useStore.setState({ seq: f.seq ?? 0, permission: f.permission ?? 'own', fileFolder: f.folder ?? '' });
+    useStore.setState({ seq: f.seq ?? 0, permission: f.permission ?? 'own', fileFolder: f.folder ?? '', savedAt: null });
     joinFile(f.id);
     setStatus(`Opened ${f.name}`, 1500);
   } catch (e) {
@@ -42,7 +51,7 @@ export async function openFile(id: string): Promise<void> {
 
 export async function newFile(name = 'Untitled', folder = ''): Promise<void> {
   await book.loadBook(null, name, null);
-  useStore.setState({ permission: 'own', fileFolder: folder });
+  useStore.setState({ permission: 'own', fileFolder: folder, savedAt: null });
   joinFile(null);
 }
 

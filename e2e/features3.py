@@ -116,7 +116,7 @@ def main():
             return page.evaluate("() => { const s = window.__gw.getState(); return { fileId: s.fileId, panel: s.panel }; }")
 
         page.evaluate("() => window.__gw.getState().set({ fileName: 'Round three' })")
-        page.evaluate("() => document.querySelector('.topbar button[title^=\"Save\"]').click()")
+        page.evaluate("() => document.querySelector('.topbar .save-btn').click()")
         fid = None
         for _ in range(60):
             fid = state()["fileId"]

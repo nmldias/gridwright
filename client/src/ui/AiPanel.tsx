@@ -1,28 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
-import { api, type AiSettings, type ToolEvent } from '../api/client';
+import { api, type AiSettings } from '../api/client';
 import * as book from '../engine/book';
 import { useStore } from '../state/store';
-import { applyActions, buildMessages, extractActions, previewActions, type Action, type DiffLine } from './ai';
-
-interface ToolRun {
-  id: string;
-  name: string;
-  args: Record<string, unknown>;
-  ok?: boolean;
-  summary?: string;
-  result?: unknown;
-}
-
-interface Msg {
-  role: 'user' | 'assistant';
-  content: string;
-  actions?: Action[];
-  diff?: { lines: DiffLine[]; errors: string[] };
-  applied?: { applied: number; errors: string[] };
-  dismissed?: boolean;
-  tools?: ToolRun[];
-  notice?: string;
-}
+import { applyActions } from './ai';
+import { docKey, patchConversation, sendMessage, stopMessage, updateMessage, useChat, type ToolRun } from './chat';
+import { PanelHeader } from './PanelHeader';
 
 const AUTO_KEY = 'gridwright.ai.autoApply';
 const TOOLS_KEY = 'gridwright.ai.tools';
@@ -69,9 +51,15 @@ export function AiPanel() {
   const [showSettings, setShowSettings] = useState(false);
   const [draft, setDraft] = useState({ baseUrl: '', model: '', apiKey: '' });
   const [models, setModels] = useState<string[]>([]);
-  const [messages, setMessages] = useState<Msg[]>([]);
-  const [input, setInput] = useState('');
-  const [busy, setBusy] = useState(false);
+  const fileId = useStore((s) => s.fileId);
+  const key = docKey(fileId);
+  // the conversation belongs to the document, not to this panel: it survives switching panels
+  const conv = useChat((s) => s.byDoc[key]);
+  const messages = conv?.messages ?? [];
+  const input = conv?.input ?? '';
+  const busy = conv?.busy ?? false;
+  const error = conv?.error ?? null;
+  const setError = (e: string | null) => patchConversation(key, { error: e });
   const [autoApply, setAutoApply] = useState(() => {
     try {
       return localStorage.getItem(AUTO_KEY) === '1';
@@ -86,9 +74,6 @@ export function AiPanel() {
       return true;
     }
   });
-  const fileId = useStore((s) => s.fileId);
-  const [error, setError] = useState<string | null>(null);
-  const abort = useRef<AbortController | null>(null);
   const bottom = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -107,63 +92,18 @@ export function AiPanel() {
     bottom.current?.scrollIntoView({ block: 'end' });
   }, [messages]);
 
-  const send = async () => {
-    const text = input.trim();
-    if (!text || busy) return;
-    setInput('');
-    setError(null);
-    const history: Msg[] = [...messages, { role: 'user', content: text }];
-    setMessages([...history, { role: 'assistant', content: '' }]);
-    setBusy(true);
-    abort.current = new AbortController();
-    try {
-      let acc = '';
-      const runs: ToolRun[] = [];
-      let notice: string | undefined;
-      const patch = () => setMessages((ms) => [...ms.slice(0, -1), { role: 'assistant', content: acc, tools: runs.length ? [...runs] : undefined, notice }]);
-      const onTool = (ev: ToolEvent) => {
-        if (ev.kind === 'call') runs.push({ id: ev.id, name: ev.name, args: ev.args });
-        else if (ev.kind === 'result') {
-          const r = runs.find((x) => x.id === ev.id);
-          if (r) Object.assign(r, { ok: ev.ok, summary: ev.summary, result: ev.result });
-        } else notice = ev.text;
-        patch();
-      };
-      const full = await api.ai.chat(
-        buildMessages(history.map((m) => ({ role: m.role, content: m.content }))),
-        (chunk) => {
-          acc += chunk;
-          patch();
-        },
-        abort.current.signal,
-        { tools: tools && me.role !== 'viewer', file: fileId, onTool },
-      );
-      const actions = extractActions(full);
-      const diff = actions.length ? previewActions(actions) : undefined;
-      let applied: Msg['applied'];
-      if (actions.length && autoApply) applied = applyActions(actions);
-      setMessages((ms) => [...ms.slice(0, -1), { role: 'assistant', content: full, actions, diff, applied, tools: runs.length ? runs : undefined, notice }]);
-    } catch (e) {
-      if ((e as Error).name !== 'AbortError') setError((e as Error).message);
-      setMessages((ms) => (ms[ms.length - 1]?.content === '' ? ms.slice(0, -1) : ms));
-    } finally {
-      setBusy(false);
-      abort.current = null;
-    }
-  };
+  const send = () => void sendMessage(key, { tools, autoApply, file: fileId });
 
   const stop = (e: React.KeyboardEvent) => e.stopPropagation();
   const stripActions = (s: string) => s.replace(/```gridwright-actions[\s\S]*?```/g, '').trim();
 
   return (
     <div className="panel ai-panel">
-      <div className="panel-title">
-        <span>AI assistant</span>
-        <span className="grow" />
+      <PanelHeader title="Ask">
         <button className={showSettings ? 'active' : ''} onClick={() => setShowSettings((v) => !v)} title="Model endpoint">
           ⚙
         </button>
-      </div>
+      </PanelHeader>
       {showSettings && (
         <div className="ai-settings">
           <label className="field">
@@ -294,14 +234,11 @@ export function AiPanel() {
                     <button
                       className="primary small"
                       disabled={me.role === 'viewer'}
-                      onClick={() => {
-                        const applied = applyActions(m.actions!);
-                        setMessages((ms) => ms.map((x, j) => (j === i ? { ...x, applied } : x)));
-                      }}
+                      onClick={() => updateMessage(key, i, { applied: applyActions(m.actions!) })}
                     >
                       Apply {m.diff?.lines.length ?? m.actions.length} change{(m.diff?.lines.length ?? m.actions.length) === 1 ? '' : 's'}
                     </button>
-                    <button className="small" onClick={() => setMessages((ms) => ms.map((x, j) => (j === i ? { ...x, dismissed: true } : x)))}>
+                    <button className="small" onClick={() => updateMessage(key, i, { dismissed: true })}>
                       Dismiss
                     </button>
                   </div>
@@ -322,15 +259,15 @@ export function AiPanel() {
             e.stopPropagation();
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault();
-              void send();
+              send();
             }
           }}
-          onChange={(e) => setInput(e.target.value)}
+          onChange={(e) => patchConversation(key, { input: e.target.value })}
         />
         {busy ? (
-          <button onClick={() => abort.current?.abort()}>Stop</button>
+          <button onClick={() => stopMessage(key)}>Stop</button>
         ) : (
-          <button className="primary" onClick={() => void send()} disabled={!input.trim()}>
+          <button className="primary" onClick={send} disabled={!input.trim()}>
             Send
           </button>
         )}

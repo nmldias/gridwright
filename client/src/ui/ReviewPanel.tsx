@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import * as book from '../engine/book';
-import { a1, isCodeKind, refText, type CheckView } from '../engine/types';
+import { a1, isCodeKind, parseA1, refText, type CheckView, type TableId } from '../engine/types';
 import { selectCell, selectRange } from '../grid/actions';
+import { displayOf } from '../grid/format';
 import { getState, readOnly, setStatus, useStore } from '../state/store';
 import { clearTrace, removeSignoff, setSignoffLocked, signOffSelection, traceActiveCell, traceStep } from './review';
 import { statusOf, type RunStatus } from '../workers/runs';
@@ -9,6 +10,7 @@ import { runCell } from '../workers/runner';
 import { api, ProposalConflictError, type Proposal } from '../api/client';
 import { getClientId } from '../api/ws';
 import { putProposal } from './proposals';
+import { PanelHeader } from './PanelHeader';
 
 const RUN_LABEL: Record<RunStatus, string> = {
   matches: 'matches recorded run',
@@ -21,29 +23,111 @@ const RUN_LABEL: Record<RunStatus, string> = {
 
 const plural = (n: number, one: string, many = one + 's') => `${n} ${n === 1 ? one : many}`;
 
-/** A proposal's preview split into the edits themselves and what moves because of them. */
-function splitPreview(p: Proposal) {
-  const edits = p.preview.filter((l) => !l.effect);
-  const effects = p.preview.filter((l) => l.effect);
-  return { edits, effects };
+type Line = Proposal['preview'][number];
+
+/** A preview line resolved against the open document: which table, which cell, what it is called. */
+interface Where {
+  text: string;
+  table?: TableId;
+  row?: number;
+  col?: number;
+  /** "Landed cost (AOA)" from the header row, when there is one */
+  header?: string;
+  /** "row 8 · Toyota Hilux" from the first column, when it holds text */
+  rowLabel?: string;
 }
 
-function DiffRows({ lines, max, effect }: { lines: Proposal['preview']; max: number; effect?: boolean }) {
+function resolveWhere(where: string): Where {
+  const st = getState();
+  const ref = parseA1(where);
+  if (!ref) return { text: where };
+  const meta = ref.table ? [...st.tables.values()].find((t) => t.name.toLowerCase() === ref.table!.toLowerCase()) : undefined;
+  if (!meta) return { text: where };
+  const map = st.cells.get(meta.id);
+  const header = meta.header_rows > 0 && ref.r0 >= meta.header_rows ? displayOf(map?.get((meta.header_rows - 1) * 65536 + ref.c0)) : '';
+  const first = ref.c0 > 0 ? map?.get(ref.r0 * 65536) : undefined;
+  const rowLabel = first && first.v && 's' in first.v && first.v.s ? first.v.s : '';
+  return { text: where, table: meta.id, row: ref.r0, col: ref.c0, header: header || undefined, rowLabel: rowLabel || undefined };
+}
+
+const parseNumber = (s: string): number | null => {
+  const t = s.replace(/[\s,]/g, '').replace(/[^\d.+-]/g, '');
+  if (!t || !/\d/.test(t)) return null;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : null;
+};
+
+const fmtDelta = (d: number) => {
+  const sign = d > 0 ? '+' : d < 0 ? '−' : '';
+  const a = Math.abs(d);
+  const text = a >= 1e6 ? `${(a / 1e6).toFixed(a >= 1e8 ? 0 : 1)} million` : a >= 1e4 ? Math.round(a).toLocaleString() : a.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  return `${sign}${text}`;
+};
+
+/** The financial reading of a proposal: the largest movements and the checks that would turn. */
+function readProposal(p: Proposal, checks: CheckView[]) {
+  const edits = p.preview.filter((l) => !l.effect);
+  const effects = p.preview.filter((l) => l.effect);
+  const movements = effects
+    .map((l) => {
+      const w = resolveWhere(l.where);
+      const before = parseNumber(l.before);
+      const after = parseNumber(l.after);
+      return { line: l, where: w, before, after, delta: before !== null && after !== null ? after - before : null };
+    })
+    .filter((m) => m.delta !== null && m.delta !== 0)
+    .sort((x, y) => Math.abs(y.delta!) - Math.abs(x.delta!));
+  const checkAt = new Map(checks.map((c) => [`${c.table}:${c.row}:${c.col}`, c]));
+  const turning = effects
+    .map((l) => ({ line: l, where: resolveWhere(l.where) }))
+    .filter((x) => x.where.table !== undefined && checkAt.has(`${x.where.table}:${x.where.row}:${x.where.col}`))
+    .map((x) => ({ ...x, check: checkAt.get(`${x.where.table}:${x.where.row}:${x.where.col}`)!, fails: /^FALSE$/i.test(x.line.after.trim()) }));
+  return { edits, effects, movements, turning };
+}
+
+function WhereLink({ w }: { w: Where }) {
+  const label = w.header ? `${w.header}${w.rowLabel ? ` · ${w.rowLabel}` : ''}` : w.text;
+  return w.table !== undefined ? (
+    <button className="link where" onClick={() => selectCell(w.table!, w.row!, w.col!)} title={w.text}>
+      {label}
+    </button>
+  ) : (
+    <span>{w.text}</span>
+  );
+}
+
+function DiffRows({ lines, max, effect }: { lines: Line[]; max: number; effect?: boolean }) {
   const [all, setAll] = useState(false);
   const shown = all ? lines : lines.slice(0, max);
   return (
     <table className={`diff-table ${effect ? 'effects' : ''}`}>
+      <thead>
+        <tr>
+          <th>{effect ? 'Moves as a result' : 'Change'}</th>
+          <th>Before</th>
+          <th>After</th>
+          <th>Impact</th>
+        </tr>
+      </thead>
       <tbody>
-        {shown.map((l, i) => (
-          <tr key={i} className={effect ? 'effect' : l.before === '' ? 'added' : l.after === '' ? 'removed' : 'changed'}>
-            <td>{l.where}</td>
-            <td className="old">{l.before}</td>
-            <td className="new">{l.after}</td>
-          </tr>
-        ))}
+        {shown.map((l, i) => {
+          const b = parseNumber(l.before);
+          const a = parseNumber(l.after);
+          const d = b !== null && a !== null ? a - b : null;
+          return (
+            <tr key={i} className={effect ? 'effect' : l.before === '' ? 'added' : l.after === '' ? 'removed' : 'changed'}>
+              <td>
+                <WhereLink w={resolveWhere(l.where)} />
+              </td>
+              <td className="old">{l.before}</td>
+              <td className="new">{l.after}</td>
+              <td className={`delta ${d !== null && d < 0 ? 'neg' : ''}`}>{d !== null && d !== 0 ? fmtDelta(d) : ''}</td>
+            </tr>
+          );
+        })}
         {lines.length > shown.length && (
           <tr>
-            <td colSpan={3} className="muted">
+            <td colSpan={4} className="muted">
               <button className="link small" onClick={() => setAll(true)}>
                 … {lines.length - shown.length} more
               </button>
@@ -67,6 +151,7 @@ export function ReviewPanel() {
   const seqNow = useStore((s) => s.seq);
   const proposals = useStore((s) => s.proposals);
   const [showDecided, setShowDecided] = useState(false);
+  const [showPassing, setShowPassing] = useState(false);
   const [pnote, setNoteFor] = useState<Record<string, string>>({});
   // the server commits the decision: it re-validates the actions at the revision we reviewed, writes the
   // operations and the decision to the log together, and relays the operations to every session (ours too)
@@ -129,33 +214,43 @@ export function ReviewPanel() {
   }, [meta, cellsVersion]);
   const canSign = permission === 'sign' || !readOnly();
   const failing = checks.filter((c) => !c.ok);
+  const passing = checks.filter((c) => c.ok);
   const selText = selection && meta ? refText(meta.name, selection.r0, selection.c0, selection.r1, selection.c1) : '';
-  const effectsPending = pending.reduce((n, p) => n + splitPreview(p).effects.length, 0);
+  const summaryParts = [
+    checks.length ? (failing.length ? `${plural(failing.length, 'check')} failing` : `all ${checks.length} checks pass`) : 'no checks',
+    codeCells.length ? (unverified ? `${plural(unverified, 'code cell')} not matching ${unverified === 1 ? 'its' : 'their'} recorded run` : `all ${codeCells.length} code cells match their recorded runs`) : null,
+  ].filter(Boolean);
+
+  const CheckItem = ({ c }: { c: CheckView }) => (
+    <button className={`list-item check-item ${c.ok ? 'ok' : 'fail'}`} onClick={() => selectCell(c.table, c.row, c.col)}>
+      <span className="mark">{c.error ? '!' : c.ok ? '✓' : '✗'}</span> {c.label}
+      <span className="muted small">
+        {' '}
+        · {tables.get(c.table)?.name ?? c.table}!{a1(c.row, c.col)}
+      </span>
+    </button>
+  );
 
   return (
     <div className="panel review-panel">
-      <h3>Review</h3>
+      <PanelHeader title="Review" />
       <div className="review-summary">
-        <div className={`lead ${pending.length ? 'amber' : ''}`}>{pending.length ? `${plural(pending.length, 'change')} awaiting approval` : 'Nothing awaiting approval'}</div>
-        <div className="muted small">
-          {pending.length && effectsPending ? `${plural(effectsPending, 'cell')} would move as a result · ` : ''}
-          {checks.length ? (failing.length ? `${plural(failing.length, 'check')} failing` : `all ${checks.length} checks pass`) : 'no checks'} ·{' '}
-          {codeCells.length ? (unverified ? `${plural(unverified, 'code cell')} not matching ${unverified === 1 ? 'its' : 'their'} recorded run` : `all ${codeCells.length} code cells match their recorded runs`) : 'no code cells'}
-        </div>
+        <div className={`lead ${pending.length ? 'amber' : ''}`}>{pending.length ? `${plural(pending.length, 'proposal')} awaiting review` : 'Nothing awaiting review'}</div>
+        <div className="muted small">{summaryParts.join(' · ')}</div>
       </div>
 
-      <h4>
-        Awaiting approval <span className={`badge ${pending.length ? 'amber' : ''}`}>{pending.length ? `${pending.length} pending` : 'none pending'}</span>
-      </h4>
+      <h4>Awaiting review</h4>
       {!fileId && <div className="muted small">Save the document to receive proposals from agents.</div>}
-      {fileId && !pending.length && <div className="muted small">Edits filed by agents wait here, as the numbers they change and the numbers that move as a result, until someone applies or rejects them.</div>}
+      {fileId && !pending.length && <div className="muted small">Edits filed by agents wait here — what they change, what moves as a result, and the decision — until someone applies or rejects them.</div>}
       {(showDecided ? proposals : pending).map((p) => {
-        const { edits, effects } = splitPreview(p);
+        const { edits, effects, movements, turning } = readProposal(p, checks);
         const drifted = p.seq && seqNow > p.seq && p.status === 'pending';
+        const failingChecks = turning.filter((t) => t.fails);
+        const passingChecks = turning.filter((t) => !t.fails);
         return (
           <div key={p.id} className={`proposal ${p.status}`}>
             <div className="row">
-              <b className="grow">{p.title}</b>
+              <b className="grow proposal-title">{p.title}</b>
               <span className={`badge ${p.status === 'pending' ? 'amber' : p.status === 'applied' ? 'green' : ''}`}>{p.status}</span>
             </div>
             <div className="muted small">
@@ -163,17 +258,33 @@ export function ReviewPanel() {
             </div>
             {p.rationale && <div className="small">{p.rationale}</div>}
             {p.errors.length > 0 && <div className="err small">{p.errors.join('; ')}</div>}
-            <div className="small">
-              <b>{plural(edits.length, 'change')}</b>
-              {effects.length ? ` · ${plural(effects.length, 'cell')} would move as a result` : ' · nothing else moves'}
-            </div>
-            <DiffRows lines={edits} max={12} />
-            {effects.length > 0 && (
-              <>
-                <div className="muted small">As a result</div>
-                <DiffRows lines={effects} max={8} effect />
-              </>
+            {/* the financial effect first: the largest movements, in the words of the sheet's own headers */}
+            {movements.length > 0 ? (
+              <div className="effect-lines">
+                {movements.slice(0, 3).map((m, i) => (
+                  <div key={i} className="effect-line">
+                    <WhereLink w={m.where} /> <span className="muted">{m.line.before}</span> → <b>{m.line.after}</b> <span className={`delta ${m.delta! < 0 ? 'neg' : ''}`}>({fmtDelta(m.delta!)})</span>
+                  </div>
+                ))}
+                {movements.length > 3 && <div className="muted small">and {plural(movements.length - 3, 'other cell')} moving</div>}
+              </div>
+            ) : (
+              <div className="small muted">{effects.length ? `${plural(effects.length, 'cell')} would change as a result (no numeric movement).` : 'No other dependent changes detected in this preview.'}</div>
             )}
+            {failingChecks.length > 0 && (
+              <div className="attention">
+                {plural(failingChecks.length, 'check')} would fail: {failingChecks.map((t) => t.check.label).join('; ')}
+              </div>
+            )}
+            {passingChecks.length > 0 && <div className="small ok-text">{plural(passingChecks.length, 'check')} would pass again: {passingChecks.map((t) => t.check.label).join('; ')}</div>}
+            <details className="proposal-detail" open={edits.length <= 4}>
+              <summary>
+                {plural(edits.length, 'change')}
+                {effects.length ? ` · ${plural(effects.length, 'dependent cell')}` : ''}
+              </summary>
+              <DiffRows lines={edits} max={12} />
+              {effects.length > 0 && <DiffRows lines={effects} max={8} effect />}
+            </details>
             {drifted ? (
               <div className="small amber-text">
                 The document changed {plural(seqNow - p.seq, 'time')} since this preview was made.{' '}
@@ -183,7 +294,7 @@ export function ReviewPanel() {
               </div>
             ) : null}
             {p.status === 'pending' ? (
-              <div className="row">
+              <div className="row decision">
                 <input className="grow" placeholder="Decision note (optional)" value={pnote[p.id] ?? ''} onChange={(e) => setNoteFor({ ...pnote, [p.id]: e.target.value })} onKeyDown={(e) => e.stopPropagation()} />
                 <button className="primary" disabled={readOnly()} onClick={() => void decide(p, 'applied')}>
                   Apply
@@ -205,7 +316,7 @@ export function ReviewPanel() {
                 {p.appliedSeqs?.length ? ` · committed as log entries ${p.appliedSeqs[0]}–${p.appliedSeqs[p.appliedSeqs.length - 1]}` : ''}
                 {p.command ? ` · command ${p.command}` : ''}
                 <br />
-                The server re-validates the actions at this revision when a decision is made; a decision made against an outdated preview is refused, and the same decision sent twice is applied once.
+                The server re-validates the actions at this revision when a decision is made; a decision made against an outdated preview is refused, and the same decision sent twice is applied once. Consequences are those inside this workbook; nothing outside it has been assessed.
               </div>
             </details>
           </div>
@@ -226,15 +337,17 @@ export function ReviewPanel() {
           Write <code>=CHECK(condition, "label")</code> anywhere; every check is listed here with its outcome.
         </p>
       )}
-      {checks.map((c) => (
-        <button key={`${c.table}:${c.row}:${c.col}`} className={`list-item check-item ${c.ok ? 'ok' : 'fail'}`} onClick={() => selectCell(c.table, c.row, c.col)}>
-          <span className="mark">{c.error ? '!' : c.ok ? '✓' : '✗'}</span> {c.label}
-          <span className="muted small">
-            {' '}
-            · {tables.get(c.table)?.name ?? c.table}!{a1(c.row, c.col)}
-          </span>
-        </button>
+      {failing.map((c) => (
+        <CheckItem key={`${c.table}:${c.row}:${c.col}`} c={c} />
       ))}
+      {passing.length > 0 && (
+        <>
+          <button className="link small" onClick={() => setShowPassing((v) => !v)}>
+            {showPassing ? 'hide passing checks' : `${plural(passing.length, 'passing check')}`}
+          </button>
+          {showPassing && passing.map((c) => <CheckItem key={`${c.table}:${c.row}:${c.col}`} c={c} />)}
+        </>
+      )}
 
       <h4>
         Code cells{' '}

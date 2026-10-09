@@ -14,6 +14,9 @@ import { FormulaBar } from './ui/FormulaBar';
 import { HistoryPanel } from './ui/HistoryPanel';
 import { SettingsPanel, prewarmEnabled } from './ui/SettingsPanel';
 import { SharePanel } from './ui/SharePanel';
+import { NavigatePanel } from './ui/NavigatePanel';
+import { StartCard } from './ui/StartCard';
+import { SidePanel } from './ui/SidePanel';
 import { loadProposals } from './ui/proposals';
 import { SqlPanel } from './ui/SqlPanel';
 import { StatusBar } from './ui/StatusBar';
@@ -21,6 +24,9 @@ import { TablePanel } from './ui/TablePanel';
 import { TopBar } from './ui/TopBar';
 import { installAutosave, openFile, saveCurrentFile } from './ui/files';
 import { getPyWorker, installRefreshScheduler, installRunner, setLocalPyodide } from './workers/runner';
+import { setGridFontSize } from './grid/renderer';
+import { getRenderer } from './grid/actions';
+import { THEME } from './theme';
 
 const SAMPLE: string[][] = [
   ['Region', 'Units', 'Unit price', 'Revenue'],
@@ -37,9 +43,20 @@ let booted = false;
 export function App() {
   const ready = useStore((s) => s.ready);
   const panel = useStore((s) => s.panel);
+  const start = useStore((s) => s.start && !s.fileId && !s.dirty);
   const [boot, setBoot] = useState<string>('loading engine…');
 
   useEffect(() => {
+    // grid density: the renderer's text size follows the setting
+    setGridFontSize(THEME.gridFont[useStore.getState().density]);
+    const offDensity = useStore.subscribe((s, prev) => {
+      if (s.density !== prev.density) {
+        setGridFontSize(THEME.gridFont[s.density]);
+        getRenderer()?.markDirty();
+      }
+      // the start card is for a fresh document only
+      if (s.start && (s.dirty || s.fileId)) useStore.setState({ start: false });
+    });
     const offRunner = installRunner();
     const offAutosave = installAutosave();
     const offRefresh = installRefreshScheduler();
@@ -72,6 +89,8 @@ export function App() {
             useStore.setState({ dirty: false });
           }
           joinFile(null);
+          // first use: offer import, a template or a blank sheet; the example is already on the canvas
+          useStore.setState({ start: true });
         }
         if (prewarmEnabled()) getPyWorker();
       } catch (e) {
@@ -93,6 +112,7 @@ export function App() {
     };
     window.addEventListener('beforeunload', onBeforeUnload);
     return () => {
+      offDensity();
       offRunner();
       offAutosave();
       offRefresh();
@@ -129,20 +149,22 @@ export function App() {
       <FormulaBar />
       <div className="main">
         <GridCanvas />
+        {start && <StartCard />}
         {panel !== 'none' && (
-          <aside className="side">
+          <SidePanel>
             {panel === 'code' && <CodePanel />}
             {panel === 'ai' && <AiPanel />}
             {panel === 'sql' && <SqlPanel />}
             {panel === 'files' && <FilesPanel />}
             {panel === 'share' && <SharePanel />}
+            {panel === 'navigate' && <NavigatePanel />}
             {panel === 'table' && <TablePanel />}
             {panel === 'format' && <FormatPanel />}
             {panel === 'history' && <HistoryPanel />}
             {panel === 'chart' && <ChartPanel />}
             {panel === 'review' && <ReviewPanel />}
             {panel === 'settings' && <SettingsPanel />}
-          </aside>
+          </SidePanel>
         )}
       </div>
       <StatusBar />

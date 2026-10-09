@@ -7,6 +7,7 @@ import * as book from '../engine/book';
 import type { TableId } from '../engine/types';
 import { getState, useStore } from '../state/store';
 import {
+  autoFitColumn,
   cancelEdit,
   clearSelection,
   commitEdit,
@@ -234,6 +235,15 @@ export class GridController {
       }
       case 'col-resize': {
         const meta = st.tables.get(h.table)!;
+        // a double-click on a column edge fits the column to its widest value (spreadsheet convention)
+        const now = performance.now();
+        const dbl = now - this.lastClick.t < 400 && this.lastClick.table === -3 - h.table && this.lastClick.c === h.c;
+        this.lastClick = { t: now, table: -3 - h.table, r: -1, c: h.c };
+        if (dbl) {
+          autoFitColumn(h.table, h.c);
+          this.mode = { kind: 'idle' };
+          return;
+        }
         this.mode = { kind: 'col-resize', table: h.table, c: h.c, startX: x, startW: meta.col_widths[h.c] };
         break;
       }

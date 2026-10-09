@@ -29,6 +29,14 @@ export function Menu({ label, title, className, items, children, active, testId,
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<{ top: number; left: number }>({ top: 0, left: 0 });
   const ref = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const openedByKeyboard = useRef(false);
+  const close = (restoreFocus: boolean) => {
+    setOpen(false);
+    if (restoreFocus) triggerRef.current?.focus();
+  };
+  const focusables = () => Array.from(listRef.current?.querySelectorAll<HTMLElement>('button:not(:disabled), select, input') ?? []);
   const place = () => {
     const r = ref.current?.getBoundingClientRect();
     if (!r) return;
@@ -38,11 +46,37 @@ export function Menu({ label, title, className, items, children, active, testId,
   useEffect(() => {
     if (!open) return;
     place();
+    // keyboard: the first item takes focus when the menu was opened from the keyboard; arrows move,
+    // Home/End jump, Escape closes and returns focus to the trigger
+    if (openedByKeyboard.current) focusables()[0]?.focus();
     const onDown = (e: MouseEvent) => {
       if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setOpen(false);
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        close(true);
+        return;
+      }
+      if (!ref.current?.contains(document.activeElement)) return;
+      const items = focusables();
+      if (!items.length) return;
+      const i = items.indexOf(document.activeElement as HTMLElement);
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        items[(i + 1) % items.length].focus();
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        items[(i - 1 + items.length) % items.length].focus();
+      } else if (e.key === 'Home') {
+        e.preventDefault();
+        items[0].focus();
+      } else if (e.key === 'End') {
+        e.preventDefault();
+        items[items.length - 1].focus();
+      } else if (e.key === 'Tab') {
+        setOpen(false);
+      }
     };
     document.addEventListener('mousedown', onDown);
     document.addEventListener('keydown', onKey);
@@ -59,12 +93,23 @@ export function Menu({ label, title, className, items, children, active, testId,
         </button>
       )}
       <button
+        ref={triggerRef}
         className={`menu-trigger ${open || active ? 'active' : ''}`}
         title={title}
         aria-label={main ? 'More options' : undefined}
-        onClick={() => {
+        onClick={(e) => {
+          openedByKeyboard.current = e.detail === 0;
           place();
           setOpen((v) => !v);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'ArrowDown' && !open) {
+            e.preventDefault();
+            e.stopPropagation();
+            openedByKeyboard.current = true;
+            place();
+            setOpen(true);
+          }
         }}
         aria-haspopup="menu"
         aria-expanded={open}
@@ -74,7 +119,7 @@ export function Menu({ label, title, className, items, children, active, testId,
         <span className="caret">▾</span>
       </button>
       {open && (
-        <div className="menu" role="menu" style={{ top: pos.top, left: pos.left }} onClick={(e) => e.stopPropagation()}>
+        <div className="menu" role="menu" ref={listRef} style={{ top: pos.top, left: pos.left }} onClick={(e) => e.stopPropagation()}>
           {children ??
             items?.map((it, i) =>
               it === 'sep' ? (
@@ -91,7 +136,7 @@ export function Menu({ label, title, className, items, children, active, testId,
                   title={it.title}
                   disabled={it.disabled}
                   onClick={() => {
-                    setOpen(false);
+                    close(openedByKeyboard.current);
                     it.onClick();
                   }}
                 >

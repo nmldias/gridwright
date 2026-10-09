@@ -1,17 +1,18 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, type FileInfo } from '../api/client';
-import { addTable } from '../grid/actions';
 import { setStatus, useStore } from '../state/store';
-import { downloadJson, newFile, openFile, parseCsv, saveCurrentFile } from './files';
-import * as book from '../engine/book';
-import { joinFile } from '../api/ws';
+import { downloadJson, newFile, openFile, saveCurrentFile } from './files';
 import { exportWorkbookXlsx } from './xlsx';
 import { TEMPLATES, applyTemplate } from './templates';
+import { IMPORT_ACCEPT, importFile } from './import';
+import { PanelHeader } from './PanelHeader';
 
 export function FilesPanel() {
   const [files, setFiles] = useState<FileInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [showTemplates, setShowTemplates] = useState(false);
+  const filesView = useStore((s) => s.filesView);
+  const showTemplates = filesView === 'templates';
+  const setShowTemplates = (v: boolean | ((x: boolean) => boolean)) => useStore.setState({ filesView: (typeof v === 'function' ? v(showTemplates) : v) ? 'templates' : 'documents' });
   const fileId = useStore((s) => s.fileId);
   const dirty = useStore((s) => s.dirty);
   const me = useStore((s) => s.me);
@@ -29,52 +30,6 @@ export function FilesPanel() {
   useEffect(() => {
     void refresh();
   }, [fileId, dirty]);
-  const onImport = async (f: File) => {
-    if (/\.(xlsx|xlsm|xls|ods)$/i.test(f.name)) {
-      const XLSX = await import('xlsx');
-      const wb = XLSX.read(await f.arrayBuffer(), { type: 'array', cellDates: false, cellFormula: true, sheetStubs: true });
-      let n = 0;
-      for (const name of wb.SheetNames) {
-        const sheet = wb.Sheets[name];
-        const rows: (string | number | boolean | null)[][] = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: true, defval: '' });
-        if (!rows.length) continue;
-        const values = rows.map((r) => r.map((v) => (v === null || v === undefined ? '' : String(v))));
-        // formulas are imported as their cached values; SheetJS exposes formulas via cell.f when present
-        for (const addr of Object.keys(sheet)) {
-          if (addr[0] === '!') continue;
-          const cell = sheet[addr] as { f?: string };
-          if (cell.f) {
-            const p = XLSX.utils.decode_cell(addr);
-            if (values[p.r]) values[p.r][p.c] = '=' + cell.f;
-          }
-        }
-        addTable({ name: wb.SheetNames.length > 1 ? `${f.name.replace(/\.[^.]+$/, '')} ${name}` : f.name.replace(/\.[^.]+$/, ''), rows: values.length, cols: Math.max(...values.map((r) => r.length), 1), values, origin: 'import' });
-        n++;
-      }
-      setStatus(`Imported ${n} sheet${n === 1 ? '' : 's'} from ${f.name}`);
-      return;
-    }
-    const text = await f.text();
-    if (f.name.toLowerCase().endsWith('.json')) {
-      try {
-        JSON.parse(text);
-        await book.loadBook(text, f.name.replace(/\.gridwright\.json$|\.json$/i, ''), null);
-        joinFile(null);
-        setStatus(`Loaded ${f.name}`);
-      } catch (e) {
-        setStatus(`Not a Gridwright document: ${(e as Error).message}`);
-      }
-      return;
-    }
-    const rows = parseCsv(text);
-    if (!rows.length) {
-      setStatus('The file is empty.');
-      return;
-    }
-    addTable({ name: f.name.replace(/\.(csv|tsv|txt)$/i, ''), rows: rows.length, cols: Math.max(...rows.map((r) => r.length)), values: rows, origin: 'import' });
-    setStatus(`Imported ${rows.length} rows into a new table`);
-  };
-
   const setFolder = async (folder: string) => {
     useStore.setState({ fileFolder: folder });
     if (!fileId) return;
@@ -97,7 +52,7 @@ export function FilesPanel() {
 
   return (
     <div className="panel">
-      <div className="panel-title">Files</div>
+      <PanelHeader title="Files" />
       <div className="row wrap">
         <button onClick={() => void newFile()}>New</button>
         <button onClick={() => setShowTemplates((v) => !v)} className={showTemplates ? 'active' : ''}>
@@ -119,11 +74,11 @@ export function FilesPanel() {
         <input
           ref={importRef}
           type="file"
-          accept=".csv,.tsv,.txt,.json,.xlsx,.xlsm,.xls,.ods"
+          accept={IMPORT_ACCEPT}
           style={{ display: 'none' }}
           onChange={(e) => {
             const f = e.target.files?.[0];
-            if (f) void onImport(f);
+            if (f) void importFile(f);
             e.target.value = '';
           }}
         />

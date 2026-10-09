@@ -3,7 +3,7 @@
 
 import * as book from '../engine/book';
 import { EMPTY_CHART } from '../engine/types';
-import { addTable } from '../grid/actions';
+import { addTable, autoFitColumns } from '../grid/actions';
 import { layoutOf } from '../grid/geometry';
 import { getState, setStatus, useStore } from '../state/store';
 import { newFile } from './files';
@@ -352,6 +352,7 @@ function refLandedCost() {
     money(v, 1, 14, 7, 14, '#,##0 "Kz"');
     bold(v, 7, 0, 7, 15);
     width(v, 0, 170);
+    autoFitColumns(v, 1, 15);
   }
   const p4 = place();
   const checks = [
@@ -412,7 +413,9 @@ function refBankRec() {
     money(st, 1, 3, 8, 3);
     book.apply({ type: 'set_format', table: st, r0: 1, c0: 2, r1: 7, c1: 2, format: { number_format: 'yyyy-mm-dd' } });
     bold(st, 8, 0, 8, 3);
+    autoFitColumns(st, 3, 3);
   }
+  if (l) autoFitColumns(l, 4, 4);
   const p2 = place();
   // one row per key on either side: amounts summed per side, difference, status
   const match = [
@@ -503,6 +506,7 @@ function refCash13w() {
     money(fc, 2, 1, 11, weeks, '#,##0');
     bold(fc, 11, 0, 11, weeks);
     width(fc, 0, 220);
+    autoFitColumns(fc, 1, weeks);
   }
   const p2 = place();
   const checks = [

@@ -1,7 +1,7 @@
 // Review helpers: sign-offs, checks, trace navigation and chart creation from a selection.
 
 import * as book from '../engine/book';
-import { EMPTY_CHART, refText, type Chart, type ChartKind, type Rect, type TableId } from '../engine/types';
+import { EMPTY_CHART, colToLetters, refText, type Chart, type ChartKind, type Rect, type TableId } from '../engine/types';
 import { layoutOf } from '../grid/geometry';
 import { selectCell } from '../grid/actions';
 import { cellAt, getState, setStatus, useStore } from '../state/store';
@@ -125,12 +125,59 @@ export function chartFromSelection(kind: ChartKind = 'bar'): Chart | null {
   const cats = c1 > c0 ? refText(meta.name, dataR0, c0, r1, c0) : '';
   chart.categories = cats;
   const firstSeriesCol = c1 > c0 ? c0 + 1 : c0;
+  const explicit = !(sel.r0 === sel.r1 && sel.c0 === sel.c1);
+  // one meaningful measure by default: units, unit prices and revenue do not belong on one axis.
+  // Candidate columns: those with numbers in the data rows. Several are kept only when the person
+  // selected them explicitly AND they share a number format and a scale.
+  const numericCols: number[] = [];
   for (let c = firstSeriesCol; c <= c1; c++) {
+    let n = 0;
+    for (let r = dataR0; r <= Math.min(r1, dataR0 + 50); r++) {
+      const v = cellAt(sel.table, r, c)?.v;
+      if (v && 'n' in v) n++;
+    }
+    if (n > 0) numericCols.push(c);
+  }
+  const unitOf = (c: number) => {
+    const cell = cellAt(sel.table, dataR0, c);
+    return cell?.f?.number_format ?? '';
+  };
+  const scaleOf = (c: number) => {
+    const vals: number[] = [];
+    for (let r = dataR0; r <= Math.min(r1, dataR0 + 50); r++) {
+      const v = cellAt(sel.table, r, c)?.v;
+      if (v && 'n' in v && v.n !== 0) vals.push(Math.abs(v.n));
+    }
+    vals.sort((a, b) => a - b);
+    return vals.length ? vals[Math.floor(vals.length / 2)] : 0;
+  };
+  let chosen: number[];
+  // same number format and within one order of magnitude of each other: units (120), unit prices (11)
+  // and revenue (1 140) fail this, budget and actual pass it
+  const compatible = (cols: number[]) => {
+    if (cols.length < 2) return true;
+    const u = unitOf(cols[0]);
+    const s0 = scaleOf(cols[0]);
+    return cols.every((c) => unitOf(c) === u && (s0 === 0 || scaleOf(c) === 0 || (scaleOf(c) / s0 <= 10 && s0 / scaleOf(c) <= 10)));
+  };
+  if (!numericCols.length) chosen = firstSeriesCol <= c1 ? [firstSeriesCol] : [];
+  else if (explicit && compatible(numericCols)) chosen = numericCols;
+  else if (!explicit && numericCols.includes(sel.ac) && sel.ac !== c0) chosen = [sel.ac];
+  else chosen = [numericCols[numericCols.length - 1]];
+  const leftOut = numericCols.filter((c) => !chosen.includes(c));
+  for (const c of chosen) {
     const header = firstIsHeader ? cellAt(sel.table, r0, c) : undefined;
     const name = header ? String(header.v && 's' in header.v ? header.v.s : header.i || '') : '';
     chart.series.push({ name: name || `Series ${c - firstSeriesCol + 1}`, range: refText(meta.name, dataR0, c, r1, c) });
   }
   if (!chart.series.length) return null;
+  if (leftOut.length) {
+    const names = leftOut.map((c) => {
+      const h = firstIsHeader ? cellAt(sel.table, r0, c) : undefined;
+      return h && h.v && 's' in h.v ? h.v.s : colToLetters(c);
+    });
+    setStatus(`Chart shows ${chart.series[0].name} only — ${names.join(', ')} ${leftOut.length === 1 ? 'has' : 'have'} a different unit or scale; add ${leftOut.length === 1 ? 'it' : 'them'} as a series in the Chart panel if they belong on the same axis.`, 9000);
+  }
   const n = r1 - dataR0 + 1;
   if (n > 30 && chart.kind === 'bar') chart.kind = 'line';
   const L = layoutOf(meta);

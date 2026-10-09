@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { PanelHeader } from './PanelHeader';
 import * as book from '../engine/book';
 import { a1, parseA1, refText, type CondFormat, type CondFormatKind, type Validation, type ValidationKind } from '../engine/types';
 import { setStatus, useStore } from '../state/store';
@@ -82,7 +83,7 @@ export function FormatPanel() {
   if (!meta || !selection) {
     return (
       <div className="panel">
-        <div className="panel-title">Format</div>
+        <PanelHeader title="Rules" />
         <p className="muted">Select a range to add conditional formatting or validation rules.</p>
       </div>
     );
@@ -156,7 +157,7 @@ export function FormatPanel() {
 
   return (
     <div className="panel format-panel">
-      <div className="panel-title">Format · {meta.name}</div>
+      <PanelHeader title="Rules" subtitle={meta.name} />
       <div className="muted small">Rules apply to the selection {rangeLabel(sel)} when added.</div>
 
       <div className="panel-subtitle">Conditional formatting</div>

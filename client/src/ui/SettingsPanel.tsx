@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { PanelHeader } from './PanelHeader';
 import { setMyName } from '../api/ws';
 import { engineVersion } from '../engine/book';
 import { useStore } from '../state/store';
@@ -44,10 +45,29 @@ export function SettingsPanel() {
   });
   const [pyUrl, setPyUrl] = useState(pyodideIndexURL());
   const [prewarm, setPrewarm] = useState(prewarmEnabled());
+  const density = useStore((s) => s.density);
   const stop = (e: React.KeyboardEvent) => e.stopPropagation();
   return (
     <div className="panel">
-      <div className="panel-title">Settings</div>
+      <PanelHeader title="Settings" />
+      <label className="field">
+        <span>Grid text</span>
+        <select
+          value={density}
+          onChange={(e) => {
+            const d = e.target.value === 'compact' ? 'compact' : 'comfortable';
+            useStore.setState({ density: d });
+            try {
+              localStorage.setItem('gridwright.density', d);
+            } catch {
+              /* ignore */
+            }
+          }}
+        >
+          <option value="comfortable">comfortable (13 px)</option>
+          <option value="compact">compact (12 px) — more rows and columns on screen</option>
+        </select>
+      </label>
       {me.identity ? (
         <div className="muted small">
           Signed in through Tailscale as <b>{me.name || me.login}</b> ({me.login}) · role: {me.role}

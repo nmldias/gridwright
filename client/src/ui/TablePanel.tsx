@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { PanelHeader } from './PanelHeader';
 import * as book from '../engine/book';
 import { deleteSelectedTable } from '../grid/actions';
 import { exportTableCsv } from '../grid/ContextMenu';
@@ -47,7 +48,7 @@ export function TablePanel() {
   if (!meta) {
     return (
       <div className="panel">
-        <div className="panel-title">Table</div>
+        <PanelHeader title="Table" />
         <p className="muted">Select a table.</p>
       </div>
     );
@@ -72,7 +73,7 @@ export function TablePanel() {
 
   return (
     <div className="panel">
-      <div className="panel-title">Table</div>
+      <PanelHeader title="Table" />
       <label className="field">
         <span>Name</span>
         <input

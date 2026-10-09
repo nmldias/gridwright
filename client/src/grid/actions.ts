@@ -4,10 +4,14 @@
 import * as book from '../engine/book';
 import { isCodeKind, type CellKind, type CellView, type Format, type TableId } from '../engine/types';
 import { cellAt, getState, setStatus, useStore, type Selection } from '../state/store';
-import { layoutOf, nextVisibleRow } from './geometry';
+import { FILTER_BTN, layoutOf, nextVisibleRow } from './geometry';
+import { displayOf } from './format';
+import { neededWidth } from './renderer';
 
 export interface RendererLike {
   ensureVisible: (x0: number, y0: number, x1: number, y1: number) => void;
+  fitRect: (x0: number, y0: number, x1: number, y1: number, margin?: number, maxZoom?: number) => void;
+  resetZoom: () => void;
   markDirty: () => void;
   pan: { x: number; y: number };
   zoom: number;
@@ -52,6 +56,110 @@ export function selectRange(table: TableId, r0: number, c0: number, r1: number, 
   };
   useStore.setState({ selection: sel, editorText: cellAt(table, sel.ar, sel.ac)?.i ?? '' });
   renderer?.markDirty();
+}
+
+/** World rectangle of a table, a selection, or everything on the canvas. */
+function worldRectOf(what: { table: TableId; r0?: number; c0?: number; r1?: number; c1?: number } | 'all'): [number, number, number, number] | null {
+  const st = getState();
+  if (what === 'all') {
+    let x0 = Infinity;
+    let y0 = Infinity;
+    let x1 = -Infinity;
+    let y1 = -Infinity;
+    for (const meta of st.tables.values()) {
+      const L = layoutOf(meta);
+      x0 = Math.min(x0, meta.x);
+      y0 = Math.min(y0, meta.y - 24);
+      x1 = Math.max(x1, meta.x + L.width);
+      y1 = Math.max(y1, meta.y + L.height);
+    }
+    for (const ch of st.charts) {
+      x0 = Math.min(x0, ch.x);
+      y0 = Math.min(y0, ch.y);
+      x1 = Math.max(x1, ch.x + ch.w);
+      y1 = Math.max(y1, ch.y + ch.h);
+    }
+    return Number.isFinite(x0) ? [x0, y0, x1, y1] : null;
+  }
+  const meta = st.tables.get(what.table);
+  if (!meta) return null;
+  const L = layoutOf(meta);
+  const r0 = what.r0 ?? 0;
+  const c0 = what.c0 ?? 0;
+  const r1 = what.r1 ?? meta.rows - 1;
+  const c1 = what.c1 ?? meta.cols - 1;
+  return [meta.x + L.colX[c0], meta.y + L.rowY[r0] - (r0 === 0 ? 24 : 0), meta.x + L.colX[Math.min(meta.cols, c1 + 1)], meta.y + L.rowY[Math.min(meta.rows, r1 + 1)]];
+}
+
+/** Fit the whole table (or a range of it) in the view. */
+export function fitTable(table: TableId, range?: { r0: number; c0: number; r1: number; c1: number }) {
+  const rect = worldRectOf({ table, ...(range ?? {}) });
+  if (rect && renderer) renderer.fitRect(...rect);
+}
+
+/** Select a table (its first body cell active) and fit it in the view. */
+export function jumpToTable(table: TableId) {
+  const meta = getState().tables.get(table);
+  if (!meta) return;
+  useStore.setState({ selectedTable: table, selectedChart: null });
+  selectCell(table, Math.min(meta.rows - 1, meta.header_rows), 0);
+  fitTable(table);
+}
+
+/** Fit every table and chart in the view. */
+export function fitAll() {
+  const rect = worldRectOf('all');
+  if (rect && renderer) renderer.fitRect(...rect, 40, 1);
+}
+
+/** Fit the current selection (a single cell gets its table). */
+export function fitSelection() {
+  const sel = getState().selection;
+  if (!sel) return fitAll();
+  const single = sel.r0 === sel.r1 && sel.c0 === sel.c1;
+  fitTable(sel.table, single ? undefined : { r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 });
+}
+
+export function resetZoom() {
+  renderer?.resetZoom();
+}
+
+/** Bring a chart into view and select it. */
+export function goToChart(id: number) {
+  const ch = getState().charts.find((c) => c.id === id);
+  if (!ch || !renderer) return;
+  useStore.setState({ selectedChart: id, selectedTable: null });
+  renderer.ensureVisible(ch.x, ch.y, ch.x + ch.w, ch.y + ch.h);
+  renderer.markDirty();
+}
+
+/** Jump to a table by name, or to a reference like `Sales::B2` / `Sales::A1:C9` / `B2` (in the selected table). */
+export function goTo(text: string): boolean {
+  const st = getState();
+  const t = text.trim();
+  if (!t) return false;
+  const byName = [...st.tables.values()].find((m) => m.name.toLowerCase() === t.toLowerCase());
+  if (byName) {
+    jumpToTable(byName.id);
+    return true;
+  }
+  const m = /^(?:'([^']+)'|([^:!]+))?(?:::|!)?\$?([A-Za-z]{1,3})\$?(\d+)(?::\$?([A-Za-z]{1,3})\$?(\d+))?$/.exec(t);
+  if (!m) return false;
+  const tname = m[1] ?? m[2];
+  const table = tname ? [...st.tables.values()].find((x) => x.name.toLowerCase() === tname.trim().toLowerCase()) : st.selection ? st.tables.get(st.selection.table) : st.tables.values().next().value;
+  if (!table) return false;
+  const col = (s: string) => s.toUpperCase().split('').reduce((n, ch) => n * 26 + (ch.charCodeAt(0) - 64), 0) - 1;
+  const r0 = parseInt(m[4], 10) - 1;
+  const c0 = col(m[3]);
+  const r1 = m[6] ? parseInt(m[6], 10) - 1 : r0;
+  const c1 = m[5] ? col(m[5]) : c0;
+  if (r0 < 0 || c0 < 0 || r0 >= table.rows || c0 >= table.cols) return false;
+  if (r1 === r0 && c1 === c0) selectCell(table.id, r0, c0);
+  else {
+    selectRange(table.id, Math.min(r0, r1), Math.min(c0, c1), Math.min(table.rows - 1, Math.max(r0, r1)), Math.min(table.cols - 1, Math.max(c0, c1)));
+    scrollTo(table.id, Math.min(r0, r1), Math.min(c0, c1));
+  }
+  return true;
 }
 
 export function scrollTo(table: TableId, r: number, c: number) {
@@ -430,6 +538,36 @@ export function addTable(opts: { x?: number; y?: number; rows?: number; cols?: n
     selectCell(id, 0, 0);
   }
   return id;
+}
+
+/** Widen (or narrow) a column to its widest displayed value: no amount shown as a marker, no ellipsis. */
+export function autoFitColumn(table: TableId, col: number, min = 48, max = 600): number | null {
+  const meta = getState().tables.get(table);
+  const map = getState().cells.get(table);
+  if (!meta || col < 0 || col >= meta.cols) return null;
+  let need = min;
+  if (map) {
+    for (const cell of map.values()) {
+      if (cell.c !== col || cell.s) continue;
+      const text = displayOf(cell);
+      if (!text) continue;
+      const bold = !!cell.f?.bold || cell.r < meta.header_rows;
+      const w = neededWidth(text, bold) + (cell.r < meta.header_rows ? FILTER_BTN + 2 : 0);
+      if (w > need) need = w;
+    }
+  }
+  const width = Math.min(max, Math.round(need));
+  if (Math.abs(width - meta.col_widths[col]) >= 1) book.apply({ type: 'set_col_width', table, col, width });
+  return width;
+}
+
+/** Fit every column of a table (or those of the selection). */
+export function autoFitColumns(table: TableId, c0?: number, c1?: number) {
+  const meta = getState().tables.get(table);
+  if (!meta) return;
+  const a = c0 ?? 0;
+  const b = c1 ?? meta.cols - 1;
+  for (let c = a; c <= b; c++) autoFitColumn(table, c);
 }
 
 export function deleteSelectedTable() {

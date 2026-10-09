@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import * as book from '../engine/book';
 import { getState, useStore } from '../state/store';
-import { clearSelection, copySelection, deleteSelectedTable, makeCodeCell, pasteFromClipboard, selectionToTsv, sortTableByColumn } from './actions';
+import { autoFitColumns, clearSelection, copySelection, deleteSelectedTable, makeCodeCell, pasteFromClipboard, selectionToTsv, sortTableByColumn } from './actions';
 import { colToLetters, refText } from '../engine/types';
 import type { Hit } from './geometry';
 import { exportTableXlsx } from '../ui/xlsx';
@@ -91,6 +91,7 @@ export function ContextMenu({ host }: { host: HTMLElement | null }) {
           {item(`Insert ${cols} column${cols > 1 ? 's' : ''} left`, () => book.apply({ type: 'insert_cols', table: sel.table, at: sel.c0, count: cols }))}
           {item(`Insert ${cols} column${cols > 1 ? 's' : ''} right`, () => book.apply({ type: 'insert_cols', table: sel.table, at: sel.c1 + 1, count: cols }))}
           {item(`Delete column${cols > 1 ? 's' : ''}`, () => book.apply({ type: 'delete_cols', table: sel.table, at: sel.c0, count: cols }))}
+          {item(cols > 1 ? `Fit ${cols} columns to their values` : 'Fit column to its values', () => autoFitColumns(sel.table, sel.c0, sel.c1))}
           {sep}
           {item(`Sort ${rows > 1 ? 'selected rows' : 'table'} A→Z by column ${colToLetters(sel.ac)}`, () => sortTableByColumn(sel.table, sel.ac, true, rows > 1 ? { r0: sel.r0, r1: sel.r1 } : undefined))}
           {item(`Sort ${rows > 1 ? 'selected rows' : 'table'} Z→A by column ${colToLetters(sel.ac)}`, () => sortTableByColumn(sel.table, sel.ac, false, rows > 1 ? { r0: sel.r0, r1: sel.r1 } : undefined))}

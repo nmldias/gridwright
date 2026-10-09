@@ -1,6 +1,9 @@
 import { useMemo } from 'react';
 import { cellAt, useStore } from '../state/store';
 import { formatNumberPlain } from '../engine/types';
+import { displayOf } from '../grid/format';
+import { numberOverflows } from '../grid/renderer';
+import { autoFitColumn } from '../grid/actions';
 
 export function StatusBar() {
   const status = useStore((s) => s.status);
@@ -39,6 +42,16 @@ export function StatusBar() {
 
   const meta = selection ? tables.get(selection.table) : undefined;
   const running = Array.from(runs.values()).filter((r) => r.running).length;
+  // a single number: its full text, and whether the column is too narrow to show it
+  const single = useMemo(() => {
+    if (!selection || !meta || stats) return null;
+    const cell = cellAt(selection.table, selection.ar, selection.ac);
+    if (!cell || !cell.v || !('n' in cell.v)) return null;
+    const text = displayOf(cell);
+    const bold = !!cell.f?.bold || selection.ar < meta.header_rows;
+    return { text, overflow: numberOverflows(text, bold, meta.col_widths[selection.ac] ?? 0) };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selection, meta, stats, cellsVersion]);
 
   return (
     <div className="statusbar">
@@ -59,6 +72,20 @@ export function StatusBar() {
         </span>
       )}
       {stats && stats.n === 0 && <span className="muted">Count {stats.count}</span>}
+      {single && (
+        <span className={single.overflow ? 'overflow-note' : 'muted'} title={single.overflow ? 'The column is too narrow to show this amount; the cell shows #### instead of a shortened number' : 'The selected value'}>
+          {single.overflow ? 'Does not fit: ' : ''}
+          {single.text}
+          {single.overflow && selection && (
+            <>
+              {' '}
+              <button className="link small" onClick={() => autoFitColumn(selection.table, selection.ac)}>
+                fit column
+              </button>
+            </>
+          )}
+        </span>
+      )}
       <span className="muted" title="Zoom: Ctrl + wheel">
         {Math.round(zoom * 100)}%
       </span>

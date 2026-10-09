@@ -1,8 +1,8 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import * as book from '../engine/book';
 import { a1, isCodeKind } from '../engine/types';
-import { openCodeCell, selectCell } from '../grid/actions';
-import { cellAt, useStore } from '../state/store';
+import { goTo, openCodeCell, selectCell } from '../grid/actions';
+import { cellAt, setStatus, useStore } from '../state/store';
 
 export function FormulaBar() {
   const selection = useStore((s) => s.selection);
@@ -11,6 +11,8 @@ export function FormulaBar() {
   const editorText = useStore((s) => s.editorText);
   const cellsVersion = useStore((s) => s.cellsVersion);
   const ref = useRef<HTMLInputElement>(null);
+  const nameRef = useRef<HTMLInputElement>(null);
+  const [nameDraft, setNameDraft] = useState<string | null>(null);
   void cellsVersion;
 
   const meta = selection ? tables.get(selection.table) : undefined;
@@ -34,9 +36,32 @@ export function FormulaBar() {
 
   return (
     <div className="formula-bar">
-      <div className="name-box" title="Active cell (table::reference)">
-        {label}
-      </div>
+      <input
+        ref={nameRef}
+        className="name-box"
+        title="Active cell — type a table name or a reference (Sales::B2, Sales::A1:C9, B2) and press Enter to jump there"
+        value={nameDraft ?? label}
+        spellCheck={false}
+        onFocus={(e) => {
+          setNameDraft(label);
+          e.target.select();
+        }}
+        onBlur={() => setNameDraft(null)}
+        onChange={(e) => setNameDraft(e.target.value)}
+        onKeyDown={(e) => {
+          e.stopPropagation();
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            const t = (nameDraft ?? '').trim();
+            if (!goTo(t)) setStatus(`No table or reference called “${t}”`, 4000);
+            setNameDraft(null);
+            nameRef.current?.blur();
+          } else if (e.key === 'Escape') {
+            setNameDraft(null);
+            nameRef.current?.blur();
+          }
+        }}
+      />
       <div className="fx">fx</div>
       {isCode ? (
         <button className="code-link" onClick={() => selection && openCodeCell(selection.table, selection.ar, selection.ac)}>

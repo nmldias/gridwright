@@ -146,7 +146,7 @@ def main():
             return cell(table, r, c)
 
         page.evaluate("() => window.__gw.getState().set({ fileName: 'Round four' })")
-        page.evaluate("() => document.querySelector('.topbar button[title^=\"Save\"]').click()")
+        page.evaluate("() => document.querySelector('.topbar .save-btn').click()")
         for _ in range(60):
             if state()["fileId"]:
                 break
@@ -236,7 +236,7 @@ def main():
         # a second proposal edits an input that a formula depends on: the preview carries the consequence
         apply({"type": "set_cell", "table": T, "row": 0, "col": 8, "input": "=SUM(H2:H4)"})
         time.sleep(0.3)
-        page.evaluate("() => document.querySelector('.topbar button[title^=\"Save\"]').click()")
+        page.evaluate("() => document.querySelector('.topbar .save-btn').click()")
         time.sleep(1.0)
         body = {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "propose_edit", "arguments": {"id": fid, "title": "Correct item a", "actions": [{"action": "set_cell", "table": "Table 1", "ref": "H2", "input": "40"}]}}}
         code, text = rest("POST", "/mcp", body, raw=True)
@@ -253,14 +253,15 @@ def main():
         except Exception:
             pass
         bar = [b for b in page.evaluate("() => [...document.querySelectorAll('.topbar > button, .topbar > .menu-wrap > button')].map((b) => b.textContent.trim().replace(/▾$/, '').trim())") if b]
-        check("the primary bar is: name · Save · undo/redo · Add · Py · Ask · Review · Share (+ contextual Format, More)", bar[1:4] == ["Save", "↶", "↷"] and bar[4:9] == ["Add", "Py", "Ask", "Review2", "Share"] and "JS" not in bar and "SQL" not in bar and bar[-1] == "More", str(bar))
+        check("the primary bar is: name · Save · undo/redo · Add · Python · Ask · Review · Share (+ contextual Format, More)", bar[1] in ("Save", "Saved") and bar[2:4] == ["↶", "↷"] and bar[4:9] == ["Add", "Python", "Ask", "Review2", "Share"] and "JS" not in bar and "SQL" not in bar and bar[-1] == "More", str(bar))
         check("the Review button carries the number of changes awaiting approval, pushed by the server as proposals arrive", page.locator(".topbar button .count").text_content() == "2", "")
         page.evaluate("() => window.__gw.getState().set({ panel: 'review' })")
         page.wait_for_selector(".review-panel .proposal.pending", timeout=8000)
         lead = page.text_content(".review-panel .review-summary .lead") or ""
-        check("the Review panel leads with the decision to make", lead == "2 changes awaiting approval", lead)
+        check("the Review panel leads with the decision to make", lead == "2 proposals awaiting review", lead)
         card2 = page.locator(".review-panel .proposal.pending", has_text="Correct item a")
-        check("a proposal card shows the changed number and what moves as a result, with the evidence folded away", "1 change · 1 cell would move as a result" in (card2.text_content() or "") and card2.locator("table.diff-table.effects tr.effect").count() == 1 and card2.locator("details.evidence").count() == 1 and not card2.locator("details.evidence[open]").count(), (card2.text_content() or "")[:200])
+        card_text = card2.text_content() or ""
+        check("a proposal card leads with the financial effect (the dependent total, before → after, delta), names cells by their headers, and folds the evidence away", "150.5 → 90.5 (−60)" in card_text and "Amount" in card_text and "1 change · 1 dependent cell" in card_text and card2.locator("table.diff-table.effects tr.effect").count() == 1 and card2.locator("details.evidence").count() == 1 and not card2.locator("details.evidence[open]").count(), card_text[:200])
         page.evaluate("() => { const s = window.__gw.getState(); s.set({ selection: { table: 1, r0: 1, c0: 1, r1: 1, c1: 1, ar: 1, ac: 1 } }); }")
         time.sleep(0.2)
         page.click(".topbar button[data-menu='format']")

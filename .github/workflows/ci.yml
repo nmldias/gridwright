@@ -105,6 +105,8 @@ jobs:
           python3 e2e/ai_multiplayer.py http://127.0.0.1:8787
       - name: Reference workbooks reconcile to independently computed figures
         run: python3 e2e/reference.py http://127.0.0.1:8787
+      - name: Interaction quality (drafts, overflow, document menu, Review wording, navigation, keyboard, phone)
+        run: python3 e2e/interface.py http://127.0.0.1:8787 --acl http://127.0.0.1:8795
       - name: Control gates (reviewer isolation, approval integrity, revocation, execution permissions)
         run: node e2e/controls.mjs http://127.0.0.1:8795
       - name: Worker isolation fails closed without bubblewrap

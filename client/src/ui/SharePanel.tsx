@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { PanelHeader } from './PanelHeader';
 import { api, type FileAccess } from '../api/client';
 import { setStatus, useStore } from '../state/store';
 import { saveCurrentFile } from './files';
@@ -42,7 +43,7 @@ export function SharePanel() {
 
   return (
     <div className="panel share-panel">
-      <div className="panel-title">Share</div>
+      <PanelHeader title="Share" />
       {!fileId ? (
         <>
           <p className="muted small">Save the document to the server to share it; it then opens live for everyone with access.</p>

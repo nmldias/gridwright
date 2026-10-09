@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { PanelHeader } from './PanelHeader';
 import { EditorView, basicSetup } from 'codemirror';
 import { EditorState, Prec } from '@codemirror/state';
 import { keymap } from '@codemirror/view';
@@ -82,7 +83,7 @@ export function SqlPanel() {
     const upd = (patch: Partial<typeof c>) => setEditing({ ...c, ...patch });
     return (
       <div className="panel">
-        <div className="panel-title">{c.id ? 'Edit connection' : 'New connection'}</div>
+        <PanelHeader title={c.id ? 'Edit connection' : 'New connection'} />
         <label className="field">
           <span>Name</span>
           <input value={c.name ?? ''} onKeyDown={stop} onChange={(e) => upd({ name: e.target.value })} />
@@ -168,7 +169,7 @@ export function SqlPanel() {
 
   return (
     <div className="panel sql-panel">
-      <div className="panel-title">SQL</div>
+      <PanelHeader title="Database" />
       <div className="row">
         <select value={current} onChange={(e) => setCurrent(e.target.value)}>
           {conns.map((c) => (
