@@ -130,12 +130,14 @@ fi
 if [ "$PYVENV" = 1 ]; then
   command -v python3 >/dev/null 2>&1 || die "--python needs python3 on this host (sudo apt install python3 python3-venv)"
   if [ -x "$DATA/pyenv/bin/python" ]; then
-    say "Python venv already present in $DATA/pyenv (upgrading packages)"
+    say "Python venv already present in $DATA/pyenv (adding missing packages only — versions you installed, e.g. RAPIDS and the numpy it pins, are left alone)"
   else
     say "creating a Python venv in $DATA/pyenv"
     python3 -m venv "$DATA/pyenv" || die "python3 -m venv failed (sudo apt install python3-venv)"
   fi
-  "$DATA/pyenv/bin/pip" install -q --upgrade pip pandas numpy matplotlib openpyxl || die "pip install failed (is the internet reachable?)"
+  "$DATA/pyenv/bin/pip" install -q --upgrade pip >/dev/null 2>&1 || true
+  # no --upgrade: an existing numpy/pandas stays as it is, because cuDF's numba pins numpy and a blind upgrade breaks the GPU path
+  "$DATA/pyenv/bin/pip" install -q pandas numpy matplotlib openpyxl || die "pip install failed (is the internet reachable?)"
   say "venv ready: $("$DATA/pyenv/bin/python" --version) with pandas $("$DATA/pyenv/bin/python" -c 'import pandas; print(pandas.__version__)')"
 fi
 if [ "$SANDBOX" = 1 ]; then
@@ -284,12 +286,20 @@ for i in $(seq 1 30); do
   [ "$i" -eq 30 ] && { [ -f "$DATA/server.log" ] && tail -n 30 "$DATA/server.log"; journalctl --user -u gridwright --no-pager -n 30 2>/dev/null || true; die "server did not answer on port $PORT"; }
 done
 
-# the runtime is probed in the background right after start (a second or two; longer with a slow venv)
+# the runtime is probed in the background right after start (a second or two), then the GPU probe
+# imports cuDF when it is installed (can take a while on first use) — wait for both, within reason
 for i in $(seq 1 40); do
   curl -fsS -H "Authorization: Bearer ${GW_TOKEN:-}" "http://127.0.0.1:$PORT/api/python" 2>/dev/null | grep -q '"not probed yet"' || break
   sleep 0.5
 done
-py_line="$(curl -fsS -H "Authorization: Bearer ${GW_TOKEN:-}" "http://127.0.0.1:$PORT/api/python" 2>/dev/null | "$NODE_BIN" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const p=JSON.parse(s);process.stdout.write(p.available?`CPython ${p.version}, sandbox: ${p.sandbox}${p.sandbox!=="bwrap"&&p.fallbacks?" ("+p.fallbacks+" — run the installer with --sandbox)":""}${p.gpu&&p.gpu.startsWith("cudf")?", GPU: "+p.gpu:", no GPU (cuDF not installed)"}`:"off — "+(p.reason||"no python3 found (run with --python or set GW_PYTHON)"))}catch{process.stdout.write("unknown")}})')"
+if "$DATA/pyenv/bin/python" -c 'import importlib.util, sys; sys.exit(0 if importlib.util.find_spec("cudf") else 1)' 2>/dev/null; then
+  say "cuDF is installed in the venv — waiting for the GPU probe"
+  for i in $(seq 1 90); do
+    curl -fsS -H "Authorization: Bearer ${GW_TOKEN:-}" "http://127.0.0.1:$PORT/api/python" 2>/dev/null | grep -q '"gpu":null' || break
+    sleep 1
+  done
+fi
+py_line="$(curl -fsS -H "Authorization: Bearer ${GW_TOKEN:-}" "http://127.0.0.1:$PORT/api/python" 2>/dev/null | "$NODE_BIN" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const p=JSON.parse(s);process.stdout.write(p.available?`CPython ${p.version}, sandbox: ${p.sandbox}${p.sandbox!=="bwrap"&&p.fallbacks?" ("+p.fallbacks+" — run the installer with --sandbox)":""}${p.gpu===null?", GPU: still probing (see Settings → Re-check server Python)":p.gpu.startsWith("cudf")?", GPU: "+p.gpu:", GPU: "+p.gpu}`:"off — "+(p.reason||"no python3 found (run with --python or set GW_PYTHON)"))}catch{process.stdout.write("unknown")}})')"
 say "server-side Python cells: $py_line"
 
 if [ "$TAILSCALE" = 1 ]; then
