@@ -1,0 +1,145 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/gridwright
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gw
+          POSTGRES_PASSWORD: gw
+          POSTGRES_DB: demo
+        ports: ['54329:5432']
+        options: >-
+          --health-cmd "pg_isready -U gw" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+      - name: Engine unit tests
+        run: cargo test --manifest-path core/Cargo.toml
+
+      - name: wasm-pack
+        run: curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+      - name: Build engine → WebAssembly
+        run: cd core && wasm-pack build --release --target web --out-dir ../client/src/engine/pkg --out-name gridwright_core
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            client/package-lock.json
+            server/package-lock.json
+      - name: Build client
+        run: cd client && npm ci --no-audit --no-fund && npm run build
+      - name: Build server
+        run: cd server && npm ci --no-audit --no-fund && npm run build
+
+      - name: Seed the test database
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client >/dev/null
+          PGPASSWORD=gw psql -h 127.0.0.1 -p 54329 -U gw -d demo -c "CREATE TABLE orders(id serial primary key, region text, product text, amount numeric); INSERT INTO orders(region,product,amount) VALUES ('North','A',10),('South','A',20),('North','B',30),('South','B',40),('North','A',5);"
+
+      - name: Browser tests
+        run: |
+          pip install -q playwright && python3 -m playwright install --with-deps chromium >/dev/null
+          (cd server && GRIDWRIGHT_DATA=/tmp/gw-data PORT=8787 node dist/index.js > /tmp/server.log 2>&1 &)
+          node e2e/mock-llm.mjs > /tmp/mock.log 2>&1 &
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8787/api/health >/dev/null && break; sleep 1; done
+          python3 e2e/smoke.py http://127.0.0.1:8787 --python
+          python3 e2e/features.py http://127.0.0.1:8787 --pg 127.0.0.1:54329:demo:gw:gw --mock-llm http://127.0.0.1:8899/v1
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-screenshots
+          path: /tmp/gridwright-e2e
+          if-no-files-found: ignore
+
+      - name: Release tarball
+        run: |
+          mkdir -p /tmp/rel && cp -r . /tmp/rel/gridwright
+          rm -rf /tmp/rel/gridwright/.git /tmp/rel/gridwright/core/target /tmp/rel/gridwright/client/node_modules /tmp/rel/gridwright/server/node_modules /tmp/rel/gridwright/data
+          tar -C /tmp/rel -czf gridwright.tar.gz gridwright
+          sha256sum gridwright.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gridwright-release
+          path: gridwright.tar.gz
+      - name: Keep build outputs for the next jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-outputs
+          path: |
+            client/dist
+            client/src/engine/pkg
+            server/dist
+
+  release-branch:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-outputs
+      - name: Publish the prebuilt tree to the `release` branch
+        run: |
+          git config user.name "gridwright-ci"
+          git config user.email "ci@users.noreply.github.com"
+          git checkout --orphan release-build
+          git add -A
+          git add -f client/dist client/src/engine/pkg server/dist
+          git commit -qm "release: prebuilt from ${GITHUB_SHA::7}"
+          git push -f origin HEAD:release
+
+  image:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-outputs
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push (linux/amd64, linux/arm64) from the prebuilt tree
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

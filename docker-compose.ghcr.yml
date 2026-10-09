@@ -1,0 +1,23 @@
+# Run the published image (no build): docker compose -f docker-compose.ghcr.yml up -d
+# Images are built by CI for linux/amd64 and linux/arm64 → ghcr.io/nmldias/gridwright:latest
+services:
+  gridwright:
+    image: ghcr.io/nmldias/gridwright:latest
+    container_name: gridwright
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      GRIDWRIGHT_SECRET: ${GRIDWRIGHT_SECRET:-}
+      GRIDWRIGHT_TOKEN: ${GRIDWRIGHT_TOKEN:-}
+      # behind `tailscale serve` on the host: bind the port to 127.0.0.1 above and set this to 1
+      GRIDWRIGHT_TRUST_TAILSCALE: ${GRIDWRIGHT_TRUST_TAILSCALE:-0}
+      GRIDWRIGHT_ADMINS: ${GRIDWRIGHT_ADMINS:-}
+      GRIDWRIGHT_READONLY: ${GRIDWRIGHT_READONLY:-}
+      AI_BASE_URL: ${AI_BASE_URL:-}
+      AI_MODEL: ${AI_MODEL:-}
+      AI_API_KEY: ${AI_API_KEY:-}
+    volumes:
+      - ./data:/data          # documents, history, connections; put a Pyodide copy in ./data/pyodide for offline Python
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

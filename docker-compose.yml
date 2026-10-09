@@ -13,12 +13,16 @@ services:
       GRIDWRIGHT_SECRET: ${GRIDWRIGHT_SECRET:-}
       # Optional shared access token: open http://host:8787/?token=... once per browser.
       GRIDWRIGHT_TOKEN: ${GRIDWRIGHT_TOKEN:-}
+      # Trust `tailscale serve` identity headers (bind the port to 127.0.0.1 when enabling this).
+      GRIDWRIGHT_TRUST_TAILSCALE: ${GRIDWRIGHT_TRUST_TAILSCALE:-0}
+      GRIDWRIGHT_ADMINS: ${GRIDWRIGHT_ADMINS:-}
+      GRIDWRIGHT_READONLY: ${GRIDWRIGHT_READONLY:-}
       # Optional defaults for the AI assistant (can also be set in the UI).
       AI_BASE_URL: ${AI_BASE_URL:-}
       AI_MODEL: ${AI_MODEL:-}
       AI_API_KEY: ${AI_API_KEY:-}
     volumes:
-      - ./data:/data
+      - ./data:/data          # documents, history, connections; ./data/pyodide → offline Python runtime
     extra_hosts:
       - "host.docker.internal:host-gateway"   # reach databases / LLM servers running on the host
 
