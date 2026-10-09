@@ -62,8 +62,8 @@ try:
     q("SELECT * FROM dbo.missing_table")
     check("errors from the server are surfaced", False, "no error")
 except urllib.error.HTTPError as e:
-    body = e.read().decode()
-    check("errors from the server are surfaced", e.code == 400 and "missing_table" in body, body[:120])
+    err_text = e.read().decode()
+    check("errors from the server are surfaced", e.code == 400 and "missing_table" in err_text, err_text[:120])
 # the same connection switched to read-only: the policy refuses writes before they reach SQL Server
 rest("PUT", f"/api/connections/{conn['id']}", dict(body, readOnly=True))
 try:
