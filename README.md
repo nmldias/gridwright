@@ -42,7 +42,7 @@ Every change to a document is an *operation* (`set_cell`, `resize_table`, `move_
 
 ```bash
 git clone <this repo> gridwright && cd gridwright
-GRIDWRIGHT_SECRET="$(openssl rand -hex 32)" docker compose up -d --build
+docker compose up -d --build        # a random secret.key is generated into ./data
 # open http://<host>:8787
 ```
 

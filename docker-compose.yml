@@ -8,8 +8,9 @@ services:
     ports:
       - "8787:8787"
     environment:
-      # Encrypts stored DB passwords / AI keys. Set a long random string; keep it with your backups.
-      GRIDWRIGHT_SECRET: ${GRIDWRIGHT_SECRET:-change-me-to-a-long-random-string}
+      # Encrypts stored DB passwords / AI keys. Leave empty to have a random key generated into
+      # /data/secret.key (keep the data volume with your backups), or set a long random string.
+      GRIDWRIGHT_SECRET: ${GRIDWRIGHT_SECRET:-}
       # Optional shared access token: open http://host:8787/?token=... once per browser.
       GRIDWRIGHT_TOKEN: ${GRIDWRIGHT_TOKEN:-}
       # Optional defaults for the AI assistant (can also be set in the UI).
