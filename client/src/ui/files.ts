@@ -1,7 +1,7 @@
 // File operations shared by the top bar and the files panel.
 
 import { api } from '../api/client';
-import { joinFile } from '../api/ws';
+import { getClientId, joinFile } from '../api/ws';
 import * as book from '../engine/book';
 import { getState, setStatus, useStore } from '../state/store';
 
@@ -10,10 +10,11 @@ export async function saveCurrentFile(): Promise<void> {
   const json = book.toJson();
   try {
     if (st.fileId) {
-      await api.files.save(st.fileId, st.fileName, json);
+      const info = await api.files.save(st.fileId, st.fileName, json, getClientId(), st.seq);
+      if (info.seq > getState().seq) useStore.setState({ seq: info.seq });
     } else {
       const info = await api.files.create(st.fileName, json);
-      useStore.setState({ fileId: info.id });
+      useStore.setState({ fileId: info.id, seq: info.seq ?? 0 });
       joinFile(info.id);
     }
     useStore.setState({ dirty: false });
@@ -27,6 +28,7 @@ export async function openFile(id: string): Promise<void> {
   try {
     const f = await api.files.get(id);
     await book.loadBook(f.json, f.name, f.id);
+    useStore.setState({ seq: f.seq ?? 0 });
     joinFile(f.id);
     setStatus(`Opened ${f.name}`, 1500);
   } catch (e) {

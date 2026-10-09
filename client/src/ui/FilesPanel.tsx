@@ -5,12 +5,14 @@ import { setStatus, useStore } from '../state/store';
 import { downloadJson, newFile, openFile, parseCsv, saveCurrentFile } from './files';
 import * as book from '../engine/book';
 import { joinFile } from '../api/ws';
+import { exportWorkbookXlsx } from './xlsx';
 
 export function FilesPanel() {
   const [files, setFiles] = useState<FileInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
   const fileId = useStore((s) => s.fileId);
   const dirty = useStore((s) => s.dirty);
+  const me = useStore((s) => s.me);
   const importRef = useRef<HTMLInputElement>(null);
 
   const refresh = async () => {
@@ -44,7 +46,7 @@ export function FilesPanel() {
             if (values[p.r]) values[p.r][p.c] = '=' + cell.f;
           }
         }
-        addTable({ name: wb.SheetNames.length > 1 ? `${f.name.replace(/\.[^.]+$/, '')} ${name}` : f.name.replace(/\.[^.]+$/, ''), rows: values.length, cols: Math.max(...values.map((r) => r.length), 1), values });
+        addTable({ name: wb.SheetNames.length > 1 ? `${f.name.replace(/\.[^.]+$/, '')} ${name}` : f.name.replace(/\.[^.]+$/, ''), rows: values.length, cols: Math.max(...values.map((r) => r.length), 1), values, origin: 'import' });
         n++;
       }
       setStatus(`Imported ${n} sheet${n === 1 ? '' : 's'} from ${f.name}`);
@@ -67,7 +69,7 @@ export function FilesPanel() {
       setStatus('The file is empty.');
       return;
     }
-    addTable({ name: f.name.replace(/\.(csv|tsv|txt)$/i, ''), rows: rows.length, cols: Math.max(...rows.map((r) => r.length)), values: rows });
+    addTable({ name: f.name.replace(/\.(csv|tsv|txt)$/i, ''), rows: rows.length, cols: Math.max(...rows.map((r) => r.length)), values: rows, origin: 'import' });
     setStatus(`Imported ${rows.length} rows into a new table`);
   };
 
@@ -80,7 +82,15 @@ export function FilesPanel() {
           Save
         </button>
         <button onClick={() => importRef.current?.click()}>Import CSV / Excel / JSON</button>
+        <button onClick={() => void exportWorkbookXlsx()} title="Every table becomes a sheet; formulas, formats and column widths are kept">
+          Download .xlsx
+        </button>
         <button onClick={downloadJson}>Download JSON</button>
+        {me.role === 'admin' && (
+          <a className="button" href="/api/backup" download title="tar.gz of the server's data directory: documents, history, connections (encrypted), settings">
+            Backup
+          </a>
+        )}
         <input
           ref={importRef}
           type="file"

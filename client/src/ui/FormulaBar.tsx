@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import * as book from '../engine/book';
-import { a1 } from '../engine/types';
+import { a1, isCodeKind } from '../engine/types';
 import { openCodeCell, selectCell } from '../grid/actions';
 import { cellAt, useStore } from '../state/store';
 
@@ -9,13 +9,13 @@ export function FormulaBar() {
   const tables = useStore((s) => s.tables);
   const editing = useStore((s) => s.editing);
   const editorText = useStore((s) => s.editorText);
-  const cells = useStore((s) => s.cells);
+  const cellsVersion = useStore((s) => s.cellsVersion);
   const ref = useRef<HTMLInputElement>(null);
-  void cells;
+  void cellsVersion;
 
   const meta = selection ? tables.get(selection.table) : undefined;
   const cell = selection ? cellAt(selection.table, selection.ar, selection.ac) : undefined;
-  const isCode = cell && (cell.k === 'python' || cell.k === 'javascript');
+  const isCode = cell && isCodeKind(cell.k);
   const label = meta && selection ? `${meta.name}::${a1(selection.ar, selection.ac)}` : '';
   const shown = editing ? editorText : (cell?.s ? '' : (cell?.i ?? ''));
 
@@ -40,7 +40,7 @@ export function FormulaBar() {
       <div className="fx">fx</div>
       {isCode ? (
         <button className="code-link" onClick={() => selection && openCodeCell(selection.table, selection.ar, selection.ac)}>
-          {cell!.k === 'python' ? 'Python' : 'JavaScript'} cell — open in code editor
+          {cell!.k === 'python' ? 'Python' : cell!.k === 'sql' ? 'SQL' : 'JavaScript'} cell — open in code editor
         </button>
       ) : (
         <input

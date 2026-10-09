@@ -5,8 +5,9 @@ import { Application, Assets, BitmapFontManager, BitmapText, Container, Graphics
 import type { CellView, TableId, TableMeta } from '../engine/types';
 import { colToLetters } from '../engine/types';
 import { getState, type Presence, type Selection } from '../state/store';
-import { HANDLE, HANDLE_GAP, TAB_SIZE, TITLE_H, indexAt, layoutOf } from './geometry';
+import { FILTER_BTN, HANDLE, HANDLE_GAP, TAB_SIZE, TITLE_H, indexAt, layoutOf } from './geometry';
 import { alignOf, displayOf } from './format';
+import { condStyle } from './condfmt';
 
 export const FONT = 'Inter, "Segoe UI", Helvetica, Arial, sans-serif';
 export const FONT_SIZE = 13;
@@ -25,6 +26,11 @@ const COLORS = {
   spill: 0x60a5fa,
   python: 0x2563eb,
   javascript: 0xd97706,
+  sql: 0x0f766e,
+  invalid: 0xdc2626,
+  pivotBg: 0xf8fafc,
+  filterBtn: 0x9ca3af,
+  filterActive: 0x2563eb,
   selectionFill: 0x3b82f6,
   tab: 0xe5e7eb,
   tabText: 0x4b5563,
@@ -184,6 +190,8 @@ export class GridRenderer {
   rowPreview: RowPreview | null = null;
   movePreview: MovePreview | null = null;
   initialised = false;
+  cellsVersion = 0;
+  touch = false;
   private raf = 0;
   private host: HTMLElement | null = null;
   viewportListeners = new Set<() => void>();
@@ -291,6 +299,8 @@ export class GridRenderer {
   draw() {
     const st = getState();
     const { tables, cells, selection, selectedTable } = st;
+    this.cellsVersion = st.cellsVersion;
+    this.touch = st.touch;
     const vw = this.viewWidth;
     const vh = this.viewHeight;
     const w0 = this.screenToWorld(0, 0);
@@ -370,31 +380,41 @@ export class GridRenderer {
     const hairline = 1 / zoom;
 
     // background + header
-    bg.rect(0, 0, L.width, L.height).fill(COLORS.tableBg);
+    bg.rect(0, 0, L.width, L.height).fill(meta.pivot ? COLORS.pivotBg : COLORS.tableBg);
     const headerH = meta.header_rows > 0 ? L.rowY[Math.min(meta.header_rows, meta.rows)] : 0;
     if (headerH > 0) bg.rect(0, 0, L.width, headerH).fill(COLORS.headerBg);
+    const hasRules = meta.cond_formats && meta.cond_formats.length > 0;
+    const invalidMarks: { x: number; y: number }[] = [];
 
     // cell fills, spill tints, code markers, text
     const spillRects: { x: number; y: number; w: number; h: number; color: number }[] = [];
-    if (cellMap) {
+    if (cellMap || hasRules) {
       for (let r = r0; r <= r1; r++) {
+        if (L.hidden.has(r)) continue;
         for (let c = c0; c <= c1; c++) {
-          const cell = cellMap.get(r * 65536 + c);
-          if (!cell) continue;
+          const cell = cellMap?.get(r * 65536 + c);
+          const cond = hasRules ? condStyle(meta, cellMap, r, c, cell, this.cellsVersion) : null;
+          if (!cell && !cond) continue;
           const x0 = L.colX[c];
           const y0 = L.rowY[r];
           const w = L.colX[c + 1] - x0;
           const h = L.rowY[r + 1] - y0;
-          const fill = hexToNum(cell.f?.fill);
+          const fill = hexToNum(cond?.fill ?? cell?.f?.fill);
           if (fill !== null) bg.rect(x0, y0, w, h).fill(fill);
-          if (cell.k === 'python' || cell.k === 'javascript') {
-            const color = cell.k === 'python' ? COLORS.python : COLORS.javascript;
+          if (!cell) continue;
+          if (cell.inv) invalidMarks.push({ x: x0 + w, y: y0 });
+          if (cell.k === 'python' || cell.k === 'javascript' || cell.k === 'sql') {
+            const color = cell.k === 'python' ? COLORS.python : cell.k === 'javascript' ? COLORS.javascript : COLORS.sql;
             bg.poly([x0, y0, x0 + 7, y0, x0, y0 + 7]).fill(color);
             if (cell.ss) {
               const sw = (L.colX[Math.min(meta.cols, c + cell.ss[1])] ?? L.width) - x0;
               const sh = (L.rowY[Math.min(meta.rows, r + cell.ss[0])] ?? L.height) - y0;
               spillRects.push({ x: x0, y: y0, w: sw, h: sh, color });
             }
+          } else if (cell.k === 'formula' && cell.ss) {
+            const sw = (L.colX[Math.min(meta.cols, c + cell.ss[1])] ?? L.width) - x0;
+            const sh = (L.rowY[Math.min(meta.rows, r + cell.ss[0])] ?? L.height) - y0;
+            spillRects.push({ x: x0, y: y0, w: sw, h: sh, color: COLORS.spill });
           }
           const text = displayOf(cell);
           if (!text) continue;
@@ -418,12 +438,13 @@ export class GridRenderer {
             }
             continue;
           }
-          const bold = !!cell.f?.bold || r < meta.header_rows;
+          const bold = (cond?.bold ?? !!cell.f?.bold) || r < meta.header_rows;
           const t = view.pool.acquire(bold ? boldStyle : normalStyle);
           const align = alignOf(cell);
           // left-aligned text may overflow into empty cells to the right (spreadsheet convention)
           let avail = w;
-          if (align === 'left' && textWidth(text, bold) > w - PAD * 2) {
+          const headerReserve = r < meta.header_rows && (isSel || meta.filters.length > 0) ? FILTER_BTN + 2 : 0;
+          if (align === 'left' && cellMap && textWidth(text, bold) > w - PAD * 2 - headerReserve) {
             let cc = c + 1;
             while (cc < meta.cols && avail < 2000) {
               const nb = cellMap.get(r * 65536 + cc);
@@ -432,14 +453,14 @@ export class GridRenderer {
               cc++;
             }
           }
-          const maxW = Math.max(4, avail - PAD * 2);
+          const maxW = Math.max(4, avail - PAD * 2 - (avail === w ? headerReserve : 0));
           const fitted = fit(text, maxW, bold);
           if (t.text !== fitted) t.text = fitted;
           const isErr = !!cell.v && typeof cell.v === 'object' && 'e' in cell.v;
-          const color = hexToNum(cell.f?.color);
+          const color = hexToNum(cond?.color ?? cell?.f?.color);
           t.tint = isErr ? COLORS.error : color !== null ? color : cell.s ? 0x1e3a8a : COLORS.text;
           const tw = Math.min(t.width, maxW);
-          t.x = align === 'right' ? x0 + w - PAD - tw : align === 'center' ? x0 + (w - tw) / 2 : x0 + PAD;
+          t.x = align === 'right' ? x0 + w - PAD - tw - (avail === w ? headerReserve : 0) : align === 'center' ? x0 + (w - tw) / 2 : x0 + PAD;
           t.y = y0 + (h - t.height) / 2 + 0.5;
         }
       }
@@ -452,17 +473,32 @@ export class GridRenderer {
       lines.moveTo(L.colX[c], 0).lineTo(L.colX[c], L.height);
     }
     for (let r = r0; r <= r1 + 1 && r <= meta.rows; r++) {
+      if (r > 0 && r < meta.rows && L.rowY[r] === L.rowY[r + 1]) continue;
       lines.moveTo(0, L.rowY[r]).lineTo(L.width, L.rowY[r]);
     }
     lines.stroke({ width: hairline, color: COLORS.grid });
     if (headerH > 0) lines.moveTo(0, headerH).lineTo(L.width, headerH).stroke({ width: hairline, color: COLORS.border });
     for (const s of spillRects) lines.rect(s.x, s.y, s.w, s.h).stroke({ width: hairline, color: s.color, alpha: 0.7 });
+    // validation marks: small red triangle in the top-right corner
+    for (const m of invalidMarks) lines.poly([m.x - 6, m.y, m.x, m.y, m.x, m.y + 6]).fill(COLORS.invalid);
+    // header filter buttons
+    if (meta.header_rows > 0 && (isSel || meta.filters.length > 0) && headerH > 0) {
+      for (let c = c0; c <= c1; c++) {
+        const active = meta.filters.some((f) => f.col === c);
+        const bx = L.colX[c + 1] - FILTER_BTN - 2;
+        const by = L.rowY[1] - FILTER_BTN - 2;
+        const cx = bx + FILTER_BTN / 2;
+        const cy = by + FILTER_BTN / 2;
+        lines.roundRect(bx, by, FILTER_BTN, FILTER_BTN, 2).fill({ color: active ? COLORS.filterActive : 0xffffff, alpha: active ? 1 : 0.9 }).stroke({ width: hairline, color: active ? COLORS.filterActive : COLORS.filterBtn });
+        lines.poly([cx - 3.5, cy - 2, cx + 3.5, cy - 2, cx, cy + 2.5]).fill(active ? 0xffffff : COLORS.tabText);
+      }
+    }
     // outer border
     lines.rect(0, 0, L.width, L.height).stroke({ width: isSel ? 1.5 / zoom : hairline, color: isSel ? COLORS.borderSelected : COLORS.border });
 
     // title bar
     const title = view.chromePool.acquire(titleStyle);
-    title.text = fit(meta.name, Math.max(20, L.width - 8), true);
+    title.text = fit(meta.pivot ? `${meta.name}  ·  pivot` : meta.name, Math.max(20, L.width - 8), true);
     title.tint = isSel ? COLORS.borderSelected : COLORS.textMuted;
     title.x = 2;
     title.y = -(isSel ? TAB_SIZE : 0) - TITLE_H + (TITLE_H - title.height) / 2;
@@ -483,6 +519,7 @@ export class GridRenderer {
         chrome.moveTo(L.colX[c + 1], -TAB_SIZE).lineTo(L.colX[c + 1], 0);
       }
       for (let r = r0; r <= r1; r++) {
+        if (L.hidden.has(r)) continue;
         const t = view.chromePool.acquire(smallStyle);
         const label = String(r + 1);
         if (t.text !== label) t.text = label;
@@ -493,12 +530,13 @@ export class GridRenderer {
         chrome.moveTo(-TAB_SIZE, L.rowY[r + 1]).lineTo(0, L.rowY[r + 1]);
       }
       chrome.stroke({ width: hairline, color: 0xd1d5db });
-      // handles
+      // handles (larger targets on touch screens)
       const hx = L.width + HANDLE_GAP;
       const hy = L.height + HANDLE_GAP;
-      chrome.roundRect(hx, L.height / 2 - 12, HANDLE - 2, 24, 3).fill(0xffffff).stroke({ width: 1.2 / zoom, color: COLORS.handle });
-      chrome.roundRect(L.width / 2 - 12, hy, 24, HANDLE - 2, 3).fill(0xffffff).stroke({ width: 1.2 / zoom, color: COLORS.handle });
-      chrome.circle(hx + HANDLE / 2, hy + HANDLE / 2, HANDLE / 2).fill(0xffffff).stroke({ width: 1.5 / zoom, color: COLORS.handle });
+      const HS = this.touch ? HANDLE + 8 : HANDLE;
+      chrome.roundRect(hx, L.height / 2 - 12, HS - 2, 24, 3).fill(0xffffff).stroke({ width: 1.2 / zoom, color: COLORS.handle });
+      chrome.roundRect(L.width / 2 - 12, hy, 24, HS - 2, 3).fill(0xffffff).stroke({ width: 1.2 / zoom, color: COLORS.handle });
+      chrome.circle(hx + HANDLE / 2, hy + HANDLE / 2, HS / 2).fill(0xffffff).stroke({ width: 1.5 / zoom, color: COLORS.handle });
       // grip marks
       chrome.moveTo(hx + 3, L.height / 2 - 5).lineTo(hx + 3, L.height / 2 + 5).moveTo(hx + 6, L.height / 2 - 5).lineTo(hx + 6, L.height / 2 + 5);
       chrome.moveTo(L.width / 2 - 5, hy + 3).lineTo(L.width / 2 + 5, hy + 3).moveTo(L.width / 2 - 5, hy + 6).lineTo(L.width / 2 + 5, hy + 6);

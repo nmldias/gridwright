@@ -8,9 +8,10 @@ import { displayOf } from '../grid/format';
 
 export const SYSTEM_PROMPT = `You are the assistant inside Gridwright, a spreadsheet whose documents hold several named tables on a canvas.
 Formulas start with "=" and use A1 references inside the current table; other tables are addressed as Name::A1 or 'Name with spaces'::A1:B5 (ranges A1:B5, whole columns A:A).
-Functions available: SUM AVERAGE MIN MAX COUNT COUNTA COUNTBLANK PRODUCT MEDIAN STDEV VAR ABS ROUND ROUNDUP ROUNDDOWN INT TRUNC MOD POWER SQRT EXP LN LOG LOG10 PI CEILING FLOOR SIGN SUMPRODUCT SUMIF SUMIFS COUNTIF COUNTIFS AVERAGEIF AVERAGEIFS IF IFS IFERROR IFNA AND OR XOR NOT ISBLANK ISNUMBER ISTEXT ISERROR LEN UPPER LOWER PROPER TRIM CONCAT CONCATENATE TEXTJOIN LEFT RIGHT MID FIND SEARCH SUBSTITUTE REPT VALUE TEXT EXACT VLOOKUP HLOOKUP XLOOKUP MATCH INDEX CHOOSE ROW COLUMN ROWS COLUMNS TRANSPOSE UNIQUE TODAY NOW DATE YEAR MONTH DAY DATEVALUE EDATE EOMONTH WEEKDAY DAYS RANK LARGE SMALL N T.
-Python cells: the last expression is the output; q.cells("A1:B5") returns values (a DataFrame when pandas is imported), q.cells("Table 2::A1") reads another table, q.df("A1:C20") returns a DataFrame with the first row as header. JavaScript cells: return the value; q.cells(...) as above. Outputs spill into the cells right/below; the table grows to fit.
-Row 1 of a table is usually its header.
+Structured references use the header row: Orders[Amount] is the data column under the header "Amount", [@Amount] the value on the formula's own row. Workbook names (e.g. TaxRate) can be defined by the user. Array results spill: =FILTER(Orders[Amount], Orders[Region]="N"), =SORT(...), =UNIQUE(...), =SEQUENCE(...), =A1:A9*2.
+Functions available: SUM AVERAGE MIN MAX COUNT COUNTA COUNTBLANK PRODUCT MEDIAN STDEV VAR ABS ROUND ROUNDUP ROUNDDOWN INT TRUNC MOD POWER SQRT EXP LN LOG LOG10 PI CEILING FLOOR SIGN ISEVEN ISODD SUMPRODUCT SUMIF SUMIFS COUNTIF COUNTIFS AVERAGEIF AVERAGEIFS MAXIFS MINIFS SUBTOTAL IF IFS IFERROR IFNA SWITCH AND OR XOR NOT ISBLANK ISNUMBER ISTEXT ISERROR LEN UPPER LOWER PROPER TRIM CONCAT CONCATENATE TEXTJOIN LEFT RIGHT MID FIND SEARCH SUBSTITUTE REPT VALUE TEXT EXACT VLOOKUP HLOOKUP XLOOKUP MATCH INDEX CHOOSE ROW COLUMN ROWS COLUMNS TRANSPOSE UNIQUE FILTER SORT SORTBY SEQUENCE TODAY NOW DATE TIME YEAR MONTH DAY HOUR MINUTE SECOND DATEVALUE EDATE EOMONTH WEEKDAY DAYS DATEDIF YEARFRAC NETWORKDAYS WORKDAY NPV IRR XNPV XIRR PMT IPMT PPMT PV FV NPER RATE SLN EFFECT NOMINAL RANK LARGE SMALL N T.
+Python cells: the last expression is the output; q.cells("A1:B5") returns values (a DataFrame when pandas is imported), q.cells("Table 2::A1") reads another table, q.df("A1:C20") returns a DataFrame with the first row as header. JavaScript cells: return the value; q.cells(...) as above. SQL cells (language "sql") run a query on a stored connection and spill the result; {{A1}} binds a cell as a parameter. Outputs spill into the cells right/below; the table grows to fit.
+Row 1 of a table is usually its header. Number formats: "#,##0.00", "0%", "yyyy-mm-dd", "€#,##0.00", "#,##0.00 \"Kz\"" (set with the set_format action).
 
 To change the sheet, include one fenced block tagged gridwright-actions containing a JSON array of actions, for example:
 \`\`\`gridwright-actions
@@ -18,9 +19,10 @@ To change the sheet, include one fenced block tagged gridwright-actions containi
  {"action":"set_cell","table":"Table 1","ref":"B4","input":"=SUM(B2:B3)"},
  {"action":"code_cell","table":"Table 1","ref":"D1","language":"python","code":"df = q.df(\\"A1:B3\\")\\ndf['Share'] = df['Revenue'] / df['Revenue'].sum()\\ndf"},
  {"action":"add_table","name":"Summary","values":[["Metric","Value"],["Total","=SUM('Table 1'::B2:B3)"]]},
+ {"action":"set_format","table":"Table 1","ref":"B2:B9","format":{"number_format":"#,##0.00","bold":false}},
  {"action":"resize_table","table":"Table 1","rows":12,"cols":4}]
 \`\`\`
-Rules: refer to tables by their exact names; "ref" is the top-left cell; values are plain strings/numbers or formula strings starting with "="; keep explanations short and put them outside the block; never invent data that is not in the sheet unless the user asks for sample data.`;
+Rules: refer to tables by their exact names; "ref" is the top-left cell (a range for set_format/clear_range); values are plain strings/numbers or formula strings starting with "="; keep explanations short and put them outside the block; never invent data that is not in the sheet unless the user asks for sample data. The user reviews every change as a diff before it is applied, so prefer precise, minimal actions.`;
 
 function summariseWorkbook(maxRows = 15, maxCols = 12): string {
   const st = getState();
@@ -44,6 +46,7 @@ function summariseWorkbook(maxRows = 15, maxCols = 12): string {
     const header = Array.from({ length: cols }, (_, c) => a1(0, c).replace(/\d+$/, '')).join(' | ');
     parts.push(`### Table "${t.name}" (${t.rows} rows × ${t.cols} cols)\ncolumns: ${header}\n${lines.join('\n') || '(empty)'}${t.rows > rows ? `\n… ${t.rows - rows} more rows` : ''}`);
   }
+  if (st.names.length) parts.push(`### Names\n${st.names.map((n) => `${n.name} = ${n.reference}`).join('\n')}`);
   const sel = st.selection;
   let selText = '';
   if (sel) {
@@ -72,6 +75,105 @@ export interface Action {
   name?: string;
   rows?: number;
   cols?: number;
+  format?: Record<string, unknown>;
+}
+
+export interface DiffLine {
+  where: string;
+  before: string;
+  after: string;
+  kind: 'cell' | 'table' | 'format' | 'other';
+}
+
+/** What an action would change, as before → after lines (for review before applying). */
+export function previewActions(actions: Action[]): { lines: DiffLine[]; errors: string[] } {
+  const lines: DiffLine[] = [];
+  const errors: string[] = [];
+  const st = getState();
+  const resolve = (act: Action): { id: number; name: string } | null => {
+    if (act.table) {
+      const id = book.tableIdByName(act.table);
+      if (!id) {
+        errors.push(`${act.action}: table "${act.table}" not found`);
+        return null;
+      }
+      return { id, name: act.table };
+    }
+    const id = st.selection?.table ?? st.tables.keys().next().value;
+    if (!id) return null;
+    return { id, name: st.tables.get(id)?.name ?? '' };
+  };
+  const trunc = (s: string) => (s.length > 50 ? s.slice(0, 47) + '…' : s);
+  for (const act of actions) {
+    switch (act.action) {
+      case 'set_cells': {
+        const t = resolve(act);
+        const p = parseA1(act.ref ?? 'A1');
+        if (!t || !p) break;
+        (act.values ?? []).forEach((row, i) =>
+          row.forEach((v, j) => {
+            const r = p.r0 + i;
+            const c = p.c0 + j;
+            const cur = cellAt(t.id, r, c);
+            const before = cur ? (cur.k === 'value' ? displayOf(cur) : cur.i) : '';
+            const after = str(v);
+            if (before !== after) lines.push({ where: `${t.name}::${a1(r, c)}`, before: trunc(before), after: trunc(after), kind: 'cell' });
+          }),
+        );
+        if (lines.length > 400) lines.length = 400;
+        break;
+      }
+      case 'set_cell': {
+        const t = resolve(act);
+        const p = parseA1(act.ref ?? 'A1');
+        if (!t || !p) break;
+        const cur = cellAt(t.id, p.r0, p.c0);
+        lines.push({ where: `${t.name}::${a1(p.r0, p.c0)}`, before: trunc(cur ? (cur.k === 'value' ? displayOf(cur) : cur.i) : ''), after: trunc(str(act.input)), kind: 'cell' });
+        break;
+      }
+      case 'code_cell': {
+        const t = resolve(act);
+        const p = parseA1(act.ref ?? 'A1');
+        if (!t || !p) break;
+        const cur = cellAt(t.id, p.r0, p.c0);
+        lines.push({ where: `${t.name}::${a1(p.r0, p.c0)} (${act.language ?? 'python'} cell)`, before: trunc(cur?.i ?? ''), after: trunc(str(act.code)), kind: 'cell' });
+        break;
+      }
+      case 'add_table':
+        lines.push({ where: `new table “${act.name ?? 'Table'}”`, before: '', after: `${act.values?.length ?? act.rows ?? 5} rows × ${act.values?.[0]?.length ?? act.cols ?? 3} cols`, kind: 'table' });
+        break;
+      case 'resize_table': {
+        const t = resolve(act);
+        if (!t) break;
+        const m = st.tables.get(t.id)!;
+        lines.push({ where: t.name, before: `${m.rows} × ${m.cols}`, after: `${act.rows ?? m.rows} × ${act.cols ?? m.cols}`, kind: 'table' });
+        break;
+      }
+      case 'rename_table': {
+        const t = resolve(act);
+        if (!t) break;
+        lines.push({ where: t.name, before: t.name, after: str(act.name), kind: 'table' });
+        break;
+      }
+      case 'clear_range': {
+        const t = resolve(act);
+        const p = parseA1(act.ref ?? 'A1');
+        if (!t || !p) break;
+        lines.push({ where: `${t.name}::${a1(p.r0, p.c0)}:${a1(p.r1, p.c1)}`, before: '(contents)', after: '(cleared)', kind: 'cell' });
+        break;
+      }
+      case 'set_format': {
+        const t = resolve(act);
+        const p = parseA1(act.ref ?? 'A1');
+        if (!t || !p) break;
+        lines.push({ where: `${t.name}::${a1(p.r0, p.c0)}:${a1(p.r1, p.c1)}`, before: '', after: JSON.stringify(act.format ?? {}), kind: 'format' });
+        break;
+      }
+      default:
+        errors.push(`unknown action ${act.action}`);
+    }
+  }
+  return { lines, errors };
 }
 
 export function extractActions(text: string): Action[] {
@@ -95,6 +197,7 @@ const str = (v: string | number | boolean | null | undefined): string => (v === 
 export function applyActions(actions: Action[]): { applied: number; errors: string[] } {
   let applied = 0;
   const errors: string[] = [];
+  const opts = { origin: 'ai' as const };
   for (const act of actions) {
     try {
       const st = getState();
@@ -115,7 +218,7 @@ export function applyActions(actions: Action[]): { applied: number; errors: stri
           if (!p) throw new Error(`bad ref ${act.ref}`);
           const values = (act.values ?? []).map((row) => row.map(str));
           if (!values.length) throw new Error('no values');
-          const ch = book.apply({ type: 'set_cells', table: id, row: p.r0, col: p.c0, values });
+          const ch = book.apply({ type: 'set_cells', table: id, row: p.r0, col: p.c0, values }, opts);
           if (ch.error) throw new Error(ch.error);
           applied++;
           break;
@@ -124,7 +227,7 @@ export function applyActions(actions: Action[]): { applied: number; errors: stri
           const id = resolveTable();
           const p = parseA1(act.ref ?? 'A1');
           if (!p) throw new Error(`bad ref ${act.ref}`);
-          const ch = book.apply({ type: 'set_cell', table: id, row: p.r0, col: p.c0, input: str(act.input) });
+          const ch = book.apply({ type: 'set_cell', table: id, row: p.r0, col: p.c0, input: str(act.input) }, opts);
           if (ch.error) throw new Error(ch.error);
           applied++;
           break;
@@ -133,29 +236,30 @@ export function applyActions(actions: Action[]): { applied: number; errors: stri
           const id = resolveTable();
           const p = parseA1(act.ref ?? 'A1');
           if (!p) throw new Error(`bad ref ${act.ref}`);
-          const lang: CellKind = (act.language ?? 'python').toLowerCase().startsWith('j') ? 'javascript' : 'python';
-          const ch = book.apply({ type: 'set_cell', table: id, row: p.r0, col: p.c0, input: str(act.code), kind: lang });
+          const l = (act.language ?? 'python').toLowerCase();
+          const lang: CellKind = l.startsWith('j') ? 'javascript' : l.startsWith('s') ? 'sql' : 'python';
+          const ch = book.apply({ type: 'set_cell', table: id, row: p.r0, col: p.c0, input: str(act.code), kind: lang }, opts);
           if (ch.error) throw new Error(ch.error);
           applied++;
           break;
         }
         case 'add_table': {
           const values = (act.values ?? []).map((row) => row.map(str));
-          addTable({ name: act.name, rows: Math.max(act.rows ?? 0, values.length || 5), cols: Math.max(act.cols ?? 0, values[0]?.length ?? 3), values: values.length ? values : undefined });
+          addTable({ name: act.name, rows: Math.max(act.rows ?? 0, values.length || 5), cols: Math.max(act.cols ?? 0, values[0]?.length ?? 3), values: values.length ? values : undefined, origin: 'ai' });
           applied++;
           break;
         }
         case 'resize_table': {
           const id = resolveTable();
           const meta = st.tables.get(id)!;
-          const ch = book.apply({ type: 'resize_table', table: id, rows: act.rows ?? meta.rows, cols: act.cols ?? meta.cols });
+          const ch = book.apply({ type: 'resize_table', table: id, rows: act.rows ?? meta.rows, cols: act.cols ?? meta.cols }, opts);
           if (ch.error) throw new Error(ch.error);
           applied++;
           break;
         }
         case 'rename_table': {
           const id = resolveTable();
-          const ch = book.apply({ type: 'rename_table', table: id, name: str(act.name) });
+          const ch = book.apply({ type: 'rename_table', table: id, name: str(act.name) }, opts);
           if (ch.error) throw new Error(ch.error);
           applied++;
           break;
@@ -164,7 +268,19 @@ export function applyActions(actions: Action[]): { applied: number; errors: stri
           const id = resolveTable();
           const p = parseA1(act.ref ?? 'A1');
           if (!p) throw new Error(`bad ref ${act.ref}`);
-          const ch = book.apply({ type: 'clear_range', table: id, r0: p.r0, c0: p.c0, r1: p.r1, c1: p.c1 });
+          const ch = book.apply({ type: 'clear_range', table: id, r0: p.r0, c0: p.c0, r1: p.r1, c1: p.c1 }, opts);
+          if (ch.error) throw new Error(ch.error);
+          applied++;
+          break;
+        }
+        case 'set_format': {
+          const id = resolveTable();
+          const p = parseA1(act.ref ?? 'A1');
+          if (!p) throw new Error(`bad ref ${act.ref}`);
+          const f = (act.format ?? {}) as Record<string, unknown>;
+          const format: Record<string, unknown> = {};
+          for (const k of ['bold', 'italic', 'align', 'number_format', 'fill', 'color']) if (f[k] !== undefined) format[k] = f[k];
+          const ch = book.apply({ type: 'set_format', table: id, r0: p.r0, c0: p.c0, r1: p.r1, c1: p.c1, format }, opts);
           if (ch.error) throw new Error(ch.error);
           applied++;
           break;

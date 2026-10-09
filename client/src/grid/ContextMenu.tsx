@@ -2,8 +2,9 @@ import { useEffect, useState } from 'react';
 import * as book from '../engine/book';
 import { getState, useStore } from '../state/store';
 import { clearSelection, copySelection, deleteSelectedTable, makeCodeCell, pasteFromClipboard, selectionToTsv, sortTableByColumn } from './actions';
-import { colToLetters } from '../engine/types';
+import { colToLetters, refText } from '../engine/types';
 import type { Hit } from './geometry';
+import { exportTableXlsx } from '../ui/xlsx';
 
 interface MenuState {
   x: number;
@@ -94,9 +95,20 @@ export function ContextMenu({ host }: { host: HTMLElement | null }) {
           {sep}
           {item('Python cell', () => makeCodeCell('python'))}
           {item('JavaScript cell', () => makeCodeCell('javascript'))}
+          {item('SQL cell', () => makeCodeCell('sql'))}
+          {sep}
+          {item('Filter by this column…', () => useStore.setState({ filterPopover: { table: sel.table, col: sel.ac, x: menu.x, y: menu.y } }), (getState().tables.get(sel.table)?.header_rows ?? 0) === 0)}
+          {item('Conditional formatting / validation…', () => useStore.setState({ panel: 'format' }))}
+          {item('Define name for selection…', () => {
+            const meta = getState().tables.get(sel.table)!;
+            const name = prompt('Name for ' + refText(meta.name, sel.r0, sel.c0, sel.r1, sel.c1), '');
+            if (name) book.apply({ type: 'set_name', name, reference: refText(meta.name, sel.r0, sel.c0, sel.r1, sel.c1) });
+          })}
+          {item('Cell history', () => useStore.setState({ panel: 'history', historyCell: { table: sel.table, row: sel.ar, col: sel.ac } }), !getState().fileId)}
           {sep}
           {item('Table settings…', () => useStore.setState({ panel: 'table', selectedTable: sel.table }))}
           {item('Export table as CSV', () => exportTableCsv(sel.table))}
+          {item('Export table as .xlsx', () => void exportTableXlsx(sel.table))}
           {item('Delete table', () => {
             useStore.setState({ selectedTable: sel.table });
             deleteSelectedTable();

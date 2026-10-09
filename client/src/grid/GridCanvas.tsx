@@ -6,6 +6,7 @@ import { GridController } from './controller';
 import { GridRenderer } from './renderer';
 import { CellEditor } from './CellEditor';
 import { ContextMenu } from './ContextMenu';
+import { FilterPopover } from './FilterPopover';
 
 export function GridCanvas() {
   const hostRef = useRef<HTMLDivElement>(null);
@@ -48,6 +49,7 @@ export function GridCanvas() {
     <div className="canvas-host" ref={hostRef} tabIndex={0}>
       {renderer && <CellEditor renderer={renderer} tick={viewportTick} />}
       <ContextMenu host={hostRef.current} />
+      <FilterPopover />
     </div>
   );
 }

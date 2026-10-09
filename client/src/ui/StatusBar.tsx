@@ -11,6 +11,9 @@ export function StatusBar() {
   const runs = useStore((s) => s.runs);
   const fileId = useStore((s) => s.fileId);
   const zoom = useStore((s) => s.zoom);
+  const me = useStore((s) => s.me);
+  const cellsVersion = useStore((s) => s.cellsVersion);
+  void cellsVersion;
 
   const stats = useMemo(() => {
     if (!selection) return null;
@@ -32,7 +35,7 @@ export function StatusBar() {
     }
     return { sum, count, n };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selection, cells]);
+  }, [selection, cells, cellsVersion]);
 
   const meta = selection ? tables.get(selection.table) : undefined;
   const running = Array.from(runs.values()).filter((r) => r.running).length;
@@ -42,7 +45,8 @@ export function StatusBar() {
       <span className="status-msg">{status}</span>
       <span className="grow" />
       {running > 0 && <span className="pill loading">{running} cell{running > 1 ? 's' : ''} running</span>}
-      {presence.size > 0 && <span className="pill">{presence.size} other{presence.size > 1 ? 's' : ''} online</span>}
+      {presence.size > 0 && <span className="pill" title={Array.from(presence.values()).map((p) => p.name).join(', ')}>{presence.size} other{presence.size > 1 ? 's' : ''} online</span>}
+      {me.identity && me.login && <span className="muted" title={`signed in as ${me.login} (${me.role})`}>{me.name || me.login}</span>}
       {!fileId && <span className="muted">unsaved document</span>}
       {meta && (
         <span className="muted">

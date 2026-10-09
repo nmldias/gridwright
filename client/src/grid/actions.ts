@@ -2,9 +2,9 @@
 // keyboard handling and the toolbar.
 
 import * as book from '../engine/book';
-import type { CellKind, CellView, Format, TableId } from '../engine/types';
+import { isCodeKind, type CellKind, type CellView, type Format, type TableId } from '../engine/types';
 import { cellAt, getState, setStatus, useStore, type Selection } from '../state/store';
-import { layoutOf } from './geometry';
+import { layoutOf, nextVisibleRow } from './geometry';
 
 export interface RendererLike {
   ensureVisible: (x0: number, y0: number, x1: number, y1: number) => void;
@@ -67,15 +67,29 @@ export function moveActive(dr: number, dc: number, extend = false) {
   if (!sel) return;
   const meta = st.tables.get(sel.table);
   if (!meta) return;
+  // rows hidden by filters are skipped
+  const step = (from: number, d: number): number => {
+    if (d === 0 || !meta.hidden_rows?.length) return Math.max(0, Math.min(meta.rows - 1, from + d));
+    const dir: 1 | -1 = d > 0 ? 1 : -1;
+    let r = from;
+    let left = Math.min(Math.abs(d), meta.rows);
+    while (left > 0) {
+      const next = nextVisibleRow(meta, r + dir, dir);
+      if (next === null) break;
+      r = next;
+      left--;
+    }
+    return r;
+  };
   if (extend) {
     // move the far corner relative to the anchor
     const fr = sel.r1 !== sel.ar ? sel.r1 : sel.r0;
     const fc = sel.c1 !== sel.ac ? sel.c1 : sel.c0;
-    const nr = Math.max(0, Math.min(meta.rows - 1, fr + dr));
+    const nr = step(fr, dr);
     const nc = Math.max(0, Math.min(meta.cols - 1, fc + dc));
     selectCell(sel.table, nr, nc, true);
   } else {
-    selectCell(sel.table, sel.ar + dr, sel.ac + dc);
+    selectCell(sel.table, step(sel.ar, dr), sel.ac + dc);
   }
 }
 
@@ -88,8 +102,13 @@ export function startEdit(initial?: string, replace = false) {
     setStatus('This cell shows spilled output — edit the source cell.');
     return;
   }
-  if (cell && (cell.k === 'python' || cell.k === 'javascript')) {
+  if (cell && isCodeKind(cell.k)) {
     openCodeCell(sel.table, sel.ar, sel.ac);
+    return;
+  }
+  const meta = st.tables.get(sel.table);
+  if (meta?.pivot) {
+    setStatus('This table is a pivot — its cells are computed from the source table.');
     return;
   }
   const text = initial !== undefined ? initial : (cell?.i ?? '');
@@ -97,17 +116,32 @@ export function startEdit(initial?: string, replace = false) {
   renderer?.markDirty();
 }
 
-export function commitEdit(text: string, move: { dr: number; dc: number } | null) {
+/** Returns false when a strict validation rule refused the value (the editor stays open). */
+export function commitEdit(text: string, move: { dr: number; dc: number } | null): boolean {
   const st = getState();
   const ed = st.editing;
-  if (!ed) return;
-  useStore.setState({ editing: null });
+  if (!ed) return true;
   const prev = cellAt(ed.table, ed.r, ed.c)?.i ?? '';
   if (text !== prev) {
+    const meta = st.tables.get(ed.table);
+    if (meta?.validations.length) {
+      const v = book.checkValidation(ed.table, ed.r, ed.c, text);
+      if (!v.ok) {
+        if (v.strict) {
+          setStatus(`Not allowed: ${v.message}`, 5000);
+          return false;
+        }
+        setStatus(`Note: ${v.message}`, 4000);
+      }
+    }
+    useStore.setState({ editing: null });
     book.apply({ type: 'set_cell', table: ed.table, row: ed.r, col: ed.c, input: text });
+  } else {
+    useStore.setState({ editing: null });
   }
   if (move) moveActive(move.dr, move.dc);
   else selectCell(ed.table, ed.r, ed.c);
+  return true;
 }
 
 export function cancelEdit() {
@@ -138,7 +172,7 @@ export function toggleBold() {
 }
 
 /** Turn the active cell into a code cell of the given language and open the editor. */
-export function makeCodeCell(kind: CellKind) {
+export function makeCodeCell(kind: CellKind, conn?: string) {
   const sel = getState().selection;
   if (!sel) return;
   const cell = cellAt(sel.table, sel.ar, sel.ac);
@@ -146,17 +180,19 @@ export function makeCodeCell(kind: CellKind) {
     setStatus('This cell shows spilled output — pick another cell.');
     return;
   }
+  if (getState().tables.get(sel.table)?.pivot) {
+    setStatus('This table is a pivot — pick a cell in another table.');
+    return;
+  }
   const existing = cell?.i ?? '';
-  const template =
-    kind === 'python'
-      ? existing && cell?.k === 'python'
-        ? existing
-        : `# Python cell — the last expression is written to the sheet\n# q.cells("A1:B5") reads a range, q.cells("A1") a single value\n`
-      : existing && cell?.k === 'javascript'
-        ? existing
-        : `// JavaScript cell — return a value, a list, or a 2-D array\n// q.cells("A1:B5") reads a range\nreturn 1 + 1;\n`;
+  const templates: Record<string, string> = {
+    python: `# Python cell — the last expression is written to the sheet\n# q.cells("A1:B5") reads a range, q.cells("A1") a single value\n`,
+    javascript: `// JavaScript cell — return a value, a list, or a 2-D array\n// q.cells("A1:B5") reads a range\nreturn 1 + 1;\n`,
+    sql: `-- SQL cell: the result spills from this cell. Use {{A1}} or {{Table::B2}} as parameters.\nSELECT 1 AS answer\n`,
+  };
+  const template = existing && cell?.k === kind ? existing : templates[kind] ?? '';
   if (!cell || cell.k !== kind) {
-    book.apply({ type: 'set_cell', table: sel.table, row: sel.ar, col: sel.ac, input: template, kind });
+    book.apply({ type: 'set_cell', table: sel.table, row: sel.ar, col: sel.ac, input: template, kind, conn: kind === 'sql' ? (conn ?? null) : undefined });
   }
   openCodeCell(sel.table, sel.ar, sel.ac);
 }
@@ -364,7 +400,7 @@ export function fillFromSource(table: TableId, src: { r0: number; c0: number; r1
   book.apply({ type: 'set_cells', table, row: target.r0, col: target.c0, values });
 }
 
-export function addTable(opts: { x?: number; y?: number; rows?: number; cols?: number; name?: string; values?: string[][] } = {}) {
+export function addTable(opts: { x?: number; y?: number; rows?: number; cols?: number; name?: string; values?: string[][]; origin?: 'user' | 'ai' | 'import' | 'sql' } = {}) {
   const st = getState();
   // place below the lowest table by default
   let y = 80;
@@ -373,15 +409,18 @@ export function addTable(opts: { x?: number; y?: number; rows?: number; cols?: n
     const L = layoutOf(t);
     y = Math.max(y, t.y + L.height + 80);
   }
-  const ch = book.apply({
-    type: 'add_table',
-    name: opts.name,
-    x: opts.x ?? x,
-    y: opts.y ?? y,
-    rows: opts.rows ?? 10,
-    cols: opts.cols ?? 5,
-    values: opts.values,
-  });
+  const ch = book.apply(
+    {
+      type: 'add_table',
+      name: opts.name,
+      x: opts.x ?? x,
+      y: opts.y ?? y,
+      rows: opts.rows ?? 10,
+      cols: opts.cols ?? 5,
+      values: opts.values,
+    },
+    { origin: opts.origin ?? 'user' },
+  );
   const id = ch.created?.[0];
   if (id) {
     useStore.setState({ selectedTable: id });

@@ -7,14 +7,16 @@ import { useStore } from './state/store';
 import { AiPanel } from './ui/AiPanel';
 import { CodePanel } from './ui/CodePanel';
 import { FilesPanel } from './ui/FilesPanel';
+import { FormatPanel } from './ui/FormatPanel';
 import { FormulaBar } from './ui/FormulaBar';
-import { SettingsPanel } from './ui/SettingsPanel';
+import { HistoryPanel } from './ui/HistoryPanel';
+import { SettingsPanel, prewarmEnabled } from './ui/SettingsPanel';
 import { SqlPanel } from './ui/SqlPanel';
 import { StatusBar } from './ui/StatusBar';
 import { TablePanel } from './ui/TablePanel';
 import { TopBar } from './ui/TopBar';
 import { installAutosave, openFile, saveCurrentFile } from './ui/files';
-import { installRunner } from './workers/runner';
+import { getPyWorker, installRefreshScheduler, installRunner, setLocalPyodide } from './workers/runner';
 
 const SAMPLE: string[][] = [
   ['Region', 'Units', 'Unit price', 'Revenue'],
@@ -36,11 +38,23 @@ export function App() {
   useEffect(() => {
     const offRunner = installRunner();
     const offAutosave = installAutosave();
+    const offRefresh = installRefreshScheduler();
     const firstBoot = !booted;
     booted = true;
     if (firstBoot) (async () => {
       try {
         await book.ensureEngine();
+        // server capabilities first: a local Pyodide changes the default runtime URL
+        try {
+          const h = await api.health();
+          setLocalPyodide(!!h.pyodide);
+          if (h.identity) {
+            const me = await api.me();
+            useStore.setState({ me });
+          }
+        } catch {
+          useStore.setState({ status: 'Server not reachable — files, SQL and AI are unavailable; the spreadsheet still works.' });
+        }
         const fileId = INITIAL_FILE;
         if (fileId) {
           await openFile(fileId);
@@ -54,7 +68,7 @@ export function App() {
           }
           joinFile(null);
         }
-        api.health().catch(() => useStore.setState({ status: 'Server not reachable — files, SQL and AI are unavailable; the spreadsheet still works.' }));
+        if (prewarmEnabled()) getPyWorker();
       } catch (e) {
         setBoot(`Failed to start: ${(e as Error).message}`);
       }
@@ -76,6 +90,7 @@ export function App() {
     return () => {
       offRunner();
       offAutosave();
+      offRefresh();
       window.removeEventListener('keydown', onKey);
       window.removeEventListener('beforeunload', onBeforeUnload);
     };
@@ -112,6 +127,8 @@ export function App() {
             {panel === 'sql' && <SqlPanel />}
             {panel === 'files' && <FilesPanel />}
             {panel === 'table' && <TablePanel />}
+            {panel === 'format' && <FormatPanel />}
+            {panel === 'history' && <HistoryPanel />}
             {panel === 'settings' && <SettingsPanel />}
           </aside>
         )}

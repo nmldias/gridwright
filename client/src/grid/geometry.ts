@@ -7,12 +7,14 @@ export const TAB_SIZE = 18; // reference tabs (column letters / row numbers) sho
 export const HANDLE = 12; // resize handle size
 export const HANDLE_GAP = 6; // gap between the table edge and its handles
 export const SNAP = 8; // move snapping grid
+export const FILTER_BTN = 14; // header filter button size
 
 export interface Layout {
   colX: number[]; // cumulative x offsets, length cols + 1
   rowY: number[]; // cumulative y offsets, length rows + 1
   width: number;
   height: number;
+  hidden: Set<number>;
 }
 
 const cache = new WeakMap<TableMeta, Layout>();
@@ -20,18 +22,19 @@ const cache = new WeakMap<TableMeta, Layout>();
 export function layoutOf(meta: TableMeta): Layout {
   let l = cache.get(meta);
   if (l) return l;
+  const hidden = new Set<number>(meta.hidden_rows ?? []);
   const colX = new Array(meta.cols + 1);
   const rowY = new Array(meta.rows + 1);
   colX[0] = 0;
   for (let i = 0; i < meta.cols; i++) colX[i + 1] = colX[i] + (meta.col_widths[i] ?? 100);
   rowY[0] = 0;
-  for (let i = 0; i < meta.rows; i++) rowY[i + 1] = rowY[i] + (meta.row_heights[i] ?? 24);
-  l = { colX, rowY, width: colX[meta.cols], height: rowY[meta.rows] };
+  for (let i = 0; i < meta.rows; i++) rowY[i + 1] = rowY[i] + (hidden.has(i) ? 0 : (meta.row_heights[i] ?? 24));
+  l = { colX, rowY, width: colX[meta.cols], height: rowY[meta.rows], hidden };
   cache.set(meta, l);
   return l;
 }
 
-/** Index i such that offsets[i] <= v < offsets[i+1]; -1 outside. */
+/** Index i such that offsets[i] <= v < offsets[i+1]; -1 outside. Zero-height entries are skipped. */
 export function indexAt(offsets: number[], v: number): number {
   if (v < 0 || v >= offsets[offsets.length - 1]) return -1;
   let lo = 0;
@@ -41,7 +44,19 @@ export function indexAt(offsets: number[], v: number): number {
     if (offsets[mid] <= v) lo = mid;
     else hi = mid - 1;
   }
+  while (lo < offsets.length - 2 && offsets[lo] === offsets[lo + 1]) lo++;
   return lo;
+}
+
+/** Next visible row at or after `r` in the given direction (null when none). */
+export function nextVisibleRow(meta: TableMeta, r: number, dir: 1 | -1): number | null {
+  const hidden = layoutOf(meta).hidden;
+  let x = r;
+  while (x >= 0 && x < meta.rows) {
+    if (!hidden.has(x)) return x;
+    x += dir;
+  }
+  return null;
 }
 
 export type Hit =
@@ -56,7 +71,8 @@ export type Hit =
   | { kind: 'col-tab'; table: TableId; c: number }
   | { kind: 'row-tab'; table: TableId; r: number }
   | { kind: 'select-all'; table: TableId }
-  | { kind: 'fill'; table: TableId };
+  | { kind: 'fill'; table: TableId }
+  | { kind: 'filter'; table: TableId; c: number };
 
 export function hitTest(
   tables: Map<TableId, TableMeta>,
@@ -66,8 +82,10 @@ export function hitTest(
   selected: TableId | null,
   zoom: number,
   selection?: { table: TableId; r1: number; c1: number } | null,
+  touch = false,
 ): Hit {
-  const tol = 5 / zoom;
+  const tol = (touch ? 12 : 5) / zoom;
+  const handleTol = touch ? 10 : 0;
   // fill handle at the bottom-right corner of the selection
   if (selection) {
     const t = tables.get(selection.table);
@@ -91,9 +109,9 @@ export function hitTest(
     if (isSel) {
       const hx = L.width + HANDLE_GAP;
       const hy = L.height + HANDLE_GAP;
-      if (within(lx, ly, hx, hy, HANDLE + tol)) return { kind: 'corner', table: id };
-      if (lx >= hx - tol && lx <= hx + HANDLE + tol && Math.abs(ly - L.height / 2) <= 14 + tol) return { kind: 'right', table: id };
-      if (ly >= hy - tol && ly <= hy + HANDLE + tol && Math.abs(lx - L.width / 2) <= 14 + tol) return { kind: 'bottom', table: id };
+      if (within(lx, ly, hx - handleTol, hy - handleTol, HANDLE + tol + handleTol)) return { kind: 'corner', table: id };
+      if (lx >= hx - tol && lx <= hx + HANDLE + tol + handleTol && Math.abs(ly - L.height / 2) <= 14 + tol) return { kind: 'right', table: id };
+      if (ly >= hy - tol && ly <= hy + HANDLE + tol + handleTol && Math.abs(lx - L.width / 2) <= 14 + tol) return { kind: 'bottom', table: id };
     }
     // title bar (sits above the reference tabs when the table is selected)
     const tabW = isSel ? TAB_SIZE : 0;
@@ -106,16 +124,22 @@ export function hitTest(
       if (c >= 0) return { kind: 'col-tab', table: id, c };
     }
     if (isSel && lx >= -tabW && lx < 0 && ly >= 0 && ly <= L.height) {
-      for (let r = 1; r < L.rowY.length; r++) if (Math.abs(ly - L.rowY[r]) <= tol) return { kind: 'row-resize', table: id, r: r - 1 };
+      for (let r = 1; r < L.rowY.length; r++) if (L.rowY[r] !== L.rowY[r - 1] && Math.abs(ly - L.rowY[r]) <= tol) return { kind: 'row-resize', table: id, r: r - 1 };
       const r = indexAt(L.rowY, ly);
       if (r >= 0) return { kind: 'row-tab', table: id, r };
     }
     // inside the grid
     if (lx >= 0 && lx < L.width && ly >= 0 && ly < L.height) {
-      // column boundaries inside the header row double as resize grips
+      // column boundaries inside the header row double as resize grips; header filter buttons
       const headerBottom = L.rowY[Math.max(1, t.header_rows)] ?? 0;
-      if (ly < headerBottom) {
+      if (ly < headerBottom && t.header_rows > 0) {
         for (let c = 1; c < L.colX.length; c++) if (Math.abs(lx - L.colX[c]) <= tol) return { kind: 'col-resize', table: id, c: c - 1 };
+        const c = indexAt(L.colX, lx);
+        if (c >= 0 && (isSel || t.filters.length > 0)) {
+          const bx = L.colX[c + 1] - FILTER_BTN - 2;
+          const by = L.rowY[1] - FILTER_BTN - 2;
+          if (lx >= bx - tol && ly >= by - tol && lx <= L.colX[c + 1] && ly <= L.rowY[1]) return { kind: 'filter', table: id, c };
+        }
       }
       const c = indexAt(L.colX, lx);
       const r = indexAt(L.rowY, ly);
@@ -150,6 +174,7 @@ export function cursorFor(h: Hit): string {
     case 'row-tab':
       return 'e-resize';
     case 'select-all':
+    case 'filter':
       return 'pointer';
     case 'fill':
       return 'crosshair';
@@ -162,7 +187,8 @@ export function cursorFor(h: Hit): string {
 export function sizeForCorner(meta: TableMeta, lx: number, ly: number): { rows: number; cols: number } {
   const L = layoutOf(meta);
   const avgW = meta.cols ? L.width / meta.cols : 100;
-  const avgH = meta.rows ? L.height / meta.rows : 24;
+  const visibleRows = meta.rows - L.hidden.size;
+  const avgH = visibleRows ? L.height / visibleRows : 24;
   let cols = meta.cols;
   if (lx > L.width) cols = meta.cols + Math.max(0, Math.round((lx - L.width) / avgW));
   else {

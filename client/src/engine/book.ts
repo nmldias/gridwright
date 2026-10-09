@@ -3,11 +3,20 @@
 
 import init, { Book } from './pkg/gridwright_core';
 import wasmUrl from './pkg/gridwright_core_bg.wasm?url';
-import type { CellRef, CellValue, CellView, Changes, Op, TableId, TableMeta } from './types';
-import { cellKey } from './types';
+import type { CellRef, CellValue, CellView, Changes, NamedRange, Op, TableId, TableMeta } from './types';
+import { cellKey, isCodeKind } from './types';
 import { useStore } from '../state/store';
 
-type Listener = (op: Op | null, changes: Changes) => void;
+/** Where a change came from (recorded in the document's audit log). */
+export type Origin = 'user' | 'ai' | 'code' | 'sql' | 'import' | 'remote' | 'system';
+
+export interface ApplyMeta {
+  origin: Origin;
+  /** short human-readable description for the history (optional) */
+  note?: string;
+}
+
+type Listener = (op: Op | null, changes: Changes, meta: ApplyMeta) => void;
 
 let book: Book | null = null;
 let ready: Promise<void> | null = null;
@@ -45,7 +54,7 @@ export function nowSerial(): number {
 }
 
 /** Replace the current workbook with a fresh one or a loaded JSON document. */
-export async function loadBook(json: string | null, name = 'Untitled', fileId: string | null = null) {
+export async function loadBook(json: string | null, name = 'Untitled', fileId: string | null = null, opts: { keepView?: boolean } = {}) {
   await ensureEngine();
   if (book) book.free();
   book = json ? Book.from_json(json) : new Book(name);
@@ -57,15 +66,18 @@ export async function loadBook(json: string | null, name = 'Untitled', fileId: s
     tables.set(m.id, m);
     cells.set(m.id, toCellMap(JSON.parse(book.cells(m.id))));
   }
+  const prev = useStore.getState();
+  const keep = opts.keepView && prev.selection && tables.has(prev.selection.table);
   useStore.setState({
     ready: true,
     tables,
     cells,
+    names: JSON.parse(book.names()) as NamedRange[],
     fileName: json ? book.name() : name,
     fileId,
     dirty: false,
-    selection: metas[0] ? { table: metas[0].id, r0: 0, c0: 0, r1: 0, c1: 0, ar: 0, ac: 0 } : null,
-    selectedTable: null,
+    selection: keep ? prev.selection : metas[0] ? { table: metas[0].id, r0: 0, c0: 0, r1: 0, c1: 0, ar: 0, ac: 0 } : null,
+    selectedTable: keep ? prev.selectedTable : null,
     editing: null,
     editorText: '',
     canUndo: false,
@@ -77,7 +89,7 @@ export async function loadBook(json: string | null, name = 'Untitled', fileId: s
   const refs: CellRef[] = [];
   for (const m of metas) {
     for (const c of cells.get(m.id)!.values()) {
-      if ((c.k === 'python' || c.k === 'javascript') && !c.s) refs.push({ table: m.id, row: c.r, col: c.c });
+      if (isCodeKind(c.k) && !c.s) refs.push({ table: m.id, row: c.r, col: c.c });
     }
   }
   if (refs.length) rerunListeners.forEach((l) => l(refs));
@@ -94,7 +106,7 @@ export function toJson(): string {
 }
 
 /** Apply an op locally (and notify listeners, e.g. the multiplayer link). */
-export function apply(op: Op, opts: { remote?: boolean; silent?: boolean } = {}): Changes {
+export function apply(op: Op, opts: { remote?: boolean; silent?: boolean; origin?: Origin; note?: string } = {}): Changes {
   const b = getBook();
   const changes: Changes = JSON.parse(b.apply(JSON.stringify(op)));
   if (changes.error) {
@@ -104,7 +116,8 @@ export function apply(op: Op, opts: { remote?: boolean; silent?: boolean } = {})
   applyChanges(changes);
   if (!opts.remote) {
     useStore.setState({ dirty: true });
-    opListeners.forEach((l) => l(op, changes));
+    const meta: ApplyMeta = { origin: opts.origin ?? 'user', note: opts.note };
+    opListeners.forEach((l) => l(op, changes, meta));
   }
   return changes;
 }
@@ -113,20 +126,28 @@ export function undo() {
   const changes: Changes = JSON.parse(getBook().undo());
   applyChanges(changes);
   useStore.setState({ dirty: true });
-  opListeners.forEach((l) => l(null, changes));
+  opListeners.forEach((l) => l(null, changes, { origin: 'user', note: 'undo' }));
 }
 
 export function redo() {
   const changes: Changes = JSON.parse(getBook().redo());
   applyChanges(changes);
   useStore.setState({ dirty: true });
-  opListeners.forEach((l) => l(null, changes));
+  opListeners.forEach((l) => l(null, changes, { origin: 'user', note: 'redo' }));
+}
+
+/** Tell listeners the whole document changed (after a restore/import): multiplayer sends a snapshot. */
+export function announceSnapshot(note: string, origin: Origin = 'system') {
+  useStore.setState({ dirty: true });
+  const empty: Changes = { cells: {}, tables: [], reload: [], removed_tables: [], rerun_code: [], created: [] };
+  opListeners.forEach((l) => l(null, empty, { origin, note }));
 }
 
 export function applyChanges(changes: Changes) {
   const b = getBook();
   const st = useStore.getState();
   const tables = new Map(st.tables);
+  // the outer map gets a new identity (so subscribers notice); inner maps are patched in place
   const cells = new Map(st.cells);
   for (const id of changes.removed_tables) {
     tables.delete(id);
@@ -146,13 +167,16 @@ export function applyChanges(changes: Changes) {
   for (const [tid, views] of Object.entries(changes.cells)) {
     const id = Number(tid);
     if (!tables.has(id)) continue;
-    const m = new Map(cells.get(id) ?? []);
+    let m = cells.get(id);
+    if (!m) {
+      m = new Map();
+      cells.set(id, m);
+    }
     for (const v of views) {
       const empty = v.i === '' && v.v === null && !v.f && !v.s && !v.err && !v.out;
       if (empty) m.delete(cellKey(v.r, v.c));
       else m.set(cellKey(v.r, v.c), v);
     }
-    cells.set(id, m);
   }
   // keep selection valid
   let selection = st.selection;
@@ -180,6 +204,8 @@ export function applyChanges(changes: Changes) {
     selectedTable,
     canUndo: b.can_undo(),
     canRedo: b.can_redo(),
+    cellsVersion: st.cellsVersion + 1,
+    ...(changes.names ? { names: changes.names } : {}),
   });
   requestRedraw();
   if (changes.rerun_code.length) rerunListeners.forEach((l) => l(changes.rerun_code));
@@ -192,6 +218,11 @@ export function rangeValues(table: TableId, r0: number, c0: number, r1: number, 
 
 export function preview(table: TableId, formula: string): CellValue {
   return JSON.parse(getBook().preview(table, formula));
+}
+
+/** Evaluate a formula as if it sat in a given cell (conditional-format formulas). */
+export function evalAt(table: TableId, row: number, col: number, formula: string): CellValue {
+  return JSON.parse(getBook().eval_at(table, row, col, formula));
 }
 
 export function shiftFormula(src: string, dr: number, dc: number): string {
@@ -208,4 +239,27 @@ export function tableIdByName(name: string): TableId {
 
 export function engineVersion(): string {
   return Book.version();
+}
+
+export function checkValidation(table: TableId, row: number, col: number, input: string): { ok: boolean; message?: string; strict: boolean } {
+  return JSON.parse(getBook().check_validation(table, row, col, input));
+}
+
+export function listEntries(table: TableId, row: number, col: number): string[] {
+  return JSON.parse(getBook().list_entries(table, row, col));
+}
+
+export function formatWithEngine(n: number, pattern: string): string {
+  return Book.format_number(n, pattern);
+}
+
+/** Build a throw-away Book from a checkpoint and a list of ops (history replay). */
+export async function replayDocument(json: string | null, ops: Op[], name: string): Promise<string> {
+  await ensureEngine();
+  const b = json ? Book.from_json(json) : new Book(name);
+  b.set_now(nowSerial());
+  for (const op of ops) b.apply(JSON.stringify(op));
+  const out = b.to_json();
+  b.free();
+  return out;
 }

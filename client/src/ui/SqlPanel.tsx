@@ -6,7 +6,7 @@ import { sql } from '@codemirror/lang-sql';
 import { api, type ConnectionInfo, type SqlResult } from '../api/client';
 import { addTable } from '../grid/actions';
 import * as book from '../engine/book';
-import { getState, setStatus } from '../state/store';
+import { getState, setStatus, useStore } from '../state/store';
 
 const EMPTY: Partial<ConnectionInfo> & { password?: string } = { name: '', kind: 'postgres', host: 'localhost', port: 5432, database: '', user: '', ssl: false, password: '' };
 
@@ -18,6 +18,7 @@ export function SqlPanel() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [target, setTarget] = useState<'new' | 'selection'>('new');
+  const me = useStore((s) => s.me);
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
 
@@ -61,10 +62,10 @@ export function SqlPanel() {
       const values = [res.columns, ...res.rows.map((r) => r.map((v) => (v === null ? '' : String(v))))];
       const sel = getState().selection;
       if (target === 'selection' && sel) {
-        book.apply({ type: 'set_cells', table: sel.table, row: sel.r0, col: sel.c0, values });
+        book.apply({ type: 'set_cells', table: sel.table, row: sel.r0, col: sel.c0, values }, { origin: 'sql' });
       } else {
         const conn = conns.find((c) => c.id === current);
-        addTable({ name: `${conn?.name ?? 'Query'} result`, rows: values.length, cols: res.columns.length, values });
+        addTable({ name: `${conn?.name ?? 'Query'} result`, rows: values.length, cols: res.columns.length, values, origin: 'sql' });
       }
       setStatus(`${res.rowCount} rows in ${res.ms} ms${res.truncated ? ' (truncated)' : ''}`);
     } catch (e) {
@@ -88,9 +89,10 @@ export function SqlPanel() {
         </label>
         <label className="field">
           <span>Type</span>
-          <select value={c.kind} onChange={(e) => upd({ kind: e.target.value as 'postgres' | 'mysql', port: e.target.value === 'mysql' ? 3306 : 5432 })}>
+          <select value={c.kind} onChange={(e) => upd({ kind: e.target.value as ConnectionInfo['kind'], port: e.target.value === 'mysql' ? 3306 : e.target.value === 'mssql' ? 1433 : 5432 })}>
             <option value="postgres">PostgreSQL</option>
             <option value="mysql">MySQL / MariaDB</option>
+            <option value="mssql">SQL Server (Cegid Primavera, Azure SQL)</option>
           </select>
         </label>
         <div className="row">
@@ -140,7 +142,7 @@ export function SqlPanel() {
           <button onClick={() => setEditing(null)}>Cancel</button>
         </div>
         {error && <div className="err small">{error}</div>}
-        <p className="muted small">Credentials are stored on the server (encrypted at rest with the server's key), never in the document.</p>
+        <p className="muted small">Credentials are stored on the server (encrypted at rest with the server's key), never in the document. SQL Server: tick SSL for Azure SQL or servers with Force Encryption; the certificate is not verified.</p>
       </div>
     );
   }
@@ -157,9 +159,11 @@ export function SqlPanel() {
           ))}
           {!conns.length && <option value="">No connections</option>}
         </select>
-        <button onClick={() => setEditing({ ...EMPTY })}>+ New</button>
+        <button onClick={() => setEditing({ ...EMPTY })} disabled={me.role !== 'admin'} title={me.role !== 'admin' ? 'administrators only' : ''}>
+          + New
+        </button>
         <button
-          disabled={!current}
+          disabled={!current || me.role !== 'admin'}
           onClick={() => {
             const c = conns.find((x) => x.id === current);
             if (c) setEditing({ ...c, password: '' });
@@ -199,6 +203,18 @@ export function SqlPanel() {
           <option value="new">Results → new table</option>
           <option value="selection">Results → at selection</option>
         </select>
+        <button
+          disabled={!current}
+          title="Create a SQL cell at the selection that re-runs this query (and can take {{A1}} parameters)"
+          onClick={() => {
+            const sel = getState().selection;
+            if (!sel || !view.current) return;
+            book.apply({ type: 'set_cell', table: sel.table, row: sel.ar, col: sel.ac, input: view.current.state.doc.toString(), kind: 'sql', conn: current, refresh: 0 });
+            useStore.setState({ panel: 'code', codeCell: { table: sel.table, row: sel.ar, col: sel.ac } });
+          }}
+        >
+          → SQL cell
+        </button>
         <button className="primary" disabled={busy || !current} onClick={() => void run()} title="Run (Ctrl+Enter)">
           {busy ? 'Running…' : '▶ Run query'}
         </button>

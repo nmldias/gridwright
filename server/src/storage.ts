@@ -132,11 +132,17 @@ export function deleteFile(id: string): boolean {
   return true;
 }
 
+/** Directory holding a self-hosted Pyodide distribution (served at /pyodide/), when present. */
+export function pyodideDir(): string | null {
+  const p = process.env.GRIDWRIGHT_PYODIDE_DIR ?? join(DATA_DIR, 'pyodide');
+  return existsSync(join(p, 'pyodide.mjs')) || existsSync(join(p, 'pyodide.js')) ? p : null;
+}
+
 // --- connections -------------------------------------------------------------------
 export interface StoredConnection {
   id: string;
   name: string;
-  kind: 'postgres' | 'mysql';
+  kind: 'postgres' | 'mysql' | 'mssql';
   host: string;
   port: number;
   database: string;

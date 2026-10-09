@@ -10,7 +10,7 @@ export interface FileInfo {
 export interface ConnectionInfo {
   id: string;
   name: string;
-  kind: 'postgres' | 'mysql';
+  kind: 'postgres' | 'mysql' | 'mssql';
   host: string;
   port: number;
   database: string;
@@ -34,6 +34,18 @@ export interface AiSettings {
   configured: boolean;
 }
 
+export interface HistoryEntry {
+  seq: number;
+  ts: string;
+  author: { id: string; name: string; login?: string };
+  origin: string;
+  op?: Record<string, unknown>;
+  checkpoint?: boolean;
+  note?: string;
+}
+
+export type SqlParam = string | number | boolean | null;
+
 async function j<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`;
@@ -49,30 +61,46 @@ async function j<T>(res: Response): Promise<T> {
 }
 
 export const api = {
-  async health(): Promise<{ ok: boolean; version: string; multiplayer: boolean }> {
+  async health(): Promise<{ ok: boolean; version: string; multiplayer: boolean; pyodide?: boolean; identity?: boolean }> {
     return j(await fetch('/api/health'));
+  },
+  async me(): Promise<{ login: string; name: string; role: 'admin' | 'editor' | 'viewer'; identity: boolean }> {
+    return j(await fetch('/api/me'));
   },
   files: {
     async list(): Promise<FileInfo[]> {
       return j(await fetch('/api/files'));
     },
-    async get(id: string): Promise<{ id: string; name: string; json: string }> {
+    async get(id: string): Promise<{ id: string; name: string; json: string; seq: number }> {
       return j(await fetch(`/api/files/${encodeURIComponent(id)}`));
     },
-    async create(name: string, json: string): Promise<FileInfo> {
-      return j(await fetch('/api/files', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name, json }) }));
+    async create(name: string, json: string, client?: string): Promise<FileInfo & { seq: number }> {
+      return j(await fetch('/api/files', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name, json, client }) }));
     },
-    async save(id: string, name: string, json: string): Promise<FileInfo> {
+    async save(id: string, name: string, json: string, client?: string, seq?: number): Promise<FileInfo & { seq: number }> {
       return j(
         await fetch(`/api/files/${encodeURIComponent(id)}`, {
           method: 'PUT',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ name, json }),
+          body: JSON.stringify({ name, json, client, seq }),
         }),
       );
     },
     async remove(id: string): Promise<void> {
       await j(await fetch(`/api/files/${encodeURIComponent(id)}`, { method: 'DELETE' }));
+    },
+    async history(id: string, limit = 200, before?: number): Promise<{ seq: number; entries: HistoryEntry[] }> {
+      const q = new URLSearchParams({ limit: String(limit) });
+      if (before) q.set('before', String(before));
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/history?${q}`));
+    },
+    async cellHistory(id: string, table: number, row: number, col: number): Promise<{ entries: HistoryEntry[] }> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/history/cell?table=${table}&row=${row}&col=${col}`));
+    },
+    async replay(id: string, seq: number): Promise<{ checkpointSeq: number; json: string | null; ops: HistoryEntry[] } | null> {
+      const res = await fetch(`/api/files/${encodeURIComponent(id)}/history/replay?seq=${seq}`);
+      if (res.status === 404) return null;
+      return j(res);
     },
   },
   connections: {
@@ -90,12 +118,12 @@ export const api = {
     async test(id: string): Promise<{ ok: boolean; message: string }> {
       return j(await fetch(`/api/connections/${encodeURIComponent(id)}/test`, { method: 'POST' }));
     },
-    async query(id: string, sql: string, limit = 5000): Promise<SqlResult> {
+    async query(id: string, sql: string, limit = 5000, params: SqlParam[] = []): Promise<SqlResult> {
       return j(
         await fetch(`/api/connections/${encodeURIComponent(id)}/query`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ sql, limit }),
+          body: JSON.stringify({ sql, limit, params }),
         }),
       );
     },
@@ -106,6 +134,9 @@ export const api = {
     },
     async saveSettings(s: { baseUrl?: string; model?: string; apiKey?: string }): Promise<AiSettings> {
       return j(await fetch('/api/ai/settings', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(s) }));
+    },
+    async models(): Promise<{ models: string[]; error?: string }> {
+      return j(await fetch('/api/ai/models'));
     },
     /** Streams assistant text chunks; resolves with the full text. */
     async chat(messages: { role: string; content: string }[], onChunk: (text: string) => void, signal?: AbortSignal): Promise<string> {

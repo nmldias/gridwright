@@ -1,5 +1,7 @@
 // Pointer and keyboard interaction for the canvas: selection drags, table
-// moving, Numbers-style resize handles, column/row resizing, pan/zoom.
+// moving, Numbers-style resize handles, column/row resizing, pan/zoom, and
+// touch gestures (one finger pans, tap selects, long-press selects a range,
+// double-tap edits, two fingers pinch-zoom).
 
 import * as book from '../engine/book';
 import type { TableId } from '../engine/types';
@@ -31,13 +33,20 @@ type Mode =
   | { kind: 'row-resize'; table: TableId; r: number; startY: number; startH: number }
   | { kind: 'col-select'; table: TableId; c: number }
   | { kind: 'row-select'; table: TableId; r: number }
-  | { kind: 'fill'; table: TableId; r0: number; c0: number; r1: number; c1: number };
+  | { kind: 'fill'; table: TableId; r0: number; c0: number; r1: number; c1: number }
+  /** touch: undecided between tap, pan and long-press selection */
+  | { kind: 'touch-wait'; hit: Hit; sx: number; sy: number; px: number; py: number; timer: number }
+  | { kind: 'pinch'; d0: number; z0: number; cx: number; cy: number; wx: number; wy: number };
+
+const TAP_SLOP = 8;
+const LONG_PRESS_MS = 420;
 
 export class GridController {
   private mode: Mode = { kind: 'idle' };
   private spaceDown = false;
   private lastClick = { t: 0, table: -1, r: -1, c: -1 };
   private detach: (() => void)[] = [];
+  private pointers = new Map<number, { x: number; y: number }>();
 
   constructor(
     private host: HTMLElement,
@@ -54,15 +63,7 @@ export class GridController {
     on(host, 'wheel', (e) => this.onWheel(e), { passive: false });
     on(host, 'contextmenu', (e: MouseEvent) => {
       e.preventDefault();
-      const rect = host.getBoundingClientRect();
-      const w = this.renderer.screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
-      const h = this.hit(w.x, w.y);
-      if (h.kind === 'cell') {
-        const sel = getState().selection;
-        const inside = sel && sel.table === h.table && h.r >= sel.r0 && h.r <= sel.r1 && h.c >= sel.c0 && h.c <= sel.c1;
-        if (!inside) selectCell(h.table, h.r, h.c);
-      }
-      host.dispatchEvent(new CustomEvent('gw-contextmenu', { detail: { x: e.clientX, y: e.clientY, hit: h } }));
+      this.openContextMenu(e.clientX, e.clientY);
     });
     on(window, 'keydown', (e) => this.onKeyDown(e));
     on(window, 'keyup', (e) => {
@@ -82,11 +83,23 @@ export class GridController {
     this.detach.forEach((f) => f());
   }
 
+  private openContextMenu(clientX: number, clientY: number) {
+    const rect = this.host.getBoundingClientRect();
+    const w = this.renderer.screenToWorld(clientX - rect.left, clientY - rect.top);
+    const h = this.hit(w.x, w.y);
+    if (h.kind === 'cell') {
+      const sel = getState().selection;
+      const inside = sel && sel.table === h.table && h.r >= sel.r0 && h.r <= sel.r1 && h.c >= sel.c0 && h.c <= sel.c1;
+      if (!inside) selectCell(h.table, h.r, h.c);
+    }
+    this.host.dispatchEvent(new CustomEvent('gw-contextmenu', { detail: { x: clientX, y: clientY, hit: h } }));
+  }
+
   private inputFocused(): boolean {
     const el = document.activeElement as HTMLElement | null;
     if (!el) return false;
     const tag = el.tagName;
-    return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable || !!el.closest('.cm-editor');
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable || !!el.closest('.cm-editor');
   }
 
   private pointerWorld(e: PointerEvent | WheelEvent) {
@@ -96,9 +109,9 @@ export class GridController {
     return { sx, sy, ...this.renderer.screenToWorld(sx, sy) };
   }
 
-  private hit(wx: number, wy: number): Hit {
+  private hit(wx: number, wy: number, touch = false): Hit {
     const st = getState();
-    return hitTest(st.tables, Array.from(st.tables.keys()), wx, wy, st.selectedTable, this.renderer.zoom, st.selection);
+    return hitTest(st.tables, Array.from(st.tables.keys()), wx, wy, st.selectedTable, this.renderer.zoom, st.selection, touch);
   }
 
   // ------------------------------------------------------------------
@@ -106,6 +119,11 @@ export class GridController {
     // overlays (context menu, cell editor) handle their own pointer events
     const target = e.target as HTMLElement | null;
     if (target && target !== this.host && !(target instanceof HTMLCanvasElement)) return;
+    this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (e.pointerType === 'touch') {
+      this.onTouchDown(e);
+      return;
+    }
     if (e.button === 1 || this.spaceDown) {
       this.beginPan(e);
       return;
@@ -122,10 +140,21 @@ export class GridController {
     }
     const h = this.hit(x, y);
     this.host.setPointerCapture(e.pointerId);
+    this.beginHit(h, e, x, y, false);
+  }
+
+  /** Start the interaction for a hit (shared by mouse and touch). */
+  private beginHit(h: Hit, e: PointerEvent, x: number, y: number, touch: boolean) {
+    const st = getState();
     switch (h.kind) {
       case 'fill': {
         const sel = st.selection!;
         this.mode = { kind: 'fill', table: h.table, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+        break;
+      }
+      case 'filter': {
+        useStore.setState({ filterPopover: { table: h.table, col: h.c, x: e.clientX, y: e.clientY } });
+        this.mode = { kind: 'idle' };
         break;
       }
       case 'cell': {
@@ -140,7 +169,7 @@ export class GridController {
           return;
         }
         selectCell(h.table, h.r, h.c, e.shiftKey);
-        this.mode = { kind: 'select', table: h.table };
+        this.mode = touch ? { kind: 'idle' } : { kind: 'select', table: h.table };
         break;
       }
       case 'title': {
@@ -194,20 +223,88 @@ export class GridController {
     }
   }
 
+  // ---- touch ----------------------------------------------------------------
+  private onTouchDown(e: PointerEvent) {
+    this.host.setPointerCapture(e.pointerId);
+    if (this.pointers.size >= 2) {
+      // second finger: pinch zoom
+      if (this.mode.kind === 'touch-wait') clearTimeout(this.mode.timer);
+      const pts = Array.from(this.pointers.values());
+      const rect = this.host.getBoundingClientRect();
+      const cx = (pts[0].x + pts[1].x) / 2 - rect.left;
+      const cy = (pts[0].y + pts[1].y) / 2 - rect.top;
+      const w = this.renderer.screenToWorld(cx, cy);
+      this.mode = { kind: 'pinch', d0: Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y), z0: this.renderer.zoom, cx, cy, wx: w.x, wy: w.y };
+      return;
+    }
+    const st = getState();
+    const { x, y, sx, sy } = this.pointerWorld(e);
+    if (st.editing) {
+      const ed = st.editing;
+      const h = this.hit(x, y, true);
+      if (!(h.kind === 'cell' && h.table === ed.table && h.r === ed.r && h.c === ed.c)) commitEdit(st.editorText, null);
+    }
+    const h = this.hit(x, y, true);
+    // handles, title and tabs react immediately; cells and empty canvas wait to see if it is a pan
+    if (h.kind === 'cell' || h.kind === 'none') {
+      const timer = window.setTimeout(() => {
+        if (this.mode.kind !== 'touch-wait') return;
+        // long press: start a range selection (cell) or open the context menu (cell)
+        if (h.kind === 'cell') {
+          selectCell(h.table, h.r, h.c);
+          this.mode = { kind: 'select', table: h.table };
+          this.openContextMenu(e.clientX, e.clientY);
+        } else this.mode = { kind: 'idle' };
+      }, LONG_PRESS_MS);
+      this.mode = { kind: 'touch-wait', hit: h, sx, sy, px: this.renderer.pan.x, py: this.renderer.pan.y, timer };
+      return;
+    }
+    this.beginHit(h, e, x, y, true);
+  }
+
   private beginPan(e: PointerEvent) {
     const rect = this.host.getBoundingClientRect();
     this.mode = { kind: 'pan', sx: e.clientX - rect.left, sy: e.clientY - rect.top, px: this.renderer.pan.x, py: this.renderer.pan.y };
-    this.host.setPointerCapture(e.pointerId);
+    try {
+      this.host.setPointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
     this.host.style.cursor = 'grabbing';
   }
 
   private onPointerMove(e: PointerEvent) {
+    if (this.pointers.has(e.pointerId)) this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     const { sx, sy, x, y } = this.pointerWorld(e);
     const st = getState();
     switch (this.mode.kind) {
       case 'idle': {
+        if (e.pointerType === 'touch') return;
         const h = this.hit(x, y);
         this.host.style.cursor = this.spaceDown ? 'grab' : cursorFor(h);
+        return;
+      }
+      case 'touch-wait': {
+        const m = this.mode;
+        if (Math.hypot(sx - m.sx, sy - m.sy) > TAP_SLOP) {
+          clearTimeout(m.timer);
+          this.mode = { kind: 'pan', sx: m.sx, sy: m.sy, px: m.px, py: m.py };
+          this.renderer.setViewport(m.px + (sx - m.sx), m.py + (sy - m.sy), this.renderer.zoom);
+        }
+        return;
+      }
+      case 'pinch': {
+        const pts = Array.from(this.pointers.values());
+        if (pts.length < 2) return;
+        const d = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+        const m = this.mode;
+        const z = Math.min(4, Math.max(0.2, (m.z0 * d) / Math.max(1, m.d0)));
+        const rect = this.host.getBoundingClientRect();
+        const cx = (pts[0].x + pts[1].x) / 2 - rect.left;
+        const cy = (pts[0].y + pts[1].y) / 2 - rect.top;
+        // keep the world point under the fingers fixed
+        this.renderer.setViewport(cx - m.wx * z, cy - m.wy * z, z);
+        useStore.setState({ zoom: z });
         return;
       }
       case 'pan': {
@@ -292,7 +389,12 @@ export class GridController {
   }
 
   private onPointerUp(e: PointerEvent) {
+    this.pointers.delete(e.pointerId);
     const mode = this.mode;
+    if (mode.kind === 'pinch') {
+      if (this.pointers.size === 0) this.mode = { kind: 'idle' };
+      return;
+    }
     this.mode = { kind: 'idle' };
     try {
       this.host.releasePointerCapture(e.pointerId);
@@ -301,6 +403,26 @@ export class GridController {
     }
     this.host.style.cursor = 'default';
     switch (mode.kind) {
+      case 'touch-wait': {
+        clearTimeout(mode.timer);
+        // a tap: select the cell (second tap on the same cell edits), or deselect on empty canvas
+        const { x, y } = this.pointerWorld(e);
+        const h = mode.hit;
+        if (h.kind === 'cell') {
+          const now = performance.now();
+          const dbl = now - this.lastClick.t < 450 && this.lastClick.table === h.table && this.lastClick.r === h.r && this.lastClick.c === h.c;
+          this.lastClick = { t: now, table: h.table, r: h.r, c: h.c };
+          if (getState().selectedTable !== null && getState().selectedTable !== h.table) useStore.setState({ selectedTable: null });
+          selectCell(h.table, h.r, h.c);
+          if (dbl) startEdit();
+        } else {
+          void x;
+          void y;
+          useStore.setState({ selectedTable: null });
+          this.renderer.markDirty();
+        }
+        return;
+      }
       case 'fill': {
         fillFromSource(mode.table, mode, getState().selection);
         return;
@@ -402,6 +524,14 @@ export class GridController {
       selectRange(meta.id, 0, 0, meta.rows - 1, meta.cols - 1);
       return;
     }
+    if (mod && e.shiftKey && e.key.toLowerCase() === 'l') {
+      e.preventDefault();
+      const sel = st.selection;
+      const meta = st.tables.get(sel.table)!;
+      if (meta.filters.length) book.apply({ type: 'set_filters', table: sel.table, filters: [] });
+      else useStore.setState({ filterPopover: { table: sel.table, col: sel.ac, x: window.innerWidth / 2, y: 120 } });
+      return;
+    }
     switch (e.key) {
       case 'ArrowUp':
         e.preventDefault();
@@ -438,7 +568,7 @@ export class GridController {
         clearSelection();
         return;
       case 'Escape':
-        useStore.setState({ selectedTable: null });
+        useStore.setState({ selectedTable: null, filterPopover: null });
         this.renderer.markDirty();
         return;
       case 'Home':

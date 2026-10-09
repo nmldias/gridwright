@@ -9,7 +9,10 @@ export type CellValue =
   | { b: boolean }
   | { e: string };
 
-export type CellKind = 'value' | 'formula' | 'python' | 'javascript';
+export type CellKind = 'value' | 'formula' | 'python' | 'javascript' | 'sql';
+
+export const CODE_KINDS: CellKind[] = ['python', 'javascript', 'sql'];
+export const isCodeKind = (k: CellKind | undefined) => !!k && CODE_KINDS.includes(k);
 
 export interface Format {
   bold?: boolean;
@@ -28,9 +31,71 @@ export interface CellView {
   v: CellValue;
   f?: Format;
   s?: { row: number; col: number }; // spilled from
-  ss?: [number, number]; // spill size (code cells)
+  ss?: [number, number]; // spill size (code cells and array formulas)
   out?: string;
   err?: string;
+  conn?: string; // SQL cells: connection id
+  refresh?: number; // code/SQL cells: refresh interval (s)
+  inv?: boolean; // breaks a validation rule
+}
+
+export interface PivotValue {
+  field: string;
+  agg: 'sum' | 'count' | 'average' | 'min' | 'max' | 'countdistinct';
+}
+export interface PivotFilter {
+  field: string;
+  values: string[];
+}
+export interface PivotSpec {
+  source: TableId;
+  rows: string[];
+  cols: string[];
+  values: PivotValue[];
+  filters: PivotFilter[];
+  totals: boolean;
+}
+
+export interface ColumnFilter {
+  col: number;
+  values?: string[];
+  op?: 'eq' | 'ne' | 'gt' | 'ge' | 'lt' | 'le' | 'contains' | 'not_contains' | 'starts' | 'ends' | 'blank' | 'not_blank';
+  value?: string;
+}
+
+export type CondFormatKind = 'cell_is' | 'text' | 'color_scale' | 'top' | 'bottom' | 'duplicate' | 'blank' | 'not_blank' | 'formula';
+export interface CondFormat {
+  r0: number;
+  c0: number;
+  r1: number;
+  c1: number;
+  kind: CondFormatKind;
+  op?: string;
+  values: string[];
+  fill?: string;
+  color?: string;
+  bold?: boolean;
+  min_color?: string;
+  max_color?: string;
+}
+
+export type ValidationKind = 'list' | 'number' | 'integer' | 'date' | 'text_length' | 'custom';
+export interface Validation {
+  r0: number;
+  c0: number;
+  r1: number;
+  c1: number;
+  kind: ValidationKind;
+  op?: string;
+  values: string[];
+  allow_blank: boolean;
+  strict: boolean;
+  message?: string;
+}
+
+export interface NamedRange {
+  name: string;
+  reference: string;
 }
 
 export interface TableMeta {
@@ -43,6 +108,11 @@ export interface TableMeta {
   header_rows: number;
   col_widths: number[];
   row_heights: number[];
+  pivot?: PivotSpec;
+  filters: ColumnFilter[];
+  hidden_rows: number[];
+  cond_formats: CondFormat[];
+  validations: Validation[];
 }
 
 export interface Rect {
@@ -67,10 +137,11 @@ export interface Changes {
   rerun_code: CellRef[];
   error?: string;
   created: TableId[];
+  names?: NamedRange[];
 }
 
 export type Op =
-  | { type: 'set_cell'; table: TableId; row: number; col: number; input: string; kind?: CellKind }
+  | { type: 'set_cell'; table: TableId; row: number; col: number; input: string; kind?: CellKind; conn?: string | null; refresh?: number | null }
   | { type: 'set_cells'; table: TableId; row: number; col: number; values: string[][] }
   | { type: 'clear_range'; table: TableId; r0: number; c0: number; r1: number; c1: number }
   | { type: 'set_format'; table: TableId; r0: number; c0: number; r1: number; c1: number; format: Format }
@@ -104,7 +175,15 @@ export type Op =
       std_out?: string | null;
       std_err?: string | null;
       deps: Rect[];
-    };
+    }
+  | { type: 'set_pivot'; table: TableId; spec: PivotSpec | null }
+  | { type: 'set_filters'; table: TableId; filters: ColumnFilter[] }
+  | { type: 'set_cond_formats'; table: TableId; rules: CondFormat[] }
+  | { type: 'set_validations'; table: TableId; rules: Validation[] }
+  | { type: 'set_name'; name: string; reference: string | null };
+
+/** Ops that change the shape of a table (row/column indices shift). */
+export const STRUCTURAL_OPS = new Set<Op['type']>(['resize_table', 'insert_rows', 'delete_rows', 'insert_cols', 'delete_cols', 'delete_table', 'add_table', 'set_pivot', 'rename_table', 'set_header_rows']);
 
 export function valueToString(v: CellValue): string {
   if (v === null || v === undefined) return '';
@@ -148,6 +227,13 @@ export function lettersToCol(s: string): number {
 
 export function a1(r: number, c: number): string {
   return `${colToLetters(c)}${r + 1}`;
+}
+
+/** Table-qualified reference text for a rectangle, quoting names with spaces. */
+export function refText(tableName: string, r0: number, c0: number, r1: number, c1: number): string {
+  const simple = /^[A-Za-z_][A-Za-z0-9_]*$/.test(tableName);
+  const q = simple ? tableName : `'${tableName.replace(/'/g, "''")}'`;
+  return `${q}::${a1(r0, c0)}${r0 !== r1 || c0 !== c1 ? ':' + a1(r1, c1) : ''}`;
 }
 
 /** Parse "A1", "A1:B3", "Table 2::A1:B3", "'My table'::A1" → table name (optional) + rect (0-based). */

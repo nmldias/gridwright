@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { CellRef, CellView, TableId, TableMeta } from '../engine/types';
+import type { CellRef, CellView, NamedRange, TableId, TableMeta } from '../engine/types';
 
 export interface Selection {
   table: TableId;
@@ -24,12 +24,13 @@ export interface Editing {
   source?: 'cell' | 'bar';
 }
 
-export type Panel = 'none' | 'code' | 'ai' | 'sql' | 'files' | 'table' | 'settings';
+export type Panel = 'none' | 'code' | 'ai' | 'sql' | 'files' | 'table' | 'settings' | 'history' | 'format';
 
 export interface Presence {
   id: string;
   name: string;
   color: string;
+  login?: string;
   table?: TableId;
   r?: number;
   c?: number;
@@ -40,6 +41,20 @@ export interface CodeRunState {
   startedAt: number;
 }
 
+export interface Me {
+  login: string;
+  name: string;
+  role: 'admin' | 'editor' | 'viewer';
+  identity: boolean;
+}
+
+export interface FilterPopover {
+  table: TableId;
+  col: number;
+  x: number;
+  y: number;
+}
+
 interface State {
   ready: boolean;
   fileId: string | null;
@@ -47,6 +62,9 @@ interface State {
   dirty: boolean;
   tables: Map<TableId, TableMeta>;
   cells: Map<TableId, Map<number, CellView>>;
+  /** bumped on every change to the cell maps (inner maps are patched in place) */
+  cellsVersion: number;
+  names: NamedRange[];
   selection: Selection | null;
   selectedTable: TableId | null;
   editing: Editing | null;
@@ -60,6 +78,13 @@ interface State {
   runs: Map<string, CodeRunState>;
   zoom: number;
   pythonStatus: 'idle' | 'loading' | 'ready' | 'error';
+  me: Me;
+  /** last log position applied from the server (0 = none) */
+  seq: number;
+  /** cell whose history the History panel shows */
+  historyCell: CellRef | null;
+  filterPopover: FilterPopover | null;
+  touch: boolean;
   set: (patch: Partial<State>) => void;
 }
 
@@ -70,6 +95,8 @@ export const useStore = create<State>((set) => ({
   dirty: false,
   tables: new Map(),
   cells: new Map(),
+  cellsVersion: 0,
+  names: [],
   selection: null,
   selectedTable: null,
   editing: null,
@@ -83,6 +110,11 @@ export const useStore = create<State>((set) => ({
   runs: new Map(),
   zoom: 1,
   pythonStatus: 'idle',
+  me: { login: '', name: '', role: 'admin', identity: false },
+  seq: 0,
+  historyCell: null,
+  filterPopover: null,
+  touch: typeof window !== 'undefined' && (navigator.maxTouchPoints > 0 || 'ontouchstart' in window) && !matchMedia('(pointer: fine)').matches,
   set: (patch) => set(patch),
 }));
 

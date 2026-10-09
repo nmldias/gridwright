@@ -1,23 +1,9 @@
 import { useState } from 'react';
 import * as book from '../engine/book';
 import { addTable, applyFormat, makeCodeCell, toggleBold } from '../grid/actions';
+import { NUMBER_FORMATS } from '../grid/format';
 import { useStore, type Panel } from '../state/store';
 import { saveCurrentFile } from './files';
-
-const NUMBER_FORMATS: { label: string; value: string }[] = [
-  { label: 'General', value: '' },
-  { label: 'Number 0.00', value: '0.00' },
-  { label: 'Integer', value: '0' },
-  { label: 'Thousands 1,000', value: '#,##0' },
-  { label: 'Thousands 1,000.00', value: '#,##0.00' },
-  { label: 'Percent 0%', value: '0%' },
-  { label: 'Percent 0.0%', value: '0.0%' },
-  { label: 'Currency EUR', value: 'currency:EUR' },
-  { label: 'Currency USD', value: 'currency:USD' },
-  { label: 'Currency AOA', value: 'currency:AOA' },
-  { label: 'Date yyyy-mm-dd', value: 'yyyy-mm-dd' },
-  { label: 'Date dd/mm/yyyy', value: 'dd/mm/yyyy' },
-];
 
 const FILLS = ['', '#fef3c7', '#dcfce7', '#dbeafe', '#fce7f3', '#f3f4f6', '#fee2e2'];
 const COLORS = ['', '#111827', '#b91c1c', '#1d4ed8', '#047857', '#6b7280', '#7c3aed'];
@@ -28,6 +14,8 @@ export function TopBar() {
   const canUndo = useStore((s) => s.canUndo);
   const canRedo = useStore((s) => s.canRedo);
   const panel = useStore((s) => s.panel);
+  const me = useStore((s) => s.me);
+  const touch = useStore((s) => s.touch);
   const [renaming, setRenaming] = useState(false);
   const [nameDraft, setNameDraft] = useState(fileName);
 
@@ -95,6 +83,9 @@ export function TopBar() {
       <button onClick={() => makeCodeCell('javascript')} title="Turn the selected cell into a JavaScript cell">
         JS
       </button>
+      <button onClick={() => makeCodeCell('sql')} title="Turn the selected cell into a SQL cell (query result spills from it)">
+        SQL
+      </button>
       <span className="sep" />
       <button onClick={() => toggleBold()} title="Bold (Ctrl+B)">
         <b>B</b>
@@ -130,12 +121,20 @@ export function TopBar() {
         ))}
       </div>
       <span className="grow" />
-      {btn('table', 'Table', 'Table inspector: name, size, header rows')}
-      {btn('code', 'Code', 'Code editor for Python / JavaScript cells')}
-      {btn('sql', 'SQL', 'Database connections and queries')}
+      {me.role === 'viewer' && <span className="pill">read-only</span>}
+      {btn('table', 'Table', 'Table inspector: name, size, header row, pivot')}
+      {btn('format', 'Rules', 'Conditional formatting, validation, names')}
+      {btn('code', 'Code', 'Code editor for Python / JavaScript / SQL cells')}
+      {btn('sql', 'DB', 'Database connections and ad-hoc queries')}
       {btn('ai', 'AI', 'AI assistant')}
-      {btn('files', 'Files', 'Open, save, import')}
+      {btn('history', 'History', 'Audit trail: every change, by whom, restore versions')}
+      {btn('files', 'Files', 'Open, save, import, export')}
       {btn('settings', '⚙', 'Settings')}
+      {touch && (
+        <button className={panel === 'none' ? '' : 'active'} onClick={() => useStore.setState({ panel: 'none' })} title="Close panel">
+          ✕
+        </button>
+      )}
     </div>
   );
 }

@@ -521,3 +521,318 @@ code {
   background: var(--border);
   margin: 4px 6px;
 }
+
+/* ---------------------------------------------------------------------------
+   v0.2: rules, filters, history, diffs, touch
+   --------------------------------------------------------------------------- */
+.canvas-host {
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.small-row {
+  gap: 6px;
+  align-items: center;
+}
+.small-row select {
+  padding: 3px 6px;
+}
+a.button {
+  display: inline-block;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 9px;
+  text-decoration: none;
+  color: inherit;
+}
+a.button:hover {
+  background: #f9fafb;
+}
+.chip {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+}
+.chip.on {
+  background: var(--accent-soft);
+  border-color: #93c5fd;
+  color: #1e3a8a;
+}
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.swatch.on {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.swatch-dot {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  border: 1px solid #d1d5db;
+  margin-right: 6px;
+  flex: none;
+}
+.rule-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.rule-list li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fafafa;
+}
+.rule-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+}
+.rule-form input,
+.rule-form select,
+.panel .row > input,
+.panel .row > select {
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  min-width: 0;
+}
+.rule-form .row {
+  align-items: center;
+}
+.rule-form .row > input {
+  flex: 1;
+}
+button.icon {
+  border: none;
+  background: none;
+  padding: 2px 6px;
+  color: var(--muted);
+}
+button.icon:hover {
+  color: var(--danger);
+}
+button.small {
+  padding: 2px 7px;
+  font-size: 12px;
+}
+button.link {
+  border: none;
+  background: none;
+  color: var(--accent);
+  padding: 0 4px;
+  text-decoration: underline;
+}
+
+/* list validation dropdown under the cell editor */
+.list-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 40;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
+  min-width: 140px;
+  max-height: 220px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+.list-item {
+  border: none;
+  background: none;
+  text-align: left;
+  padding: 5px 10px;
+  border-radius: 0;
+}
+.list-item:hover {
+  background: var(--accent-soft);
+}
+
+/* header filter popover */
+.filter-popover {
+  position: fixed;
+  z-index: 60;
+  width: 280px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.16);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.filter-head {
+  display: flex;
+  align-items: center;
+}
+.filter-popover input,
+.filter-popover select {
+  padding: 5px 7px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.filter-values {
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.filter-values .field.check {
+  justify-content: space-between;
+}
+.filter-values .field.check span:first-of-type {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.row.tabs button {
+  flex: 1;
+  border-radius: 6px;
+}
+
+/* history */
+.history-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.history-list li {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  background: #fafafa;
+}
+.history-list li.checkpoint {
+  border-left: 3px solid var(--accent);
+}
+.history-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.history-head .seq {
+  font-family: var(--mono);
+  color: var(--muted);
+  font-size: 11px;
+}
+.history-head .who {
+  font-weight: 500;
+}
+.history-body {
+  margin: 3px 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  word-break: break-word;
+}
+.history-actions {
+  display: flex;
+  gap: 6px;
+}
+.pill.origin-ai {
+  background: #ede9fe;
+  color: #5b21b6;
+}
+.pill.origin-code,
+.pill.origin-sql {
+  background: #ccfbf1;
+  color: #115e59;
+}
+.pill.origin-import {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+/* AI diff review */
+table.diff {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12px;
+  margin: 6px 0;
+}
+table.diff td {
+  padding: 2px 4px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+  word-break: break-word;
+}
+table.diff .where {
+  font-family: var(--mono);
+  color: var(--muted);
+  white-space: nowrap;
+}
+table.diff .before {
+  color: #991b1b;
+  text-decoration: line-through;
+}
+table.diff .after {
+  color: #065f46;
+}
+table.diff .arrow {
+  color: var(--muted);
+  width: 14px;
+}
+
+/* touch / narrow screens */
+@media (max-width: 760px), (pointer: coarse) {
+  button {
+    padding: 7px 11px;
+    min-height: 34px;
+  }
+  .topbar {
+    flex-wrap: wrap;
+    row-gap: 4px;
+    overflow-x: auto;
+  }
+  .side {
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    width: 100%;
+    max-width: 100%;
+    z-index: 30;
+    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.12);
+  }
+  .main {
+    position: relative;
+  }
+  .filter-popover {
+    width: calc(100vw - 24px);
+    left: 12px !important;
+  }
+  .context-menu .menu-item {
+    padding: 9px 12px;
+  }
+  .formula-input {
+    font-size: 16px; /* avoids iOS zooming into the field */
+  }
+  .cell-editor {
+    font-size: 16px !important;
+  }
+}

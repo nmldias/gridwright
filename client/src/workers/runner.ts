@@ -1,8 +1,9 @@
 // Orchestrates code-cell execution: builds a workbook snapshot, dispatches to
 // the Python or JavaScript worker, and writes results back through the engine.
 
+import { api, type SqlParam } from '../api/client';
 import * as book from '../engine/book';
-import type { CellRef, CellValue, Rect } from '../engine/types';
+import { isCodeKind, parseA1, type CellRef, type CellValue, type Rect } from '../engine/types';
 import { cellAt, getState, useStore } from '../state/store';
 import type { Plain, Snapshot } from './q';
 import JsWorker from './js.worker?worker';
@@ -10,12 +11,17 @@ import PyWorker from './python.worker?worker';
 
 const PY_INDEX_KEY = 'gridwright.pyodideIndexURL';
 export const DEFAULT_PYODIDE_INDEX = 'https://cdn.jsdelivr.net/pyodide/v0.27.5/full/';
+/** Set when the server reports a self-hosted Pyodide at /pyodide/ (used unless the user chose a URL). */
+export let localPyodideIndex: string | null = null;
+export function setLocalPyodide(available: boolean) {
+  localPyodideIndex = available ? `${location.origin}/pyodide/` : null;
+}
 
 export function pyodideIndexURL(): string {
   try {
-    return localStorage.getItem(PY_INDEX_KEY) || (window as any).__GRIDWRIGHT_PYODIDE__ || DEFAULT_PYODIDE_INDEX;
+    return localStorage.getItem(PY_INDEX_KEY) || (window as any).__GRIDWRIGHT_PYODIDE__ || localPyodideIndex || DEFAULT_PYODIDE_INDEX;
   } catch {
-    return DEFAULT_PYODIDE_INDEX;
+    return localPyodideIndex || DEFAULT_PYODIDE_INDEX;
   }
 }
 export function setPyodideIndexURL(url: string) {
@@ -60,7 +66,7 @@ function handleResult(e: MessageEvent) {
   runs.delete(keyOf(ref));
   useStore.setState({ runs });
   const cell = cellAt(ref.table, ref.row, ref.col);
-  if (!cell || (cell.k !== 'python' && cell.k !== 'javascript')) return; // cell changed meanwhile
+  if (!cell || !isCodeKind(cell.k)) return; // cell changed meanwhile
   const deps: Rect[] = (d.deps ?? []).map((x: Rect) => ({ table: x.table, r0: x.r0, c0: x.c0, r1: x.r1, c1: x.c1 }));
   if (d.ok) {
     let output: CellValue[][] | null;
@@ -75,9 +81,62 @@ function handleResult(e: MessageEvent) {
     } else {
       output = d.output ? (d.output as Plain[][]).map((row) => row.map(toCellValue)) : null;
     }
-    book.apply({ type: 'code_result', table: ref.table, row: ref.row, col: ref.col, output, std_out: d.std_out || null, std_err: null, deps });
+    book.apply({ type: 'code_result', table: ref.table, row: ref.row, col: ref.col, output, std_out: d.std_out || null, std_err: null, deps }, { origin: 'code' });
   } else {
-    book.apply({ type: 'code_result', table: ref.table, row: ref.row, col: ref.col, output: null, std_out: d.std_out || null, std_err: d.error || 'error', deps });
+    book.apply({ type: 'code_result', table: ref.table, row: ref.row, col: ref.col, output: null, std_out: d.std_out || null, std_err: d.error || 'error', deps }, { origin: 'code' });
+  }
+}
+
+// --- SQL cells ---------------------------------------------------------------------------
+// `{{A1}}` / `{{Orders::B2}}` become bound parameters; a range expands to a list (`IN ({{A2:A9}})`).
+export function prepareSql(sql: string, current: CellRef): { text: string; params: SqlParam[]; deps: Rect[]; error?: string } {
+  const params: SqlParam[] = [];
+  const deps: Rect[] = [];
+  let error: string | undefined;
+  const st = getState();
+  const text = sql.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_m, ref: string) => {
+    const p = parseA1(ref);
+    if (!p) {
+      error = `bad reference {{${ref}}}`;
+      return 'NULL';
+    }
+    const table = p.table ? book.tableIdByName(p.table) : current.table;
+    if (!table) {
+      error = `table "${p.table}" not found`;
+      return 'NULL';
+    }
+    const meta = st.tables.get(table)!;
+    const r1 = Math.min(p.r1, meta.rows - 1);
+    const c1 = Math.min(p.c1, meta.cols - 1);
+    deps.push({ table, r0: p.r0, c0: p.c0, r1, c1 });
+    const vals = book.rangeValues(table, p.r0, p.c0, r1, c1).flat().map((v) => (v !== null && typeof v === 'object' ? null : v));
+    if (vals.length === 1) {
+      params.push(vals[0]);
+      return '?';
+    }
+    for (const v of vals) params.push(v);
+    return vals.map(() => '?').join(', ') || 'NULL';
+  });
+  return { text, params, deps, error };
+}
+
+async function runSqlCell(ref: CellRef, id: number, code: string, conn: string | undefined) {
+  const finish = (d: any) => handleResult({ data: { id, ...d } } as MessageEvent);
+  if (!conn) {
+    finish({ ok: false, error: 'choose a connection for this SQL cell', deps: [] });
+    return;
+  }
+  const prep = prepareSql(code, ref);
+  if (prep.error) {
+    finish({ ok: false, error: prep.error, deps: prep.deps });
+    return;
+  }
+  try {
+    const res = await api.connections.query(conn, prep.text, 5000, prep.params);
+    const output: Plain[][] = [res.columns, ...res.rows];
+    finish({ ok: true, output, std_out: `${res.rowCount} row${res.rowCount === 1 ? '' : 's'} in ${res.ms} ms${res.truncated ? ' (truncated to 5000)' : ''}`, deps: prep.deps });
+  } catch (e) {
+    finish({ ok: false, error: (e as Error).message, deps: prep.deps });
   }
 }
 
@@ -125,7 +184,7 @@ export function buildSnapshot(current: CellRef): Snapshot {
 
 export function runCell(ref: CellRef) {
   const cell = cellAt(ref.table, ref.row, ref.col);
-  if (!cell || (cell.k !== 'python' && cell.k !== 'javascript')) return;
+  if (!cell || !isCodeKind(cell.k)) return;
   // loop guard: at most 6 runs per cell per 10 s
   const k = keyOf(ref);
   const now = Date.now();
@@ -141,9 +200,37 @@ export function runCell(ref: CellRef) {
   const runs = new Map(getState().runs);
   runs.set(k, { running: true, startedAt: now });
   useStore.setState({ runs });
+  if (cell.k === 'sql') {
+    void runSqlCell(ref, id, cell.i, cell.conn);
+    return;
+  }
   const snapshot = buildSnapshot(ref);
   const worker = cell.k === 'python' ? getPyWorker() : getJsWorker();
   worker.postMessage({ type: 'run', id, code: cell.i, snapshot });
+}
+
+/** Periodic refresh of code/SQL cells that asked for it (`refresh` seconds). */
+const lastFinished = new Map<string, number>();
+export function installRefreshScheduler(): () => void {
+  const timer = window.setInterval(() => {
+    const st = getState();
+    if (document.hidden) return;
+    const now = Date.now();
+    for (const [tid, map] of st.cells) {
+      for (const c of map.values()) {
+        if (!isCodeKind(c.k) || !c.refresh || c.s) continue;
+        const key = `${tid}:${c.r}:${c.c}`;
+        if (st.runs.get(key)?.running) continue;
+        const last = lastFinished.get(key) ?? 0;
+        if (now - last >= c.refresh * 1000) {
+          lastFinished.set(key, now);
+          lastRun.delete(key); // periodic runs are not loops
+          runCell({ table: tid, row: c.r, col: c.c });
+        }
+      }
+    }
+  }, 2000);
+  return () => window.clearInterval(timer);
 }
 
 export function scheduleRuns(refs: CellRef[]) {
