@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16-alpine
+        image: mirror.gcr.io/library/postgres:16-alpine  # Docker Hub mirror: no anonymous pull limit
         env:
           POSTGRES_USER: gw
           POSTGRES_PASSWORD: gw
@@ -27,7 +27,7 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U gw" --health-interval 5s --health-timeout 5s --health-retries 20
       mariadb:
-        image: mariadb:11
+        image: mirror.gcr.io/library/mariadb:11
         env:
           MARIADB_USER: gw
           MARIADB_PASSWORD: gw
