@@ -76,7 +76,8 @@ def main():
     # the directory name may survive as an empty mountpoint (when it lives under /tmp); its contents never do
     r = run("import os\nos.path.exists(%r), (os.listdir(%r) if os.path.isdir(%r) else [])" % (secret, DATA, DATA))
     if sandbox == "bwrap":
-        check("the data directory (secrets, documents) is hidden from sandboxed code", r["ok"] and r["output"] == [[False], ["[]"]], f"{r.get('output')} for {DATA}")
+        # only the interpreter's venv (data/pyenv, read-only) may show through; secrets and documents never do
+        check("the data directory (secrets, documents) is hidden from sandboxed code", r["ok"] and r["output"][0] == [False] and r["output"][1][0] in ("[]", "['pyenv']"), f"{r.get('output')} for {DATA}")
     else:
         print(f"SKIP data-directory hiding (sandbox: {sandbox})")
     r = run("while True: pass")

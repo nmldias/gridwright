@@ -264,6 +264,11 @@ for i in $(seq 1 30); do
   [ "$i" -eq 30 ] && { [ -f "$DATA/server.log" ] && tail -n 30 "$DATA/server.log"; journalctl --user -u gridwright --no-pager -n 30 2>/dev/null || true; die "server did not answer on port $PORT"; }
 done
 
+# the runtime is probed in the background right after start (a second or two; longer with a slow venv)
+for i in $(seq 1 40); do
+  curl -fsS -H "Authorization: Bearer ${GW_TOKEN:-}" "http://127.0.0.1:$PORT/api/python" 2>/dev/null | grep -q '"not probed yet"' || break
+  sleep 0.5
+done
 py_line="$(curl -fsS -H "Authorization: Bearer ${GW_TOKEN:-}" "http://127.0.0.1:$PORT/api/python" 2>/dev/null | "$NODE_BIN" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const p=JSON.parse(s);process.stdout.write(p.available?`CPython ${p.version}, sandbox: ${p.sandbox}${p.sandbox!=="bwrap"&&p.fallbacks?" ("+p.fallbacks+" — run the installer with --sandbox)":""}${p.gpu&&p.gpu.startsWith("cudf")?", GPU: "+p.gpu:", no GPU (cuDF not installed)"}`:"off — "+(p.reason||"no python3 found (run with --python or set GW_PYTHON)"))}catch{process.stdout.write("unknown")}})')"
 say "server-side Python cells: $py_line"
 
