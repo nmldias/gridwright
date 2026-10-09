@@ -6,6 +6,8 @@
 pub mod engine;
 pub mod formula;
 pub mod model;
+pub mod pivot;
+pub mod validation;
 
 pub use engine::{Changes, Engine, Op};
 pub use model::{Cell, CellKind, CellRef, Table, Value, Workbook};
@@ -152,6 +154,47 @@ impl Book {
     /// Table id by name (0 when not found).
     pub fn table_id(&self, name: &str) -> u32 {
         self.engine.wb.table_by_name(name).map(|t| t.id).unwrap_or(0)
+    }
+
+    /// JSON array of workbook names: [{name, reference}].
+    pub fn names(&self) -> String {
+        js(&self.engine.wb.names)
+    }
+
+    /// Check an input against the validation rules of a cell: JSON {"ok": bool, "message"?: string, "strict": bool}.
+    pub fn check_validation(&self, table: u32, row: u32, col: u32, input: &str) -> String {
+        let key = model::CellKey::new(row, col);
+        let strict = self
+            .engine
+            .wb
+            .table(table)
+            .map(|t| t.validations.iter().any(|r| r.strict && row >= r.r0 && row <= r.r1 && col >= r.c0 && col <= r.c1))
+            .unwrap_or(false);
+        match validation::check(&self.engine.wb, table, key, input) {
+            Ok(()) => js(&serde_json::json!({ "ok": true, "strict": strict })),
+            Err(m) => js(&serde_json::json!({ "ok": false, "message": m, "strict": strict })),
+        }
+    }
+
+    /// Entries offered by a list validation covering the cell (JSON array of strings; empty when none).
+    pub fn list_entries(&self, table: u32, row: u32, col: u32) -> String {
+        let out: Vec<String> = self
+            .engine
+            .wb
+            .table(table)
+            .and_then(|t| t.validations.iter().find(|r| r.kind == "list" && row >= r.r0 && row <= r.r1 && col >= r.c0 && col <= r.c1).map(|r| validation::list_entries(&self.engine.wb, table, r)))
+            .unwrap_or_default();
+        js(&out)
+    }
+
+    /// Format a number with a spreadsheet pattern (same rules as TEXT()).
+    pub fn format_number(n: f64, pattern: &str) -> String {
+        formula::eval::format_text(&Value::Number(n), pattern)
+    }
+
+    /// Evaluate a formula body for a specific cell position (conditional-format formulas); JSON value.
+    pub fn eval_at(&self, table: u32, row: u32, col: u32, formula: &str) -> String {
+        js(&formula::evaluate(&self.engine.wb, table, Some(model::CellKey::new(row, col)), formula::formula_body(formula)))
     }
 
     pub fn version() -> String {

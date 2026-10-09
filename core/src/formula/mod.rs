@@ -10,7 +10,16 @@ pub use parser::{parse, to_string, Expr, ParseError, RefExpr, RefKind};
 use crate::model::{CellKey, ErrorKind, Rect, TableId, Value, Workbook};
 
 /// Parse (without the leading `=`) and evaluate a formula for the cell `at` in `table`.
+/// Array results collapse to their first element; use `evaluate_full` for spilling.
 pub fn evaluate(wb: &Workbook, table: TableId, at: Option<CellKey>, src: &str) -> Value {
+    match evaluate_full(wb, table, at, src) {
+        Arg::Scalar(v) => v,
+        Arg::Array(a) => a.data.into_iter().next().unwrap_or(Value::Empty),
+    }
+}
+
+/// Parse and evaluate, keeping array results (dynamic arrays).
+pub fn evaluate_full(wb: &Workbook, table: TableId, at: Option<CellKey>, src: &str) -> Arg {
     match parse(src) {
         Ok(expr) => {
             let ctx = Ctx {
@@ -19,15 +28,22 @@ pub fn evaluate(wb: &Workbook, table: TableId, at: Option<CellKey>, src: &str) -
                 now: wb.now_serial,
                 at,
             };
-            match eval(&expr, &ctx) {
-                Arg::Scalar(v) => v,
-                Arg::Array(a) => {
-                    // a formula returning an array shows its first element (no dynamic arrays yet)
-                    a.data.into_iter().next().unwrap_or(Value::Empty)
-                }
-            }
+            eval(&expr, &ctx)
         }
-        Err(_) => Value::Error(ErrorKind::Name),
+        Err(_) => Arg::Scalar(Value::Error(ErrorKind::Name)),
+    }
+}
+
+/// Rewrite table-qualified references in a formula body after a table was renamed.
+pub fn rename_table(src: &str, old: &str, new: &str) -> String {
+    let mut expr = match parse(src) {
+        Ok(e) => e,
+        Err(_) => return src.to_string(),
+    };
+    if parser::rename_table_refs(&mut expr, old, new) {
+        to_string(&expr)
+    } else {
+        src.to_string()
     }
 }
 
@@ -340,6 +356,110 @@ mod tests {
         assert_eq!(ev(&wb, "EDATE(DATE(2026,1,31),1)"), Value::Number(46084.0)); // 2026-03-03 (overflow like Excel)
         assert_eq!(ev(&wb, "TEXT(DATE(2026,10,8),\"yyyy-mm-dd\")"), Value::Text("2026-10-08".into()));
         assert_eq!(ev(&wb, "WEEKDAY(DATE(2026,10,8))"), Value::Number(5.0)); // Thursday
+    }
+
+    #[test]
+    fn arrays_structured_refs_names_and_finance() {
+        let mut wb = book();
+        wb.names.push(crate::model::NamedRange {
+            name: "Prices".into(),
+            reference: "Sales::B1:B3".into(),
+        });
+        wb.names.push(crate::model::NamedRange {
+            name: "TaxRate".into(),
+            reference: "0.14".into(),
+        });
+        // Table 1: A1..A4 = 10,20,30,40 ; B1 = apple, B2 = Banana (header row = row 0)
+        let full = |f: &str| evaluate_full(&wb, 1, Some(CellKey::new(2, 2)), f);
+        // lifting + spill shapes
+        match full("A1:A4 * 2") {
+            Arg::Array(a) => {
+                assert_eq!((a.rows, a.cols), (4, 1));
+                assert_eq!(a.data[3], Value::Number(80.0));
+            }
+            other => panic!("expected array, got {:?}", other),
+        }
+        match full("ROUND(A1:A2 / 3, 1)") {
+            Arg::Array(a) => assert_eq!(a.data, vec![Value::Number(3.3), Value::Number(6.7)]),
+            other => panic!("{:?}", other),
+        }
+        match full("FILTER(A1:A4, A1:A4 > 15)") {
+            Arg::Array(a) => assert_eq!(a.data, vec![Value::Number(20.0), Value::Number(30.0), Value::Number(40.0)]),
+            other => panic!("{:?}", other),
+        }
+        match full("SORT(A1:A4, 1, -1)") {
+            Arg::Array(a) => assert_eq!(a.data[0], Value::Number(40.0)),
+            other => panic!("{:?}", other),
+        }
+        match full("SEQUENCE(2, 3, 10, 5)") {
+            Arg::Array(a) => assert_eq!((a.rows, a.cols, a.data[5].clone()), (2, 3, Value::Number(35.0))),
+            other => panic!("{:?}", other),
+        }
+        assert_eq!(ev(&wb, "SUM(IF(A1:A4 > 15, A1:A4, 0))"), Value::Number(90.0));
+        assert_eq!(ev(&wb, "IFERROR(1/0, \"x\")"), Value::Text("x".into()));
+        assert_eq!(ev(&wb, "ROWS(UNIQUE({1;1;2}))"), Value::Number(2.0));
+        // structured references: header row is row 0 → "10" is the header of column A, "apple" of column B
+        assert_eq!(ev(&wb, "SUM([10])"), Value::Number(90.0)); // data rows A2:A4
+        assert_eq!(ev(&wb, "COUNTA('Table 1'[apple])"), Value::Number(1.0));
+        assert_eq!(evaluate(&wb, 1, Some(CellKey::new(1, 2)), "[@10] * 2"), Value::Number(40.0));
+        assert_eq!(ev(&wb, "[Nope]"), Value::Error(ErrorKind::Name));
+        // names
+        assert_eq!(ev(&wb, "SUM(Prices)"), Value::Number(7.0));
+        assert_eq!(ev(&wb, "ROUND(TaxRate * 100, 6)"), Value::Number(14.0));
+        assert_eq!(ev(&wb, "Unknown + 1"), Value::Error(ErrorKind::Name));
+        let d = dependencies(&wb, 1, "SUM(Prices) + [@10]");
+        assert_eq!(d[0], Rect { table: 2, r0: 0, c0: 1, r1: 2, c1: 1 });
+        assert_eq!(d[1], Rect { table: 1, r0: 1, c0: 0, r1: 4, c1: 0 });
+        // finance
+        let pmt = ev(&wb, "PMT(0.05/12, 360, 200000)");
+        if let Value::Number(x) = pmt {
+            assert!((x + 1073.64).abs() < 0.01, "{}", x);
+        } else {
+            panic!("{:?}", pmt);
+        }
+        if let Value::Number(x) = ev(&wb, "NPV(0.1, 100, 100, 100)") {
+            assert!((x - 248.685).abs() < 0.01);
+        } else {
+            panic!();
+        }
+        if let Value::Number(x) = ev(&wb, "IRR({-100; 60; 60})") {
+            assert!((x - 0.1307).abs() < 0.001, "{}", x);
+        } else {
+            panic!();
+        }
+        if let Value::Number(x) = ev(&wb, "FV(0.06/12, 120, -100)") {
+            assert!((x - 16387.93).abs() < 0.05, "{}", x);
+        } else {
+            panic!();
+        }
+        if let Value::Number(x) = ev(&wb, "NPER(0.01, -100, 1000)") {
+            assert!((x - 10.588).abs() < 0.01, "{}", x);
+        } else {
+            panic!();
+        }
+        if let Value::Number(x) = ev(&wb, "RATE(360, -1073.64, 200000) * 12") {
+            assert!((x - 0.05).abs() < 1e-4, "{}", x);
+        } else {
+            panic!();
+        }
+        if let Value::Number(x) = ev(&wb, "XNPV(0.1, {-1000; 600; 600}, {46000; 46365; 46730})") {
+            assert!((x - 41.32).abs() < 0.5, "{}", x);
+        } else {
+            panic!();
+        }
+        assert_eq!(ev(&wb, "SLN(10000, 1000, 5)"), Value::Number(1800.0));
+        assert_eq!(ev(&wb, "YEARFRAC(DATE(2026,1,1), DATE(2026,7,1))"), Value::Number(0.5));
+        assert_eq!(ev(&wb, "DATEDIF(DATE(2020,2,29), DATE(2026,10,8), \"Y\")"), Value::Number(6.0));
+        assert_eq!(ev(&wb, "NETWORKDAYS(DATE(2026,10,5), DATE(2026,10,11))"), Value::Number(5.0));
+        assert_eq!(ev(&wb, "WORKDAY(DATE(2026,10,9), 1)"), Value::Number(46307.0)); // Fri → Mon
+        assert_eq!(ev(&wb, "TEXT(1234.5, \"#.##0,00 \"\"Kz\"\"\")"), Value::Text("1.234,50 Kz".into()));
+        assert_eq!(ev(&wb, "TEXT(-1234.5, \"€#,##0.00\")"), Value::Text("-€1,234.50".into()));
+        assert_eq!(ev(&wb, "TEXT(DATE(2026,10,8) + 0.5, \"d mmm yyyy hh:mm\")"), Value::Text("8 Oct 2026 12:00".into()));
+        assert_eq!(ev(&wb, "TEXT(DATE(2026,10,8), \"dddd\")"), Value::Text("Thursday".into()));
+        assert_eq!(ev(&wb, "HOUR(\"2026-10-08 14:30\")"), Value::Number(14.0));
+        assert_eq!(ev(&wb, "SWITCH(2, 1, \"a\", 2, \"b\", \"z\")"), Value::Text("b".into()));
+        assert_eq!(ev(&wb, "MAXIFS(A1:A4, B1:B4, \"*an*\")"), Value::Number(20.0));
+        assert_eq!(rename_table("SUM(Sales::B1:B3) + sales[Price]", "Sales", "Revenue"), "SUM(Revenue::B1:B3) + Revenue[Price]");
     }
 
     #[test]

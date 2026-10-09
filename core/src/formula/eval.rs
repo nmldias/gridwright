@@ -1,4 +1,8 @@
 //! Formula evaluator and the built-in function library.
+//!
+//! Values flow as `Arg`: a scalar or a rectangular array. Scalar functions are
+//! lifted over arrays element-wise (so `=ROUND(A1:A5, 1)` yields an array that
+//! spills), aggregates consume whole arrays, and a few functions are lazy.
 
 use super::parser::{BinOp, Expr, RefExpr, RefKind};
 use crate::model::{CellKey, ErrorKind, Rect, TableId, Value, Workbook};
@@ -13,6 +17,38 @@ pub struct Array {
 impl Array {
     pub fn get(&self, r: u32, c: u32) -> &Value {
         &self.data[(r * self.cols + c) as usize]
+    }
+    pub fn empty() -> Array {
+        Array { rows: 0, cols: 0, data: vec![] }
+    }
+    pub fn from_rows(rows: Vec<Vec<Value>>) -> Array {
+        let nrows = rows.len() as u32;
+        let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
+        let mut data = Vec::with_capacity((nrows * ncols) as usize);
+        for r in rows {
+            for c in 0..ncols as usize {
+                data.push(r.get(c).cloned().unwrap_or(Value::Empty));
+            }
+        }
+        Array { rows: nrows, cols: ncols, data }
+    }
+    pub fn row(&self, r: u32) -> Vec<Value> {
+        (0..self.cols).map(|c| self.get(r, c).clone()).collect()
+    }
+    pub fn column(&self, c: u32) -> Vec<Value> {
+        (0..self.rows).map(|r| self.get(r, c).clone()).collect()
+    }
+    /// Element with broadcasting (1-row / 1-col arrays repeat).
+    fn at_broadcast(&self, r: u32, c: u32) -> Value {
+        if self.rows == 0 || self.cols == 0 {
+            return Value::Error(ErrorKind::NA);
+        }
+        let rr = if self.rows == 1 { 0 } else { r };
+        let cc = if self.cols == 1 { 0 } else { c };
+        if rr >= self.rows || cc >= self.cols {
+            return Value::Error(ErrorKind::NA);
+        }
+        self.get(rr, cc).clone()
     }
 }
 
@@ -33,6 +69,8 @@ impl Arg {
             Arg::Array(a) => {
                 if a.rows == 1 && a.cols == 1 {
                     a.data.into_iter().next().unwrap_or(Value::Empty)
+                } else if a.data.is_empty() {
+                    Value::Error(ErrorKind::NA)
                 } else {
                     Value::Error(ErrorKind::Value)
                 }
@@ -45,7 +83,7 @@ impl Arg {
             Arg::Array(a) => a.data.clone(),
         }
     }
-    fn as_array(&self) -> Array {
+    pub fn as_array(&self) -> Array {
         match self {
             Arg::Scalar(v) => Array {
                 rows: 1,
@@ -55,18 +93,46 @@ impl Arg {
             Arg::Array(a) => a.clone(),
         }
     }
+    fn is_multi(&self) -> bool {
+        matches!(self, Arg::Array(a) if a.rows * a.cols != 1)
+    }
+    fn shape(&self) -> (u32, u32) {
+        match self {
+            Arg::Scalar(_) => (1, 1),
+            Arg::Array(a) => (a.rows, a.cols),
+        }
+    }
+    fn at_broadcast(&self, r: u32, c: u32) -> Value {
+        match self {
+            Arg::Scalar(v) => v.clone(),
+            Arg::Array(a) => a.at_broadcast(r, c),
+        }
+    }
+    /// Normalise: 1×1 arrays become scalars, 0-sized arrays become #N/A... keep empties as #CALC-like NA.
+    fn normalise(self) -> Arg {
+        match self {
+            Arg::Array(a) if a.rows == 1 && a.cols == 1 => Arg::Scalar(a.data.into_iter().next().unwrap_or(Value::Empty)),
+            Arg::Array(a) if a.data.is_empty() => Arg::err(ErrorKind::NA),
+            other => other,
+        }
+    }
 }
 
 pub struct Ctx<'a> {
     pub wb: &'a Workbook,
     pub table: TableId,
     pub now: f64,
-    /// Position of the cell being evaluated (for ROW()/COLUMN()).
+    /// Position of the cell being evaluated (for ROW()/COLUMN() and `[@Column]`).
     pub at: Option<CellKey>,
 }
 
 /// Resolve a reference to a rectangle inside a table, clipped to the table bounds.
 pub fn resolve_ref(r: &RefExpr, wb: &Workbook, current: TableId) -> Result<Rect, ErrorKind> {
+    resolve_ref_at(r, wb, current, None)
+}
+
+/// Like `resolve_ref`, with the evaluating cell's position (needed by `[@Column]`).
+pub fn resolve_ref_at(r: &RefExpr, wb: &Workbook, current: TableId, at: Option<CellKey>) -> Result<Rect, ErrorKind> {
     let table = match &r.table {
         None => wb.table(current),
         Some(name) => wb.table_by_name(name),
@@ -80,6 +146,27 @@ pub fn resolve_ref(r: &RefExpr, wb: &Workbook, current: TableId) -> Result<Rect,
         RefKind::Range { r0, c0, r1, c1, .. } => (*r0, *c0, *r1, *c1),
         RefKind::Cols { c0, c1 } => (0, *c0, table.rows - 1, *c1),
         RefKind::Rows { r0, r1 } => (*r0, 0, *r1, table.cols - 1),
+        RefKind::Column { name, this_row } => {
+            let col = table.column_by_header(name).ok_or(ErrorKind::Name)?;
+            if *this_row {
+                match at {
+                    Some(k) if r.table.is_none() || table.id == current => {
+                        if k.row < table.header_rows {
+                            return Err(ErrorKind::Value);
+                        }
+                        (k.row, col, k.row, col)
+                    }
+                    Some(_) => return Err(ErrorKind::Value),
+                    // without a position (dependency analysis) the whole data column is read
+                    None => (table.header_rows.min(table.rows - 1), col, table.rows - 1, col),
+                }
+            } else {
+                if table.header_rows >= table.rows {
+                    return Err(ErrorKind::Ref);
+                }
+                (table.header_rows, col, table.rows - 1, col)
+            }
+        }
     };
     if r0 >= table.rows || c0 >= table.cols {
         return Err(ErrorKind::Ref);
@@ -93,15 +180,39 @@ pub fn resolve_ref(r: &RefExpr, wb: &Workbook, current: TableId) -> Result<Rect,
     })
 }
 
-/// Every rectangle an expression reads (conservative: ignores short-circuiting).
+/// Every rectangle an expression reads (conservative: ignores short-circuiting;
+/// named ranges are expanded).
 pub fn collect_deps(e: &Expr, wb: &Workbook, current: TableId) -> Vec<Rect> {
     let mut out = Vec::new();
-    super::parser::for_each_ref(e, &mut |r| {
-        if let Ok(rect) = resolve_ref(r, wb, current) {
-            out.push(rect);
-        }
-    });
+    walk_deps(e, wb, current, &mut out, 0);
     out
+}
+
+fn walk_deps(e: &Expr, wb: &Workbook, current: TableId, out: &mut Vec<Rect>, depth: u32) {
+    match e {
+        Expr::Ref(r) => {
+            if let Ok(rect) = resolve_ref(r, wb, current) {
+                out.push(rect);
+            }
+        }
+        Expr::Name(n) => {
+            if depth < 8 {
+                if let Some(nr) = wb.named_range(n) {
+                    if let Ok(parsed) = super::parser::parse(&nr.reference) {
+                        walk_deps(&parsed, wb, current, out, depth + 1);
+                    }
+                }
+            }
+        }
+        Expr::Call(_, args) => args.iter().for_each(|a| walk_deps(a, wb, current, out, depth)),
+        Expr::Neg(x) | Expr::Percent(x) => walk_deps(x, wb, current, out, depth),
+        Expr::Binary(_, l, r) => {
+            walk_deps(l, wb, current, out, depth);
+            walk_deps(r, wb, current, out, depth);
+        }
+        Expr::Array(rows) => rows.iter().flatten().for_each(|x| walk_deps(x, wb, current, out, depth)),
+        _ => {}
+    }
 }
 
 fn range_arg(rect: Rect, wb: &Workbook) -> Arg {
@@ -129,7 +240,9 @@ pub fn to_number(v: &Value) -> Result<f64, ErrorKind> {
         Value::Empty => Ok(0.0),
         Value::Number(n) => Ok(*n),
         Value::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
-        Value::Text(s) => crate::model::parse_number_literal(s).ok_or(ErrorKind::Value),
+        Value::Text(s) => crate::model::parse_number_literal(s)
+            .or_else(|| parse_date_time_text(s).map(|(d, _)| d))
+            .ok_or(ErrorKind::Value),
         Value::Error(e) => Err(e.clone()),
     }
 }
@@ -218,6 +331,23 @@ fn numbers(args: &[Arg]) -> Result<Vec<f64>, ErrorKind> {
     Ok(out)
 }
 
+/// Numbers in order, errors propagate, blanks/text skipped (for cash-flow functions).
+fn cash_flows(a: &Arg) -> Result<Vec<f64>, ErrorKind> {
+    let mut out = vec![];
+    for v in a.values() {
+        match v {
+            Value::Number(x) => out.push(x),
+            Value::Error(e) => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+pub fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+    compare(a, b)
+}
+
 fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering::*;
     fn rank(v: &Value) -> u8 {
@@ -239,6 +369,10 @@ fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         _ => rank(a).cmp(&rank(b)),
     }
+}
+
+fn same_type(a: &Value, b: &Value) -> bool {
+    std::mem::discriminant(a) == std::mem::discriminant(b)
 }
 
 // ---------------------------------------------------------------------------
@@ -281,31 +415,164 @@ pub fn ymd_from_serial(serial: f64) -> (i64, i64, i64) {
     civil_from_days(serial.floor() as i64 - UNIX_EPOCH_SERIAL)
 }
 
-/// Parse ISO-like dates typed as text: 2026-10-08, 2026/10/08, 08/10/2026 (d/m/y).
-pub fn parse_date_text(s: &str) -> Option<f64> {
-    let s = s.trim();
-    let parts: Vec<&str> = s.split(['-', '/', '.']).collect();
-    if parts.len() != 3 {
+/// Monday = 0 … Sunday = 6
+fn weekday_mon0(serial: f64) -> i64 {
+    (serial.floor() as i64 - UNIX_EPOCH_SERIAL + 3).rem_euclid(7)
+}
+
+const MONTHS_EN: [&str; 12] = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+const MONTHS_PT: [&str; 12] = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"];
+
+fn month_from_name(s: &str) -> Option<i64> {
+    let l = s.trim_matches('.').to_lowercase();
+    if l.chars().count() < 3 {
         return None;
     }
-    let nums: Option<Vec<i64>> = parts.iter().map(|p| p.trim().parse::<i64>().ok()).collect();
-    let nums = nums?;
-    let (y, m, d) = if parts[0].len() == 4 {
-        (nums[0], nums[1], nums[2])
-    } else if parts[2].len() == 4 {
-        (nums[2], nums[1], nums[0])
-    } else {
+    let key: String = l.chars().take(3).collect();
+    let key = key.as_str();
+    // full names must start with the abbreviation and be plausible month names
+    let idx = MONTHS_EN.iter().position(|m| *m == key).or_else(|| MONTHS_PT.iter().position(|m| *m == key))?;
+    Some(idx as i64 + 1)
+}
+
+/// Parse a time-of-day part ("14:30", "14:30:15", "2:05 pm") into a fraction of a day.
+fn parse_time_part(s: &str) -> Option<(f64, bool)> {
+    let mut s = s.trim().to_lowercase();
+    let mut pm: Option<bool> = None;
+    if let Some(rest) = s.strip_suffix("pm") {
+        pm = Some(true);
+        s = rest.trim().to_string();
+    } else if let Some(rest) = s.strip_suffix("am") {
+        pm = Some(false);
+        s = rest.trim().to_string();
+    }
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
         return None;
+    }
+    let h: f64 = parts[0].trim().parse().ok()?;
+    let m: f64 = parts[1].trim().parse().ok()?;
+    let sec: f64 = if parts.len() == 3 { parts[2].trim().parse().ok()? } else { 0.0 };
+    if !(0.0..24.0).contains(&h) || !(0.0..60.0).contains(&m) || !(0.0..60.0).contains(&sec) {
+        return None;
+    }
+    let h = match pm {
+        Some(true) if h < 12.0 => h + 12.0,
+        Some(false) if h == 12.0 => 0.0,
+        _ => h,
     };
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    Some(((h * 3600.0 + m * 60.0 + sec) / 86400.0, parts.len() == 3))
+}
+
+/// Parse dates and date-times typed as text. Returns the serial and the number
+/// format that reproduces what was typed. Accepts 2026-10-08, 2026/10/08,
+/// 08/10/2026, 08-10-2026, 08.10.2026 (day first), "8 Oct 2026", "Oct 8, 2026",
+/// "8 de Outubro de 2026", optionally followed by a time ("14:30", "T14:30:00"), and bare times.
+pub fn parse_date_time_text(s: &str) -> Option<(f64, &'static str)> {
+    let s = s.trim();
+    if s.is_empty() || s.len() > 40 {
         return None;
     }
-    Some(serial_from_ymd(y, m, d))
+    // bare time
+    if let Some((frac, with_secs)) = parse_time_part(s) {
+        return Some((frac, if with_secs { "hh:mm:ss" } else { "hh:mm" }));
+    }
+    // split off a time part: "2026-10-08 14:30", "2026-10-08T14:30:00", "8 Oct 2026 14:30"
+    let (date_part, time_part): (&str, Option<&str>) = if let Some(idx) = s.find('T').filter(|i| *i >= 8 && s[..*i].chars().all(|c| c.is_ascii_digit() || c == '-' || c == '/')) {
+        (&s[..idx], Some(&s[idx + 1..]))
+    } else {
+        // last whitespace-separated token containing ':' (possibly followed by am/pm)
+        let tokens: Vec<&str> = s.split_whitespace().collect();
+        let mut split_at: Option<usize> = None;
+        for (i, tok) in tokens.iter().enumerate() {
+            if tok.contains(':') {
+                split_at = Some(i);
+                break;
+            }
+        }
+        match split_at {
+            Some(i) if i > 0 => (&s[..s.find(tokens[i]).unwrap()], Some(s[s.find(tokens[i]).unwrap()..].trim())),
+            _ => (s, None),
+        }
+    };
+    let (serial, fmt) = parse_date_only(date_part.trim())?;
+    match time_part {
+        None => Some((serial, fmt)),
+        Some(tp) => {
+            let (frac, with_secs) = parse_time_part(tp)?;
+            let f: &'static str = match (fmt, with_secs) {
+                ("yyyy-mm-dd", false) => "yyyy-mm-dd hh:mm",
+                ("yyyy-mm-dd", true) => "yyyy-mm-dd hh:mm:ss",
+                ("dd/mm/yyyy", false) => "dd/mm/yyyy hh:mm",
+                ("dd/mm/yyyy", true) => "dd/mm/yyyy hh:mm:ss",
+                (_, false) => "d mmm yyyy hh:mm",
+                (_, true) => "d mmm yyyy hh:mm:ss",
+            };
+            Some((serial + frac, f))
+        }
+    }
+}
+
+fn parse_date_only(s: &str) -> Option<(f64, &'static str)> {
+    if s.is_empty() {
+        return None;
+    }
+    // numeric forms with - / .
+    let seps: Vec<char> = s.chars().filter(|c| *c == '-' || *c == '/' || *c == '.').collect();
+    if seps.len() == 2 && seps[0] == seps[1] {
+        let parts: Vec<&str> = s.split(seps[0]).map(|p| p.trim()).collect();
+        if parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())) {
+            let nums: Vec<i64> = parts.iter().map(|p| p.parse::<i64>().unwrap()).collect();
+            let (y, m, d, fmt): (i64, i64, i64, &'static str) = if parts[0].len() == 4 {
+                (nums[0], nums[1], nums[2], if seps[0] == '/' { "yyyy/mm/dd" } else { "yyyy-mm-dd" })
+            } else if parts[2].len() == 4 {
+                (nums[2], nums[1], nums[0], if seps[0] == '/' { "dd/mm/yyyy" } else if seps[0] == '.' { "dd.mm.yyyy" } else { "dd-mm-yyyy" })
+            } else if parts[2].len() == 2 && seps[0] == '/' {
+                (2000 + nums[2], nums[1], nums[0], "dd/mm/yy")
+            } else {
+                return None;
+            };
+            if !(1..=12).contains(&m) || !(1..=31).contains(&d) || !(1900..=2200).contains(&y) {
+                return None;
+            }
+            if d > days_in_month(y, m) {
+                return None;
+            }
+            return Some((serial_from_ymd(y, m, d), fmt));
+        }
+        return None;
+    }
+    // textual month forms: "8 Oct 2026", "Oct 8, 2026", "8 de Outubro de 2026", "October 8 2026"
+    let cleaned = s.replace(',', " ");
+    let tokens: Vec<&str> = cleaned.split_whitespace().filter(|t| !t.eq_ignore_ascii_case("de")).collect();
+    if tokens.len() == 3 {
+        let (a, bb, c) = (tokens[0], tokens[1], tokens[2]);
+        let year: i64 = c.parse().ok()?;
+        if !(1900..=2200).contains(&year) {
+            return None;
+        }
+        let (d, m) = if let Ok(d) = a.parse::<i64>() {
+            (d, month_from_name(bb)?)
+        } else if let Ok(d) = bb.parse::<i64>() {
+            (d, month_from_name(a)?)
+        } else {
+            return None;
+        };
+        if !(1..=31).contains(&d) || d > days_in_month(year, m) {
+            return None;
+        }
+        return Some((serial_from_ymd(year, m, d), "d mmm yyyy"));
+    }
+    None
+}
+
+fn days_in_month(y: i64, m: i64) -> i64 {
+    (serial_from_ymd(y, m + 1, 1) - serial_from_ymd(y, m, 1)) as i64
 }
 
 fn date_arg(v: &Value) -> Result<f64, ErrorKind> {
     match v {
-        Value::Text(s) => parse_date_text(s).ok_or(ErrorKind::Value),
+        Value::Text(s) => parse_date_time_text(s).map(|x| x.0).ok_or(ErrorKind::Value),
         other => to_number(other),
     }
 }
@@ -408,11 +675,18 @@ fn matches_criteria(v: &Value, c: &Criteria) -> bool {
 // ---------------------------------------------------------------------------
 
 pub fn eval(e: &Expr, ctx: &Ctx) -> Arg {
+    eval_depth(e, ctx, 0)
+}
+
+fn eval_depth(e: &Expr, ctx: &Ctx, depth: u32) -> Arg {
+    if depth > 64 {
+        return Arg::err(ErrorKind::Cycle);
+    }
     match e {
         Expr::Num(x) => n(*x),
         Expr::Str(s) => t(s.clone()),
         Expr::Bool(x) => b(*x),
-        Expr::Ref(r) => match resolve_ref(r, ctx.wb, ctx.table) {
+        Expr::Ref(r) => match resolve_ref_at(r, ctx.wb, ctx.table, ctx.at) {
             Ok(rect) => {
                 if rect.r0 == rect.r1 && rect.c0 == rect.c1 {
                     Arg::Scalar(ctx.wb.value(crate::model::CellRef::new(rect.table, rect.r0, rect.c0)))
@@ -422,20 +696,29 @@ pub fn eval(e: &Expr, ctx: &Ctx) -> Arg {
             }
             Err(k) => Arg::err(k),
         },
-        Expr::Neg(x) => {
-            let v = eval(x, ctx).scalar();
+        Expr::Name(name) => match ctx.wb.named_range(name) {
+            Some(nr) => match super::parser::parse(&nr.reference) {
+                Ok(parsed) => eval_depth(&parsed, ctx, depth + 1),
+                Err(_) => Arg::err(ErrorKind::Name),
+            },
+            None => Arg::err(ErrorKind::Name),
+        },
+        Expr::Neg(x) => lift1(eval_depth(x, ctx, depth), |v| {
             let x = try_num!(v);
             n(-x)
-        }
-        Expr::Percent(x) => {
-            let v = eval(x, ctx).scalar();
+        }),
+        Expr::Percent(x) => lift1(eval_depth(x, ctx, depth), |v| {
             let x = try_num!(v);
             n(x / 100.0)
-        }
+        }),
         Expr::Binary(op, l, r) => {
-            let lv = eval(l, ctx).scalar();
-            let rv = eval(r, ctx).scalar();
-            binary(*op, lv, rv)
+            let lv = eval_depth(l, ctx, depth);
+            let rv = eval_depth(r, ctx, depth);
+            if lv.is_multi() || rv.is_multi() {
+                broadcast2(&lv, &rv, |a, bb| binary(*op, a, bb))
+            } else {
+                binary(*op, lv.scalar(), rv.scalar())
+            }
         }
         Expr::Array(rows) => {
             let nrows = rows.len() as u32;
@@ -443,7 +726,7 @@ pub fn eval(e: &Expr, ctx: &Ctx) -> Arg {
             let mut data = Vec::new();
             for r in rows {
                 for c in 0..ncols as usize {
-                    data.push(r.get(c).map(|x| eval(x, ctx).scalar()).unwrap_or(Value::Empty));
+                    data.push(r.get(c).map(|x| eval_depth(x, ctx, depth).scalar()).unwrap_or(Value::Empty));
                 }
             }
             Arg::Array(Array {
@@ -452,9 +735,60 @@ pub fn eval(e: &Expr, ctx: &Ctx) -> Arg {
                 data,
             })
         }
-        Expr::Call(name, args) => call(name, args, ctx),
+        Expr::Call(name, args) => call(name, args, ctx, depth),
         Expr::ErrorLit(e) => Arg::err(crate::model::error_from_str(e)),
     }
+}
+
+fn lift1(a: Arg, f: impl Fn(Value) -> Arg) -> Arg {
+    match a {
+        Arg::Array(arr) if arr.rows * arr.cols != 1 => {
+            let data = arr.data.into_iter().map(|v| f(v).scalar()).collect();
+            Arg::Array(Array {
+                rows: arr.rows,
+                cols: arr.cols,
+                data,
+            })
+        }
+        other => f(other.scalar()),
+    }
+}
+
+fn broadcast2(l: &Arg, r: &Arg, f: impl Fn(Value, Value) -> Arg) -> Arg {
+    let (lr, lc) = l.shape();
+    let (rr, rc) = r.shape();
+    let rows = lr.max(rr);
+    let cols = lc.max(rc);
+    let mut data = Vec::with_capacity((rows * cols) as usize);
+    for i in 0..rows {
+        for j in 0..cols {
+            data.push(f(l.at_broadcast(i, j), r.at_broadcast(i, j)).scalar());
+        }
+    }
+    Arg::Array(Array { rows, cols, data }).normalise()
+}
+
+/// Apply a scalar function element-wise over array arguments (broadcasting).
+fn broadcast_n(args: &[Arg], f: impl Fn(&[Value]) -> Arg) -> Arg {
+    let mut rows = 1;
+    let mut cols = 1;
+    for a in args {
+        let (r, c) = a.shape();
+        rows = rows.max(r);
+        cols = cols.max(c);
+    }
+    let mut data = Vec::with_capacity((rows * cols) as usize);
+    let mut scalars = Vec::with_capacity(args.len());
+    for i in 0..rows {
+        for j in 0..cols {
+            scalars.clear();
+            for a in args {
+                scalars.push(a.at_broadcast(i, j));
+            }
+            data.push(f(&scalars).scalar());
+        }
+    }
+    Arg::Array(Array { rows, cols, data }).normalise()
 }
 
 fn binary(op: BinOp, l: Value, r: Value) -> Arg {
@@ -526,92 +860,184 @@ fn round_to(x: f64, digits: f64, mode: i8) -> f64 {
     }
 }
 
-fn call(name: &str, raw_args: &[Expr], ctx: &Ctx) -> Arg {
+/// Scalar functions that are applied element-wise when given arrays.
+const LIFTED: &[&str] = &[
+    "ABS", "SQRT", "EXP", "LN", "LOG", "LOG10", "POWER", "MOD", "INT", "TRUNC", "ROUND", "ROUNDUP", "ROUNDDOWN", "CEILING", "FLOOR", "SIGN", "NOT",
+    "ISBLANK", "ISNUMBER", "ISTEXT", "ISLOGICAL", "ISERROR", "ISNA", "ISEVEN", "ISODD", "LEN", "UPPER", "LOWER", "PROPER", "TRIM", "LEFT", "RIGHT", "MID",
+    "FIND", "SEARCH", "SUBSTITUTE", "REPT", "VALUE", "TEXT", "EXACT", "N", "T", "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "WEEKDAY", "EDATE",
+    "EOMONTH", "DAYS", "DATE", "DATEVALUE", "TIME", "YEARFRAC", "DATEDIF", "WORKDAY", "EFFECT", "NOMINAL", "PMT", "PV", "FV", "NPER", "RATE", "IPMT", "PPMT",
+    "SLN", "SWITCH",
+];
+
+fn call(name: &str, raw_args: &[Expr], ctx: &Ctx, depth: u32) -> Arg {
+    let ev = |e: &Expr| eval_depth(e, ctx, depth);
     // lazy functions first
     match name {
         "IF" => {
             if raw_args.is_empty() {
                 return Arg::err(ErrorKind::Value);
             }
-            let cond = eval(&raw_args[0], ctx).scalar();
-            let c = try_bool!(cond);
+            let cond = ev(&raw_args[0]);
+            if cond.is_multi() {
+                let yes = raw_args.get(1).map(ev).unwrap_or(b(true));
+                let no = raw_args.get(2).map(ev).unwrap_or(b(false));
+                return broadcast_n(&[cond, yes, no], |v| {
+                    let c = try_bool!(v[0]);
+                    Arg::Scalar(if c { v[1].clone() } else { v[2].clone() })
+                });
+            }
+            let c = try_bool!(cond.scalar());
             return if c {
-                raw_args.get(1).map(|e| eval(e, ctx)).unwrap_or(b(true))
+                raw_args.get(1).map(ev).unwrap_or(b(true))
             } else {
-                raw_args.get(2).map(|e| eval(e, ctx)).unwrap_or(b(false))
+                raw_args.get(2).map(ev).unwrap_or(b(false))
             };
         }
         "IFS" => {
             let mut i = 0;
             while i + 1 < raw_args.len() {
-                let cond = eval(&raw_args[i], ctx).scalar();
+                let cond = ev(&raw_args[i]).scalar();
                 if try_bool!(cond) {
-                    return eval(&raw_args[i + 1], ctx);
+                    return ev(&raw_args[i + 1]);
                 }
                 i += 2;
             }
             return Arg::err(ErrorKind::NA);
         }
-        "IFERROR" => {
-            let v = raw_args.first().map(|e| eval(e, ctx)).unwrap_or(Arg::Scalar(Value::Empty));
-            return match &v {
-                Arg::Scalar(Value::Error(_)) => raw_args.get(1).map(|e| eval(e, ctx)).unwrap_or(t(String::new())),
-                _ => v,
+        "IFERROR" | "IFNA" => {
+            let v = raw_args.first().map(ev).unwrap_or(Arg::Scalar(Value::Empty));
+            let is_hit = |x: &Value| match x {
+                Value::Error(ErrorKind::NA) => true,
+                Value::Error(_) => name == "IFERROR",
+                _ => false,
             };
-        }
-        "IFNA" => {
-            let v = raw_args.first().map(|e| eval(e, ctx)).unwrap_or(Arg::Scalar(Value::Empty));
             return match &v {
-                Arg::Scalar(Value::Error(ErrorKind::NA)) => {
-                    raw_args.get(1).map(|e| eval(e, ctx)).unwrap_or(t(String::new()))
+                Arg::Scalar(x) if is_hit(x) => raw_args.get(1).map(ev).unwrap_or(t(String::new())),
+                Arg::Scalar(_) => v,
+                Arg::Array(a) => {
+                    if !a.data.iter().any(is_hit) {
+                        return v;
+                    }
+                    let alt = raw_args.get(1).map(ev).unwrap_or(t(String::new()));
+                    broadcast_n(&[v.clone(), alt], |x| Arg::Scalar(if is_hit(&x[0]) { x[1].clone() } else { x[0].clone() }))
                 }
-                _ => v,
             };
         }
         "CHOOSE" => {
-            let idx = eval(raw_args.first().unwrap_or(&Expr::Num(0.0)), ctx).scalar();
+            let idx = ev(raw_args.first().unwrap_or(&Expr::Num(0.0))).scalar();
             let i = try_num!(idx) as usize;
             return match raw_args.get(i) {
-                Some(e) if i >= 1 => eval(e, ctx),
+                Some(e) if i >= 1 => ev(e),
                 _ => Arg::err(ErrorKind::Value),
             };
+        }
+        "ROW" | "COLUMN" => {
+            return match (raw_args.first(), ctx.at) {
+                (Some(Expr::Ref(r)), _) => match resolve_ref_at(r, ctx.wb, ctx.table, ctx.at) {
+                    Ok(rect) => n((if name == "ROW" { rect.r0 } else { rect.c0 } + 1) as f64),
+                    Err(e) => Arg::err(e),
+                },
+                (Some(_), _) => Arg::err(ErrorKind::Value),
+                (None, Some(at)) => n((if name == "ROW" { at.row } else { at.col } + 1) as f64),
+                _ => Arg::err(ErrorKind::Value),
+            };
+        }
+        "SUBTOTAL" => {
+            // SUBTOTAL(function_num, range...) — 101..111 ignore rows hidden by filters
+            if raw_args.len() < 2 {
+                return Arg::err(ErrorKind::Value);
+            }
+            let code = try_num!(ev(&raw_args[0]).scalar()) as i64;
+            let skip_hidden = code > 100;
+            let base = if skip_hidden { code - 100 } else { code };
+            let mut vals: Vec<Value> = vec![];
+            for e in &raw_args[1..] {
+                match e {
+                    Expr::Ref(r) => match resolve_ref_at(r, ctx.wb, ctx.table, ctx.at) {
+                        Ok(rect) => {
+                            let table = ctx.wb.table(rect.table).unwrap();
+                            for rr in rect.r0..=rect.r1 {
+                                if skip_hidden && table.is_row_hidden(rr) {
+                                    continue;
+                                }
+                                for cc in rect.c0..=rect.c1 {
+                                    vals.push(table.value_at(CellKey::new(rr, cc)));
+                                }
+                            }
+                        }
+                        Err(k) => return Arg::err(k),
+                    },
+                    other => vals.extend(ev(other).values()),
+                }
+            }
+            let arr = Arg::Array(Array {
+                rows: vals.len() as u32,
+                cols: 1,
+                data: vals,
+            });
+            let fname = match base {
+                1 => "AVERAGE",
+                2 => "COUNT",
+                3 => "COUNTA",
+                4 => "MAX",
+                5 => "MIN",
+                6 => "PRODUCT",
+                7 => "STDEV",
+                8 => "STDEVP",
+                9 => "SUM",
+                10 => "VAR",
+                11 => "VARP",
+                _ => return Arg::err(ErrorKind::Value),
+            };
+            return call_eager(fname, &[arr], ctx);
         }
         _ => {}
     }
 
-    let args: Vec<Arg> = raw_args.iter().map(|e| eval(e, ctx)).collect();
-    let a = |i: usize| arg_at(&args, i);
+    let args: Vec<Arg> = raw_args.iter().map(ev).collect();
+    if LIFTED.contains(&name) && args.iter().any(|a| a.is_multi()) {
+        return broadcast_n(&args, |vals| {
+            let scalars: Vec<Arg> = vals.iter().map(|v| Arg::Scalar(v.clone())).collect();
+            call_eager(name, &scalars, ctx)
+        });
+    }
+    call_eager(name, &args, ctx)
+}
+
+fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
+    let a = |i: usize| arg_at(args, i);
+    let empty_arr = || Array::empty();
 
     match name {
         // ---------------- math & aggregates ----------------
-        "SUM" => match numbers(&args) {
+        "SUM" => match numbers(args) {
             Ok(v) => n(v.iter().sum()),
             Err(e) => Arg::err(e),
         },
-        "PRODUCT" => match numbers(&args) {
+        "PRODUCT" => match numbers(args) {
             Ok(v) => n(v.iter().product()),
             Err(e) => Arg::err(e),
         },
-        "AVERAGE" => match numbers(&args) {
+        "AVERAGE" => match numbers(args) {
             Ok(v) if !v.is_empty() => n(v.iter().sum::<f64>() / v.len() as f64),
             Ok(_) => Arg::err(ErrorKind::Div0),
             Err(e) => Arg::err(e),
         },
-        "MIN" => match numbers(&args) {
+        "MIN" => match numbers(args) {
             Ok(v) => n(v.iter().cloned().fold(f64::INFINITY, f64::min).min(if v.is_empty() { 0.0 } else { f64::INFINITY })),
             Err(e) => Arg::err(e),
         },
-        "MAX" => match numbers(&args) {
+        "MAX" => match numbers(args) {
             Ok(v) => n(v.iter().cloned().fold(f64::NEG_INFINITY, f64::max).max(if v.is_empty() { 0.0 } else { f64::NEG_INFINITY })),
             Err(e) => Arg::err(e),
         },
-        "COUNT" => match numbers(&args) {
+        "COUNT" => match numbers(args) {
             Ok(v) => n(v.len() as f64),
             Err(_) => n(0.0),
         },
         "COUNTA" => n(args.iter().flat_map(|a| a.values()).filter(|v| !v.is_empty()).count() as f64),
         "COUNTBLANK" => n(args.iter().flat_map(|a| a.values()).filter(|v| v.is_empty()).count() as f64),
-        "MEDIAN" => match numbers(&args) {
+        "MEDIAN" => match numbers(args) {
             Ok(mut v) if !v.is_empty() => {
                 v.sort_by(|x, y| x.partial_cmp(y).unwrap());
                 let m = v.len() / 2;
@@ -620,7 +1046,7 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx) -> Arg {
             Ok(_) => Arg::err(ErrorKind::Num),
             Err(e) => Arg::err(e),
         },
-        "STDEV" | "STDEV.S" | "VAR" | "VAR.S" | "STDEVP" | "STDEV.P" | "VARP" | "VAR.P" => match numbers(&args) {
+        "STDEV" | "STDEV.S" | "VAR" | "VAR.S" | "STDEVP" | "STDEV.P" | "VARP" | "VAR.P" => match numbers(args) {
             Ok(v) => {
                 let sample = !name.ends_with('P');
                 let k = v.len() as f64;
@@ -710,6 +1136,8 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx) -> Arg {
         }
         "PI" => n(std::f64::consts::PI),
         "SIGN" => n(try_num!(a(0)).signum() * if try_num!(a(0)) == 0.0 { 0.0 } else { 1.0 }),
+        "ISEVEN" => b((try_num!(a(0)).trunc() as i64) % 2 == 0),
+        "ISODD" => b((try_num!(a(0)).trunc() as i64) % 2 != 0),
         "SUMPRODUCT" => {
             if args.is_empty() {
                 return n(0.0);
@@ -739,7 +1167,7 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx) -> Arg {
                 return Arg::err(ErrorKind::Value);
             }
             let range = args[0].as_array();
-            let crit = parse_criteria(&arg_at(&args, 1));
+            let crit = parse_criteria(&arg_at(args, 1));
             let sum_range = if name != "COUNTIF" && args.len() > 2 {
                 Some(args[2].as_array())
             } else {
@@ -771,9 +1199,9 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx) -> Arg {
                 }
             }
         }
-        "SUMIFS" | "COUNTIFS" | "AVERAGEIFS" => {
+        "SUMIFS" | "COUNTIFS" | "AVERAGEIFS" | "MAXIFS" | "MINIFS" => {
             let (sum_range, rest) = if name == "COUNTIFS" {
-                (None, &args[..])
+                (None, args)
             } else {
                 if args.is_empty() {
                     return Arg::err(ErrorKind::Value);
@@ -790,12 +1218,18 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx) -> Arg {
             let len = pairs[0].0.data.len();
             let mut total = 0.0;
             let mut count = 0usize;
+            let mut best: Option<f64> = None;
             for i in 0..len {
                 if pairs.iter().all(|(arr, c)| arr.data.get(i).map(|v| matches_criteria(v, c)).unwrap_or(false)) {
                     count += 1;
                     if let Some(sr) = &sum_range {
                         if let Some(Value::Number(x)) = sr.data.get(i) {
                             total += x;
+                            best = Some(match (best, name) {
+                                (None, _) => *x,
+                                (Some(bb), "MAXIFS") => bb.max(*x),
+                                (Some(bb), _) => bb.min(*x),
+                            });
                         }
                     }
                 }
@@ -803,6 +1237,7 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx) -> Arg {
             match name {
                 "SUMIFS" => n(total),
                 "COUNTIFS" => n(count as f64),
+                "MAXIFS" | "MINIFS" => n(best.unwrap_or(0.0)),
                 _ => {
                     if count == 0 {
                         Arg::err(ErrorKind::Div0)
@@ -853,6 +1288,25 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx) -> Arg {
         "ISERROR" => b(matches!(a(0), Value::Error(_))),
         "ISNA" => b(matches!(a(0), Value::Error(ErrorKind::NA))),
         "NA" => Arg::err(ErrorKind::NA),
+        "SWITCH" => {
+            if args.len() < 3 {
+                return Arg::err(ErrorKind::Value);
+            }
+            let x = a(0);
+            let mut i = 1;
+            while i + 1 < args.len() {
+                let k = a(i);
+                if compare(&x, &k) == std::cmp::Ordering::Equal && same_type(&x, &k) {
+                    return Arg::Scalar(a(i + 1));
+                }
+                i += 2;
+            }
+            if args.len() % 2 == 0 {
+                Arg::Scalar(a(args.len() - 1))
+            } else {
+                Arg::err(ErrorKind::NA)
+            }
+        }
         // ---------------- text ----------------
         "LEN" => n(try_text!(a(0)).chars().count() as f64),
         "UPPER" => t(try_text!(a(0)).to_uppercase()),
@@ -935,7 +1389,7 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx) -> Arg {
         }
         "SUBSTITUTE" => t(try_text!(a(0)).replace(&try_text!(a(1)), &try_text!(a(2)))),
         "REPT" => t(try_text!(a(0)).repeat(try_num!(a(1)).max(0.0) as usize)),
-        "VALUE" => match crate::model::parse_number_literal(&try_text!(a(0))) {
+        "VALUE" => match crate::model::parse_number_literal(&try_text!(a(0))).or_else(|| parse_date_time_text(&a(0).to_display()).map(|x| x.0)) {
             Some(x) => n(x),
             None => Arg::err(ErrorKind::Value),
         },
@@ -973,7 +1427,7 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx) -> Arg {
                     } else if compare(kv, &key) == std::cmp::Ordering::Greater {
                         break;
                     }
-                } else if compare(kv, &key) == std::cmp::Ordering::Equal && std::mem::discriminant(kv) == std::mem::discriminant(&key) {
+                } else if compare(kv, &key) == std::cmp::Ordering::Equal && same_type(kv, &key) {
                     found = Some(i);
                     break;
                 }
@@ -987,18 +1441,47 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx) -> Arg {
             if args.len() < 3 {
                 return Arg::err(ErrorKind::Value);
             }
-            let key = a(0);
             let keys = args[1].as_array();
             let vals = args[2].as_array();
-            for (i, kv) in keys.data.iter().enumerate() {
-                if compare(kv, &key) == std::cmp::Ordering::Equal && std::mem::discriminant(kv) == std::mem::discriminant(&key) {
-                    return Arg::Scalar(vals.data.get(i).cloned().unwrap_or(Value::Empty));
+            let lookup = |key: &Value| -> Arg {
+                for (i, kv) in keys.data.iter().enumerate() {
+                    if compare(kv, key) == std::cmp::Ordering::Equal && same_type(kv, key) {
+                        // return the matching row (or column) of the return array
+                        if vals.rows == keys.rows && vals.cols > 1 && keys.cols == 1 {
+                            return Arg::Array(Array {
+                                rows: 1,
+                                cols: vals.cols,
+                                data: vals.row(i as u32),
+                            })
+                            .normalise();
+                        }
+                        if vals.cols == keys.cols && vals.rows > 1 && keys.rows == 1 {
+                            return Arg::Array(Array {
+                                rows: vals.rows,
+                                cols: 1,
+                                data: vals.column(i as u32),
+                            })
+                            .normalise();
+                        }
+                        return Arg::Scalar(vals.data.get(i).cloned().unwrap_or(Value::Empty));
+                    }
                 }
-            }
-            if args.len() > 3 {
-                Arg::Scalar(a(3))
-            } else {
-                Arg::err(ErrorKind::NA)
+                if args.len() > 3 {
+                    Arg::Scalar(a(3))
+                } else {
+                    Arg::err(ErrorKind::NA)
+                }
+            };
+            match &args[0] {
+                Arg::Array(ks) if ks.rows * ks.cols != 1 => {
+                    let data: Vec<Value> = ks.data.iter().map(|k| lookup(k).scalar()).collect();
+                    Arg::Array(Array {
+                        rows: ks.rows,
+                        cols: ks.cols,
+                        data,
+                    })
+                }
+                _ => lookup(&a(0)),
             }
         }
         "MATCH" => {
@@ -1012,7 +1495,7 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx) -> Arg {
             for (i, v) in arr.data.iter().enumerate() {
                 let ord = compare(v, &key);
                 if mode == 0.0 {
-                    if ord == std::cmp::Ordering::Equal && std::mem::discriminant(v) == std::mem::discriminant(&key) {
+                    if ord == std::cmp::Ordering::Equal && same_type(v, &key) {
                         found = Some(i);
                         break;
                     }
@@ -1050,37 +1533,32 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx) -> Arg {
             } else {
                 (r, c)
             };
+            // row or column 0 → whole column / row
+            if r == 0 && c >= 1 && c <= arr.cols {
+                return Arg::Array(Array {
+                    rows: arr.rows,
+                    cols: 1,
+                    data: arr.column(c - 1),
+                })
+                .normalise();
+            }
+            if c == 0 && r >= 1 && r <= arr.rows {
+                return Arg::Array(Array {
+                    rows: 1,
+                    cols: arr.cols,
+                    data: arr.row(r - 1),
+                })
+                .normalise();
+            }
             if r == 0 || c == 0 || r > arr.rows || c > arr.cols {
                 return Arg::err(ErrorKind::Ref);
             }
             Arg::Scalar(arr.get(r - 1, c - 1).clone())
         }
-        "ROW" => match (&args.first(), ctx.at) {
-            (Some(_), _) => match raw_args.first() {
-                Some(Expr::Ref(r)) => match resolve_ref(r, ctx.wb, ctx.table) {
-                    Ok(rect) => n((rect.r0 + 1) as f64),
-                    Err(e) => Arg::err(e),
-                },
-                _ => Arg::err(ErrorKind::Value),
-            },
-            (None, Some(at)) => n((at.row + 1) as f64),
-            _ => Arg::err(ErrorKind::Value),
-        },
-        "COLUMN" => match (&args.first(), ctx.at) {
-            (Some(_), _) => match raw_args.first() {
-                Some(Expr::Ref(r)) => match resolve_ref(r, ctx.wb, ctx.table) {
-                    Ok(rect) => n((rect.c0 + 1) as f64),
-                    Err(e) => Arg::err(e),
-                },
-                _ => Arg::err(ErrorKind::Value),
-            },
-            (None, Some(at)) => n((at.col + 1) as f64),
-            _ => Arg::err(ErrorKind::Value),
-        },
         "ROWS" => n(args.first().map(|x| x.as_array().rows).unwrap_or(0) as f64),
         "COLUMNS" => n(args.first().map(|x| x.as_array().cols).unwrap_or(0) as f64),
         "TRANSPOSE" => {
-            let arr = args.first().map(|x| x.as_array()).unwrap_or(Array { rows: 0, cols: 0, data: vec![] });
+            let arr = args.first().map(|x| x.as_array()).unwrap_or_else(empty_arr);
             let mut data = Vec::with_capacity(arr.data.len());
             for c in 0..arr.cols {
                 for r in 0..arr.rows {
@@ -1094,23 +1572,164 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx) -> Arg {
             })
         }
         "UNIQUE" => {
-            let arr = args.first().map(|x| x.as_array()).unwrap_or(Array { rows: 0, cols: 0, data: vec![] });
-            let mut seen: Vec<Value> = Vec::new();
-            for v in &arr.data {
-                if !seen.iter().any(|s| compare(s, v) == std::cmp::Ordering::Equal && std::mem::discriminant(s) == std::mem::discriminant(v)) {
-                    seen.push(v.clone());
+            let arr = args.first().map(|x| x.as_array()).unwrap_or_else(empty_arr);
+            let by_col = args.len() > 1 && try_bool!(a(1));
+            let exactly_once = args.len() > 2 && try_bool!(a(2));
+            let items: Vec<Vec<Value>> = if by_col { (0..arr.cols).map(|c| arr.column(c)).collect() } else { (0..arr.rows).map(|r| arr.row(r)).collect() };
+            let eq = |x: &Vec<Value>, y: &Vec<Value>| x.len() == y.len() && x.iter().zip(y).all(|(p, q)| compare(p, q) == std::cmp::Ordering::Equal && same_type(p, q));
+            let mut out: Vec<Vec<Value>> = vec![];
+            for it in &items {
+                if !out.iter().any(|o| eq(o, it)) {
+                    if exactly_once && items.iter().filter(|x| eq(x, it)).count() != 1 {
+                        continue;
+                    }
+                    out.push(it.clone());
                 }
             }
-            Arg::Array(Array {
-                rows: seen.len() as u32,
-                cols: 1,
-                data: seen,
-            })
+            if by_col {
+                let rows = arr.rows;
+                let cols = out.len() as u32;
+                let mut data = vec![];
+                for r in 0..rows as usize {
+                    for col in &out {
+                        data.push(col[r].clone());
+                    }
+                }
+                Arg::Array(Array { rows, cols, data })
+            } else {
+                Arg::Array(Array::from_rows(out))
+            }
+        }
+        "FILTER" => {
+            if args.len() < 2 {
+                return Arg::err(ErrorKind::Value);
+            }
+            let arr = args[0].as_array();
+            let inc = args[1].as_array();
+            let mut rows: Vec<Vec<Value>> = vec![];
+            if inc.rows == arr.rows && (inc.cols == 1 || inc.cols == arr.cols) {
+                for r in 0..arr.rows {
+                    let keep = match to_bool(inc.get(r, 0)) {
+                        Ok(x) => x,
+                        Err(e) => return Arg::err(e),
+                    };
+                    if keep {
+                        rows.push(arr.row(r));
+                    }
+                }
+            } else if inc.cols == arr.cols && inc.rows == 1 {
+                // column filter
+                let mut keep_cols = vec![];
+                for c in 0..arr.cols {
+                    if try_bool!(inc.get(0, c).clone()) {
+                        keep_cols.push(c);
+                    }
+                }
+                for r in 0..arr.rows {
+                    rows.push(keep_cols.iter().map(|c| arr.get(r, *c).clone()).collect());
+                }
+                if keep_cols.is_empty() {
+                    rows.clear();
+                }
+            } else {
+                return Arg::err(ErrorKind::Value);
+            }
+            if rows.is_empty() {
+                return if args.len() > 2 { args[2].clone() } else { Arg::err(ErrorKind::NA) };
+            }
+            Arg::Array(Array::from_rows(rows))
+        }
+        "SORT" => {
+            let arr = args.first().map(|x| x.as_array()).unwrap_or_else(empty_arr);
+            let idx = if args.len() > 1 { try_num!(a(1)) as usize } else { 1 };
+            let desc = args.len() > 2 && try_num!(a(2)) < 0.0;
+            let by_col = args.len() > 3 && try_bool!(a(3));
+            if idx == 0 {
+                return Arg::err(ErrorKind::Value);
+            }
+            if by_col {
+                if idx > arr.rows as usize {
+                    return Arg::err(ErrorKind::Value);
+                }
+                let mut cols: Vec<Vec<Value>> = (0..arr.cols).map(|c| arr.column(c)).collect();
+                cols.sort_by(|x, y| {
+                    let o = compare(&x[idx - 1], &y[idx - 1]);
+                    if desc {
+                        o.reverse()
+                    } else {
+                        o
+                    }
+                });
+                let mut data = vec![];
+                for r in 0..arr.rows as usize {
+                    for col in &cols {
+                        data.push(col[r].clone());
+                    }
+                }
+                return Arg::Array(Array {
+                    rows: arr.rows,
+                    cols: arr.cols,
+                    data,
+                });
+            }
+            if idx > arr.cols as usize {
+                return Arg::err(ErrorKind::Value);
+            }
+            let mut rows: Vec<Vec<Value>> = (0..arr.rows).map(|r| arr.row(r)).collect();
+            rows.sort_by(|x, y| {
+                let o = compare(&x[idx - 1], &y[idx - 1]);
+                if desc {
+                    o.reverse()
+                } else {
+                    o
+                }
+            });
+            Arg::Array(Array::from_rows(rows))
+        }
+        "SORTBY" => {
+            if args.len() < 2 {
+                return Arg::err(ErrorKind::Value);
+            }
+            let arr = args[0].as_array();
+            let mut keys: Vec<(Array, bool)> = vec![];
+            let mut i = 1;
+            while i < args.len() {
+                let k = args[i].as_array();
+                let desc = if i + 1 < args.len() { try_num!(a(i + 1)) < 0.0 } else { false };
+                if k.data.len() != arr.rows as usize {
+                    return Arg::err(ErrorKind::Value);
+                }
+                keys.push((k, desc));
+                i += 2;
+            }
+            let mut order: Vec<usize> = (0..arr.rows as usize).collect();
+            order.sort_by(|x, y| {
+                for (k, desc) in &keys {
+                    let o = compare(&k.data[*x], &k.data[*y]);
+                    if o != std::cmp::Ordering::Equal {
+                        return if *desc { o.reverse() } else { o };
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            Arg::Array(Array::from_rows(order.iter().map(|r| arr.row(*r as u32)).collect()))
+        }
+        "SEQUENCE" => {
+            let rows = try_num!(a(0)).max(0.0) as u32;
+            let cols = if args.len() > 1 { try_num!(a(1)).max(0.0) as u32 } else { 1 };
+            let start = if args.len() > 2 { try_num!(a(2)) } else { 1.0 };
+            let step = if args.len() > 3 { try_num!(a(3)) } else { 1.0 };
+            if rows * cols > 1_000_000 {
+                return Arg::err(ErrorKind::Num);
+            }
+            let data = (0..rows * cols).map(|i| Value::Number(start + step * i as f64)).collect();
+            Arg::Array(Array { rows, cols, data }).normalise()
         }
         // ---------------- dates ----------------
         "TODAY" => n(ctx.now.floor()),
         "NOW" => n(ctx.now),
         "DATE" => n(serial_from_ymd(try_num!(a(0)) as i64, try_num!(a(1)) as i64, try_num!(a(2)) as i64)),
+        "TIME" => n(((try_num!(a(0)) * 3600.0 + try_num!(a(1)) * 60.0 + try_num!(a(2))) / 86400.0).rem_euclid(1.0)),
         "YEAR" | "MONTH" | "DAY" => {
             let v = a(0);
             let s = match date_arg(&v) {
@@ -1124,8 +1743,20 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx) -> Arg {
                 _ => d,
             } as f64)
         }
-        "DATEVALUE" => match parse_date_text(&try_text!(a(0))) {
-            Some(s) => n(s),
+        "HOUR" | "MINUTE" | "SECOND" => {
+            let s = match date_arg(&a(0)) {
+                Ok(x) => x,
+                Err(e) => return Arg::err(e),
+            };
+            let secs = ((s - s.floor()) * 86400.0).round() as i64;
+            n(match name {
+                "HOUR" => secs / 3600,
+                "MINUTE" => (secs / 60) % 60,
+                _ => secs % 60,
+            } as f64)
+        }
+        "DATEVALUE" => match parse_date_time_text(&try_text!(a(0))) {
+            Some((s, _)) => n(s.floor()),
             None => Arg::err(ErrorKind::Value),
         },
         "EDATE" => {
@@ -1151,9 +1782,13 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx) -> Arg {
                 Ok(x) => x,
                 Err(e) => return Arg::err(e),
             };
-            // 1 = Sunday (Excel default)
-            let days = s.floor() as i64 - UNIX_EPOCH_SERIAL; // 1970-01-01 was a Thursday
-            n(((days + 4).rem_euclid(7) + 1) as f64)
+            let kind = if args.len() > 1 { try_num!(a(1)) as i64 } else { 1 };
+            let mon0 = weekday_mon0(s);
+            n(match kind {
+                2 => mon0 + 1,
+                3 => mon0,
+                _ => (mon0 + 1) % 7 + 1, // 1 = Sunday
+            } as f64)
         }
         "DAYS" => {
             let end = match date_arg(&a(0)) {
@@ -1165,6 +1800,220 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx) -> Arg {
                 Err(e) => return Arg::err(e),
             };
             n((end - start).floor())
+        }
+        "DATEDIF" => {
+            let start = match date_arg(&a(0)) {
+                Ok(x) => x,
+                Err(e) => return Arg::err(e),
+            };
+            let end = match date_arg(&a(1)) {
+                Ok(x) => x,
+                Err(e) => return Arg::err(e),
+            };
+            if end < start {
+                return Arg::err(ErrorKind::Num);
+            }
+            let unit = try_text!(a(2)).to_uppercase();
+            let (y0, m0, d0) = ymd_from_serial(start);
+            let (y1, m1, d1) = ymd_from_serial(end);
+            let mut months = (y1 - y0) * 12 + (m1 - m0);
+            if d1 < d0 {
+                months -= 1;
+            }
+            match unit.as_str() {
+                "D" => n((end.floor() - start.floor()) as f64),
+                "M" => n(months as f64),
+                "Y" => n((months / 12) as f64),
+                "YM" => n((months % 12) as f64),
+                "MD" => {
+                    let anchor = serial_from_ymd(y1, if d1 < d0 { m1 - 1 } else { m1 }, d0.min(28));
+                    n((end.floor() - anchor).max(0.0))
+                }
+                "YD" => {
+                    let anchor = serial_from_ymd(if (m1, d1) < (m0, d0) { y1 - 1 } else { y1 }, m0, d0);
+                    n(end.floor() - anchor)
+                }
+                _ => Arg::err(ErrorKind::Num),
+            }
+        }
+        "YEARFRAC" => {
+            let start = match date_arg(&a(0)) {
+                Ok(x) => x,
+                Err(e) => return Arg::err(e),
+            };
+            let end = match date_arg(&a(1)) {
+                Ok(x) => x,
+                Err(e) => return Arg::err(e),
+            };
+            let basis = if args.len() > 2 { try_num!(a(2)) as i64 } else { 0 };
+            let (s, e) = if start <= end { (start, end) } else { (end, start) };
+            match basis {
+                0 | 4 => {
+                    let (y0, m0, mut d0) = ymd_from_serial(s);
+                    let (y1, m1, mut d1) = ymd_from_serial(e);
+                    if basis == 0 {
+                        // US 30/360
+                        if d0 == 31 {
+                            d0 = 30;
+                        }
+                        if d1 == 31 && d0 >= 30 {
+                            d1 = 30;
+                        }
+                    } else {
+                        d0 = d0.min(30);
+                        d1 = d1.min(30);
+                    }
+                    n(((y1 - y0) * 360 + (m1 - m0) * 30 + (d1 - d0)) as f64 / 360.0)
+                }
+                1 => {
+                    let (y0, _, _) = ymd_from_serial(s);
+                    let (y1, _, _) = ymd_from_serial(e);
+                    let days = e.floor() - s.floor();
+                    let year_len = if y0 == y1 {
+                        serial_from_ymd(y0 + 1, 1, 1) - serial_from_ymd(y0, 1, 1)
+                    } else {
+                        (serial_from_ymd(y1 + 1, 1, 1) - serial_from_ymd(y0, 1, 1)) / (y1 - y0 + 1) as f64
+                    };
+                    n(days / year_len)
+                }
+                2 => n((e.floor() - s.floor()) / 360.0),
+                3 => n((e.floor() - s.floor()) / 365.0),
+                _ => Arg::err(ErrorKind::Num),
+            }
+        }
+        "NETWORKDAYS" => {
+            let start = match date_arg(&a(0)) {
+                Ok(x) => x.floor(),
+                Err(e) => return Arg::err(e),
+            };
+            let end = match date_arg(&a(1)) {
+                Ok(x) => x.floor(),
+                Err(e) => return Arg::err(e),
+            };
+            let holidays: Vec<f64> = args.get(2).map(|h| h.values().iter().filter_map(|v| to_number(v).ok().map(|x| x.floor())).collect()).unwrap_or_default();
+            let (s, e, sign) = if start <= end { (start, end, 1.0) } else { (end, start, -1.0) };
+            let mut count = 0;
+            let mut d = s;
+            while d <= e {
+                let wd = weekday_mon0(d);
+                if wd < 5 && !holidays.contains(&d) {
+                    count += 1;
+                }
+                d += 1.0;
+            }
+            n(count as f64 * sign)
+        }
+        "WORKDAY" => {
+            let start = match date_arg(&a(0)) {
+                Ok(x) => x.floor(),
+                Err(e) => return Arg::err(e),
+            };
+            let days = try_num!(a(1)) as i64;
+            let holidays: Vec<f64> = args.get(2).map(|h| h.values().iter().filter_map(|v| to_number(v).ok().map(|x| x.floor())).collect()).unwrap_or_default();
+            let step = if days >= 0 { 1.0 } else { -1.0 };
+            let mut left = days.abs();
+            let mut d = start;
+            while left > 0 {
+                d += step;
+                if weekday_mon0(d) < 5 && !holidays.contains(&d) {
+                    left -= 1;
+                }
+            }
+            n(d)
+        }
+        // ---------------- financial ----------------
+        "NPV" => {
+            let rate = try_num!(a(0));
+            let mut total = 0.0;
+            let mut i = 1;
+            for arg in &args[1.min(args.len())..] {
+                let flows = match cash_flows(arg) {
+                    Ok(f) => f,
+                    Err(e) => return Arg::err(e),
+                };
+                for f in flows {
+                    total += f / (1.0 + rate).powi(i);
+                    i += 1;
+                }
+            }
+            n(total)
+        }
+        "IRR" => {
+            let flows = match args.first().map(cash_flows).unwrap_or(Ok(vec![])) {
+                Ok(f) => f,
+                Err(e) => return Arg::err(e),
+            };
+            let guess = if args.len() > 1 { try_num!(a(1)) } else { 0.1 };
+            match irr(&flows, guess) {
+                Some(r) => n(r),
+                None => Arg::err(ErrorKind::Num),
+            }
+        }
+        "XNPV" => {
+            let rate = try_num!(a(0));
+            let flows = args.get(1).map(|x| x.values()).unwrap_or_default();
+            let dates = args.get(2).map(|x| x.values()).unwrap_or_default();
+            if flows.len() != dates.len() || flows.is_empty() {
+                return Arg::err(ErrorKind::Num);
+            }
+            let d0 = match date_arg(&dates[0]) {
+                Ok(x) => x,
+                Err(e) => return Arg::err(e),
+            };
+            let mut total = 0.0;
+            for (f, d) in flows.iter().zip(dates.iter()) {
+                let fv = try_num!(f);
+                let dv = match date_arg(d) {
+                    Ok(x) => x,
+                    Err(e) => return Arg::err(e),
+                };
+                total += fv / (1.0 + rate).powf((dv - d0) / 365.0);
+            }
+            n(total)
+        }
+        "XIRR" => {
+            let flows: Vec<f64> = match args.first().map(|x| x.values().iter().map(to_number).collect::<Result<Vec<_>, _>>()).unwrap_or(Ok(vec![])) {
+                Ok(f) => f,
+                Err(e) => return Arg::err(e),
+            };
+            let dates: Vec<f64> = match args.get(1).map(|x| x.values().iter().map(date_arg).collect::<Result<Vec<_>, _>>()).unwrap_or(Ok(vec![])) {
+                Ok(f) => f,
+                Err(e) => return Arg::err(e),
+            };
+            if flows.len() != dates.len() || flows.len() < 2 {
+                return Arg::err(ErrorKind::Num);
+            }
+            let guess = if args.len() > 2 { try_num!(a(2)) } else { 0.1 };
+            let d0 = dates[0];
+            let f = |r: f64| flows.iter().zip(dates.iter()).map(|(cf, d)| cf / (1.0 + r).powf((d - d0) / 365.0)).sum::<f64>();
+            match newton(f, guess) {
+                Some(r) => n(r),
+                None => Arg::err(ErrorKind::Num),
+            }
+        }
+        "PMT" | "IPMT" | "PPMT" | "PV" | "FV" | "NPER" | "RATE" => annuity(name, args),
+        "SLN" => {
+            let life = try_num!(a(2));
+            if life == 0.0 {
+                return Arg::err(ErrorKind::Div0);
+            }
+            n((try_num!(a(0)) - try_num!(a(1))) / life)
+        }
+        "EFFECT" => {
+            let r = try_num!(a(0));
+            let m = try_num!(a(1)).floor();
+            if m < 1.0 || r <= 0.0 {
+                return Arg::err(ErrorKind::Num);
+            }
+            n((1.0 + r / m).powf(m) - 1.0)
+        }
+        "NOMINAL" => {
+            let r = try_num!(a(0));
+            let m = try_num!(a(1)).floor();
+            if m < 1.0 || r <= 0.0 {
+                return Arg::err(ErrorKind::Num);
+            }
+            n(m * ((1.0 + r).powf(1.0 / m) - 1.0))
         }
         // ---------------- misc ----------------
         "N" => match a(0) {
@@ -1178,9 +2027,9 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx) -> Arg {
             Value::Error(e) => Arg::err(e),
             _ => t(String::new()),
         },
-        "RANK" => {
+        "RANK" | "RANK.EQ" => {
             let x = try_num!(a(0));
-            let arr = args.get(1).map(|v| v.as_array()).unwrap_or(Array { rows: 0, cols: 0, data: vec![] });
+            let arr = args.get(1).map(|v| v.as_array()).unwrap_or_else(empty_arr);
             let asc = args.len() > 2 && try_bool!(a(2));
             let nums: Vec<f64> = arr.data.iter().filter_map(|v| if let Value::Number(y) = v { Some(*y) } else { None }).collect();
             if !nums.contains(&x) {
@@ -1190,7 +2039,7 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx) -> Arg {
             n(rank as f64)
         }
         "LARGE" | "SMALL" => {
-            let arr = args.first().map(|v| v.as_array()).unwrap_or(Array { rows: 0, cols: 0, data: vec![] });
+            let arr = args.first().map(|v| v.as_array()).unwrap_or_else(empty_arr);
             let k = try_num!(a(1)) as usize;
             let mut nums: Vec<f64> = arr.data.iter().filter_map(|v| if let Value::Number(y) = v { Some(*y) } else { None }).collect();
             if k == 0 || k > nums.len() {
@@ -1203,17 +2052,283 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx) -> Arg {
     }
 }
 
-/// Minimal TEXT() formats: 0, 0.00, #,##0, #,##0.00, 0%, 0.0%, yyyy-mm-dd, dd/mm/yyyy.
+/// Newton–Raphson root finding with numeric derivative; falls back to bisection on [-0.99, 10].
+fn newton(f: impl Fn(f64) -> f64, guess: f64) -> Option<f64> {
+    let mut r = guess;
+    for _ in 0..100 {
+        let y = f(r);
+        if y.abs() < 1e-9 {
+            return Some(r);
+        }
+        let h = 1e-6;
+        let dy = (f(r + h) - f(r - h)) / (2.0 * h);
+        if dy == 0.0 || !dy.is_finite() {
+            break;
+        }
+        let next = r - y / dy;
+        if !next.is_finite() || next <= -1.0 {
+            break;
+        }
+        if (next - r).abs() < 1e-12 {
+            return Some(next);
+        }
+        r = next;
+    }
+    // bisection
+    let (mut lo, mut hi) = (-0.99, 10.0);
+    let (flo, fhi) = (f(lo), f(hi));
+    if flo.is_nan() || fhi.is_nan() || flo.signum() == fhi.signum() {
+        return None;
+    }
+    for _ in 0..200 {
+        let mid = (lo + hi) / 2.0;
+        let fm = f(mid);
+        if fm.abs() < 1e-10 {
+            return Some(mid);
+        }
+        if fm.signum() == flo.signum() {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Some((lo + hi) / 2.0)
+}
+
+fn irr(flows: &[f64], guess: f64) -> Option<f64> {
+    if flows.len() < 2 {
+        return None;
+    }
+    let f = |r: f64| flows.iter().enumerate().map(|(i, cf)| cf / (1.0 + r).powi(i as i32)).sum::<f64>();
+    newton(f, guess)
+}
+
+/// Excel's annuity family: PMT, IPMT, PPMT, PV, FV, NPER, RATE (type 0 = end of period, 1 = beginning).
+fn annuity(name: &str, args: &[Arg]) -> Arg {
+    let a = |i: usize| arg_at(args, i);
+    let num = |i: usize, default: f64| -> Result<f64, ErrorKind> {
+        match args.get(i) {
+            None => Ok(default),
+            Some(x) => {
+                let v = x.clone().scalar();
+                if v.is_empty() {
+                    Ok(default)
+                } else {
+                    to_number(&v)
+                }
+            }
+        }
+    };
+    macro_rules! g {
+        ($e:expr) => {
+            match $e {
+                Ok(x) => x,
+                Err(e) => return Arg::err(e),
+            }
+        };
+    }
+    // payment given rate, nper, pv, fv, type
+    let pmt_of = |rate: f64, nper: f64, pv: f64, fv: f64, kind: f64| -> f64 {
+        if rate == 0.0 {
+            return -(pv + fv) / nper;
+        }
+        let k = (1.0 + rate).powf(nper);
+        -(pv * k + fv) * rate / ((1.0 + rate * kind) * (k - 1.0))
+    };
+    match name {
+        "PMT" => {
+            let (rate, nper, pv) = (try_num!(a(0)), try_num!(a(1)), try_num!(a(2)));
+            if nper == 0.0 {
+                return Arg::err(ErrorKind::Num);
+            }
+            n(pmt_of(rate, nper, pv, g!(num(3, 0.0)), g!(num(4, 0.0))))
+        }
+        "IPMT" | "PPMT" => {
+            let (rate, per, nper, pv) = (try_num!(a(0)), try_num!(a(1)), try_num!(a(2)), try_num!(a(3)));
+            let fv = g!(num(4, 0.0));
+            let kind = g!(num(5, 0.0));
+            if per < 1.0 || per > nper || nper == 0.0 {
+                return Arg::err(ErrorKind::Num);
+            }
+            let pmt = pmt_of(rate, nper, pv, fv, kind);
+            // balance before period `per`
+            let mut ipmt;
+            if rate == 0.0 {
+                ipmt = 0.0;
+            } else {
+                let k = (1.0 + rate).powf(per - 1.0);
+                let balance = pv * k + pmt * (1.0 + rate * kind) * (k - 1.0) / rate;
+                ipmt = -balance * rate;
+                if kind == 1.0 {
+                    ipmt = if per == 1.0 { 0.0 } else { ipmt / (1.0 + rate) };
+                }
+            }
+            if name == "IPMT" {
+                n(ipmt)
+            } else {
+                n(pmt - ipmt)
+            }
+        }
+        "PV" => {
+            let (rate, nper, pmt) = (try_num!(a(0)), try_num!(a(1)), try_num!(a(2)));
+            let fv = g!(num(3, 0.0));
+            let kind = g!(num(4, 0.0));
+            if rate == 0.0 {
+                return n(-(fv + pmt * nper));
+            }
+            let k = (1.0 + rate).powf(nper);
+            n(-(fv + pmt * (1.0 + rate * kind) * (k - 1.0) / rate) / k)
+        }
+        "FV" => {
+            let (rate, nper, pmt) = (try_num!(a(0)), try_num!(a(1)), try_num!(a(2)));
+            let pv = g!(num(3, 0.0));
+            let kind = g!(num(4, 0.0));
+            if rate == 0.0 {
+                return n(-(pv + pmt * nper));
+            }
+            let k = (1.0 + rate).powf(nper);
+            n(-(pv * k + pmt * (1.0 + rate * kind) * (k - 1.0) / rate))
+        }
+        "NPER" => {
+            let (rate, pmt, pv) = (try_num!(a(0)), try_num!(a(1)), try_num!(a(2)));
+            let fv = g!(num(3, 0.0));
+            let kind = g!(num(4, 0.0));
+            if rate == 0.0 {
+                if pmt == 0.0 {
+                    return Arg::err(ErrorKind::Num);
+                }
+                return n(-(pv + fv) / pmt);
+            }
+            let x = pmt * (1.0 + rate * kind) / rate;
+            let num_ = (x - fv) / (x + pv);
+            if num_ <= 0.0 {
+                return Arg::err(ErrorKind::Num);
+            }
+            n(num_.ln() / (1.0 + rate).ln())
+        }
+        "RATE" => {
+            let (nper, pmt, pv) = (try_num!(a(0)), try_num!(a(1)), try_num!(a(2)));
+            let fv = g!(num(3, 0.0));
+            let kind = g!(num(4, 0.0));
+            let guess = g!(num(5, 0.1));
+            let f = |r: f64| {
+                if r == 0.0 {
+                    return pv + pmt * nper + fv;
+                }
+                let k = (1.0 + r).powf(nper);
+                pv * k + pmt * (1.0 + r * kind) * (k - 1.0) / r + fv
+            };
+            match newton(f, guess) {
+                Some(r) => n(r),
+                None => Arg::err(ErrorKind::Num),
+            }
+        }
+        _ => Arg::err(ErrorKind::Name),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// number / date formatting (shared by TEXT() and the host's display logic)
+// ---------------------------------------------------------------------------
+
+const MONTH_NAMES: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+const DAY_NAMES: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+
+fn format_date(serial: f64, pattern: &str) -> String {
+    let (y, m, d) = ymd_from_serial(serial);
+    let secs_total = ((serial - serial.floor()) * 86400.0).round() as i64;
+    let (hh, mi, ss) = (secs_total / 3600, (secs_total / 60) % 60, secs_total % 60);
+    let wd = weekday_mon0(serial) as usize;
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i].to_ascii_lowercase();
+        if c == '"' {
+            // literal
+            i += 1;
+            while i < chars.len() && chars[i] != '"' {
+                out.push(chars[i]);
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if "ymdhs".contains(c) {
+            let mut run = 1;
+            while i + run < chars.len() && chars[i + run].to_ascii_lowercase() == c {
+                run += 1;
+            }
+            match (c, run) {
+                ('y', r) if r >= 4 => out.push_str(&format!("{:04}", y)),
+                ('y', _) => out.push_str(&format!("{:02}", y.rem_euclid(100))),
+                ('m', 1) => {
+                    // minutes when following an hour token or preceding seconds, else month
+                    let prev_h = out.ends_with(':');
+                    if prev_h {
+                        out.push_str(&mi.to_string());
+                    } else {
+                        out.push_str(&m.to_string());
+                    }
+                }
+                ('m', 2) => {
+                    if out.ends_with(':') {
+                        out.push_str(&format!("{:02}", mi));
+                    } else {
+                        out.push_str(&format!("{:02}", m));
+                    }
+                }
+                ('m', 3) => out.push_str(&MONTH_NAMES[(m - 1) as usize][..3]),
+                ('m', _) => out.push_str(MONTH_NAMES[(m - 1) as usize]),
+                ('d', 1) => out.push_str(&d.to_string()),
+                ('d', 2) => out.push_str(&format!("{:02}", d)),
+                ('d', 3) => out.push_str(&DAY_NAMES[wd][..3]),
+                ('d', _) => out.push_str(DAY_NAMES[wd]),
+                ('h', 1) => out.push_str(&hh.to_string()),
+                ('h', _) => out.push_str(&format!("{:02}", hh)),
+                ('s', 1) => out.push_str(&ss.to_string()),
+                ('s', _) => out.push_str(&format!("{:02}", ss)),
+                _ => {}
+            }
+            i += run;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+fn is_date_pattern(f: &str) -> bool {
+    let lower = f.to_ascii_lowercase();
+    let stripped: String = {
+        // ignore quoted literals
+        let mut s = String::new();
+        let mut inq = false;
+        for c in lower.chars() {
+            if c == '"' {
+                inq = !inq;
+                continue;
+            }
+            if !inq {
+                s.push(c);
+            }
+        }
+        s
+    };
+    stripped.contains("yy") || stripped.contains("dd") || stripped.contains("mmm") || stripped.contains("hh") || stripped.contains("h:") || stripped.contains("d ")
+}
+
+/// Format a value with an Excel-like pattern: `0`, `0.00`, `#,##0`, `#,##0.00`, `0%`,
+/// `€#,##0.00`, `#,##0.00 "Kz"`, `#.##0,00` (decimal comma), `yyyy-mm-dd`, `d mmm yyyy hh:mm`.
 pub fn format_text(v: &Value, fmt: &str) -> String {
     let f = fmt.trim();
-    let lower = f.to_ascii_lowercase();
-    if lower.contains("yyyy") || lower.contains("dd") {
+    if f.is_empty() {
+        return v.to_display();
+    }
+    if is_date_pattern(f) {
         if let Ok(s) = date_arg(v) {
-            let (y, m, d) = ymd_from_serial(s);
-            return lower
-                .replace("yyyy", &format!("{:04}", y))
-                .replace("mm", &format!("{:02}", m))
-                .replace("dd", &format!("{:02}", d));
+            return format_date(s, f);
         }
         return v.to_display();
     }
@@ -1221,32 +2336,73 @@ pub fn format_text(v: &Value, fmt: &str) -> String {
         Ok(x) => x,
         Err(_) => return v.to_display(),
     };
-    let pct = f.ends_with('%');
+    // split prefix / number pattern / suffix (literals in quotes or currency symbols)
+    let is_num_char = |c: char| "0#.,%".contains(c);
+    let mut prefix = String::new();
+    let mut suffix = String::new();
+    let mut core = String::new();
+    let mut state = 0; // 0 prefix, 1 number pattern, 2 suffix
+    let mut inq = false;
+    for c in f.chars() {
+        if c == '"' {
+            inq = !inq;
+            if state == 1 {
+                state = 2;
+            }
+            continue;
+        }
+        let numeric = !inq && is_num_char(c);
+        match state {
+            0 if numeric => {
+                state = 1;
+                core.push(c);
+            }
+            0 => prefix.push(c),
+            1 if numeric => core.push(c),
+            1 => {
+                state = 2;
+                suffix.push(c);
+            }
+            _ => suffix.push(c),
+        }
+    }
+    let pct = core.ends_with('%');
     let x = if pct { x * 100.0 } else { x };
-    let decimals = f.split('.').nth(1).map(|d| d.chars().filter(|c| *c == '0').count()).unwrap_or(0);
-    let grouped = f.contains(',');
-    let body = format!("{:.*}", decimals, x);
-    let out = if grouped {
-        let (int_part, frac) = match body.split_once('.') {
-            Some((i, fr)) => (i.to_string(), Some(fr.to_string())),
-            None => (body.clone(), None),
-        };
-        let neg = int_part.starts_with('-');
-        let digits: Vec<char> = int_part.trim_start_matches('-').chars().collect();
-        let mut g = String::new();
+    // decimal comma style: "#.##0,00" or "0,00" (the last separator is a comma followed by zeros)
+    let decimal_comma = match (core.rfind('.'), core.rfind(',')) {
+        (Some(d), Some(c)) => c > d,
+        (None, Some(c)) => {
+            let after = core[c + 1..].trim_end_matches('%');
+            !after.is_empty() && after.chars().all(|ch| ch == '0')
+        }
+        _ => false,
+    };
+    let (dec_sep, grp_sep, decimals, grouped) = if decimal_comma {
+        let decimals = core.rsplit(',').next().map(|d| d.chars().filter(|c| *c == '0').count()).unwrap_or(0);
+        (',', '.', decimals, core.contains('.'))
+    } else {
+        let decimals = core.split('.').nth(1).map(|d| d.chars().filter(|c| *c == '0').count()).unwrap_or(0);
+        ('.', ',', decimals, core.contains(','))
+    };
+    let body = format!("{:.*}", decimals, x.abs());
+    let (int_part, frac) = match body.split_once('.') {
+        Some((i, fr)) => (i.to_string(), Some(fr.to_string())),
+        None => (body.clone(), None),
+    };
+    let mut g = String::new();
+    if grouped {
+        let digits: Vec<char> = int_part.chars().collect();
         for (i, ch) in digits.iter().enumerate() {
             if i > 0 && (digits.len() - i) % 3 == 0 {
-                g.push(',');
+                g.push(grp_sep);
             }
             g.push(*ch);
         }
-        format!("{}{}{}", if neg { "-" } else { "" }, g, frac.map(|fr| format!(".{}", fr)).unwrap_or_default())
     } else {
-        body
-    };
-    if pct {
-        format!("{}%", out)
-    } else {
-        out
+        g = int_part;
     }
+    let num = format!("{}{}", g, frac.map(|fr| format!("{}{}", dec_sep, fr)).unwrap_or_default());
+    let neg = x < 0.0 && num.chars().any(|c| c.is_ascii_digit() && c != '0');
+    let pct_s = if pct { "%" } else { "" };
+    format!("{}{}{}{}{}", if neg { "-" } else { "" }, prefix, num, pct_s, suffix)
 }

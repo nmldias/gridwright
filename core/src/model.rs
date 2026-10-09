@@ -139,7 +139,27 @@ impl Value {
         if let Some(n) = parse_number_literal(t) {
             return Value::Number(n);
         }
+        if let Some((serial, _)) = crate::formula::eval::parse_date_time_text(t) {
+            return Value::Number(serial);
+        }
         Value::Text(input.to_string())
+    }
+
+    /// Number format implied by what was typed (dates, times, percentages, currency), if any.
+    pub fn auto_format(input: &str) -> Option<String> {
+        let t = input.trim();
+        if t.is_empty() || parse_number_literal(t).is_some() {
+            if t.ends_with('%') && parse_number_literal(t).is_some() {
+                return Some(if t.contains('.') || t.contains(',') { "0.0%".into() } else { "0%".into() });
+            }
+            for (sym, fmt) in [("€", "€#,##0.00"), ("$", "$#,##0.00"), ("£", "£#,##0.00"), ("Kz", "#,##0.00 \"Kz\""), ("AOA", "#,##0.00 \"Kz\"")] {
+                if (t.starts_with(sym) || t.ends_with(sym)) && parse_number_literal(t).is_some() {
+                    return Some(fmt.into());
+                }
+            }
+            return None;
+        }
+        crate::formula::eval::parse_date_time_text(t).map(|(_, f)| f.to_string())
     }
     pub fn to_display(&self) -> String {
         match self {
@@ -166,10 +186,15 @@ pub fn parse_number_literal(t: &str) -> Option<f64> {
         s = stripped.to_string();
         pct = true;
     }
-    for sym in ["$", "€", "£", "Kz", "AOA"] {
+    for sym in ["$", "€", "£", "Kz", "AOA", "USD", "EUR"] {
         if let Some(stripped) = s.strip_prefix(sym) {
             s = stripped.to_string();
+        } else if let Some(stripped) = s.strip_suffix(sym) {
+            s = stripped.to_string();
         }
+    }
+    if s.is_empty() {
+        return None;
     }
     // Separators: "1,234.5" (en) vs "1.234,5" (pt/eu). Decide by whichever
     // separator appears last; a lone comma followed by exactly three digits is
@@ -294,6 +319,8 @@ pub enum CellKind {
     Formula,
     Python,
     Javascript,
+    /// SQL query run by the server against a stored connection; the result spills like code output.
+    Sql,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -365,11 +392,25 @@ pub struct Cell {
     /// Code cells: ranges read through `q.cells(...)` during the last run.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub code_deps: Vec<Rect>,
+    /// SQL cells: id of the stored connection the query runs on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conn: Option<String>,
+    /// Code/SQL cells: re-run every N seconds while the document is open (0/None = never).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<u32>,
+    /// Formula cells: cached dependency rectangles (rebuilt by the engine, never stored).
+    #[serde(skip)]
+    pub deps: Vec<Rect>,
+    #[serde(skip)]
+    pub deps_valid: bool,
+    /// Set when the input breaks a (non-strict) validation rule covering the cell.
+    #[serde(skip)]
+    pub invalid: bool,
 }
 
 impl Cell {
     pub fn is_code(&self) -> bool {
-        matches!(self.kind, CellKind::Python | CellKind::Javascript)
+        matches!(self.kind, CellKind::Python | CellKind::Javascript | CellKind::Sql)
     }
     pub fn is_blank(&self) -> bool {
         self.input.is_empty()
@@ -377,6 +418,109 @@ impl Cell {
             && self.spill_from.is_none()
             && self.format.is_default()
     }
+}
+
+/// One aggregated value of a pivot table.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PivotValue {
+    /// Source column header text.
+    pub field: String,
+    /// sum | count | average | min | max | countdistinct
+    pub agg: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PivotFilter {
+    pub field: String,
+    /// Keep source rows whose field value (display text) is one of these.
+    pub values: Vec<String>,
+}
+
+/// Pivot definition stored on the *output* table.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PivotSpec {
+    pub source: TableId,
+    /// Row grouping fields (header names of the source table), outermost first.
+    pub rows: Vec<String>,
+    /// Optional column grouping field (only the first entry is used).
+    pub cols: Vec<String>,
+    pub values: Vec<PivotValue>,
+    pub filters: Vec<PivotFilter>,
+    pub totals: bool,
+}
+
+/// Header filter on one column: either an explicit allow-list of display values or a condition.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ColumnFilter {
+    pub col: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<String>>,
+    /// eq | ne | gt | ge | lt | le | contains | not_contains | starts | ends | blank | not_blank
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+/// Conditional formatting rule over a rectangle.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CondFormat {
+    pub r0: u32,
+    pub c0: u32,
+    pub r1: u32,
+    pub c1: u32,
+    /// cell_is | text | color_scale | top | bottom | duplicate | blank | not_blank | formula
+    pub kind: String,
+    /// cell_is: gt ge lt le eq ne between not_between · text: contains not_contains starts ends
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    pub values: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bold: Option<bool>,
+    /// colour scale end points
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_color: Option<String>,
+}
+
+/// Data-validation rule over a rectangle.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Validation {
+    pub r0: u32,
+    pub c0: u32,
+    pub r1: u32,
+    pub c1: u32,
+    /// list | number | integer | date | text_length | custom
+    pub kind: String,
+    /// between | not_between | gt | ge | lt | le | eq | ne
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    /// list entries (or a single range reference such as `Lists::A2:A20`), or numeric bounds
+    pub values: Vec<String>,
+    pub allow_blank: bool,
+    /// reject the entry (true) or only mark it (false)
+    pub strict: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct NamedRange {
+    pub name: String,
+    /// Reference text such as `Sales::B2:B20` or `Orders[Amount]`.
+    pub reference: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -393,6 +537,18 @@ pub struct Table {
     pub row_heights: Vec<f64>,
     #[serde(with = "cells_serde")]
     pub cells: HashMap<CellKey, Cell>,
+    /// Set when this table is the output of a pivot over another table (cells are read-only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pivot: Option<PivotSpec>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub filters: Vec<ColumnFilter>,
+    /// Rows hidden by the filters (derived; kept for the host, rebuilt on load).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hidden_rows: Vec<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cond_formats: Vec<CondFormat>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub validations: Vec<Validation>,
 }
 
 /// Cells are stored as a JSON array of `{"r":..,"c":..,"cell":{..}}` entries
@@ -445,6 +601,11 @@ impl Default for Table {
             col_widths: vec![],
             row_heights: vec![],
             cells: HashMap::new(),
+            pivot: None,
+            filters: vec![],
+            hidden_rows: vec![],
+            cond_formats: vec![],
+            validations: vec![],
         }
     }
 }
@@ -462,7 +623,50 @@ impl Table {
             col_widths: vec![DEFAULT_COL_WIDTH; cols as usize],
             row_heights: vec![DEFAULT_ROW_HEIGHT; rows as usize],
             cells: HashMap::new(),
+            pivot: None,
+            filters: vec![],
+            hidden_rows: vec![],
+            cond_formats: vec![],
+            validations: vec![],
         }
+    }
+
+    /// Header text of a column (row 0 when the table has a header row), as displayed.
+    pub fn header_text(&self, col: u32) -> String {
+        if self.header_rows == 0 {
+            return String::new();
+        }
+        self.value_at(CellKey::new(0, col)).to_display()
+    }
+
+    /// Column index whose header matches `name` (case-insensitive, trimmed).
+    pub fn column_by_header(&self, name: &str) -> Option<u32> {
+        if self.header_rows == 0 {
+            return None;
+        }
+        let needle = name.trim().to_lowercase();
+        if needle.is_empty() {
+            return None;
+        }
+        (0..self.cols).find(|c| self.header_text(*c).trim().to_lowercase() == needle)
+    }
+
+    pub fn is_row_hidden(&self, row: u32) -> bool {
+        self.hidden_rows.binary_search(&row).is_ok()
+    }
+
+    /// Recompute `hidden_rows` from the column filters (header rows are never hidden).
+    pub fn apply_filters(&mut self) {
+        let mut hidden = vec![];
+        if !self.filters.is_empty() {
+            for r in self.header_rows..self.rows {
+                let keep = self.filters.iter().all(|f| filter_keeps(self, f, r));
+                if !keep {
+                    hidden.push(r);
+                }
+            }
+        }
+        self.hidden_rows = hidden;
     }
 
     pub fn in_bounds(&self, key: CellKey) -> bool {
@@ -507,6 +711,47 @@ impl Table {
     }
 }
 
+/// Does a row pass one column filter?
+pub fn filter_keeps(t: &Table, f: &ColumnFilter, row: u32) -> bool {
+    let v = t.value_at(CellKey::new(row, f.col));
+    if let Some(allowed) = &f.values {
+        let text = v.to_display();
+        return allowed.iter().any(|a| a == &text);
+    }
+    let op = f.op.as_deref().unwrap_or("");
+    let target = f.value.clone().unwrap_or_default();
+    match op {
+        "blank" => v.is_empty(),
+        "not_blank" => !v.is_empty(),
+        "contains" | "not_contains" | "starts" | "ends" => {
+            let hay = v.to_display().to_lowercase();
+            let needle = target.to_lowercase();
+            let hit = match op {
+                "contains" => hay.contains(&needle),
+                "not_contains" => !hay.contains(&needle),
+                "starts" => hay.starts_with(&needle),
+                _ => hay.ends_with(&needle),
+            };
+            hit
+        }
+        "eq" | "ne" | "gt" | "ge" | "lt" | "le" => {
+            let tv = Value::parse_literal(&target);
+            let ord = crate::formula::eval::compare_values(&v, &tv);
+            use std::cmp::Ordering::*;
+            let same_kind = std::mem::discriminant(&v) == std::mem::discriminant(&tv) || (matches!(v, Value::Empty) && matches!(tv, Value::Number(_)));
+            match op {
+                "eq" => ord == Equal && same_kind,
+                "ne" => !(ord == Equal && same_kind),
+                "gt" => same_kind && ord == Greater,
+                "ge" => same_kind && ord != Less,
+                "lt" => same_kind && ord == Less,
+                _ => same_kind && ord != Greater,
+            }
+        }
+        _ => true,
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Workbook {
@@ -514,6 +759,8 @@ pub struct Workbook {
     pub name: String,
     pub tables: Vec<Table>,
     pub next_table_id: TableId,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<NamedRange>,
     /// Serial date-time (days since 1899-12-30) injected by the host for NOW()/TODAY().
     #[serde(skip)]
     pub now_serial: f64,
@@ -526,8 +773,14 @@ impl Workbook {
             name: name.to_string(),
             tables: vec![],
             next_table_id: 1,
+            names: vec![],
             now_serial: 45000.0,
         }
+    }
+
+    pub fn named_range(&self, name: &str) -> Option<&NamedRange> {
+        let needle = name.trim().to_lowercase();
+        self.names.iter().find(|n| n.name.trim().to_lowercase() == needle)
     }
 
     pub fn table(&self, id: TableId) -> Option<&Table> {
@@ -625,7 +878,17 @@ mod tests {
         assert_eq!(Value::parse_literal("€ 1.000,00"), Value::Number(1000.0));
         assert_eq!(Value::parse_literal("1,500"), Value::Number(1500.0));
         assert_eq!(Value::parse_literal("1.234.567,89"), Value::Number(1234567.89));
-        assert_eq!(Value::parse_literal("2026-10-08"), Value::Text("2026-10-08".into()));
+        assert_eq!(Value::parse_literal("2026-10-08"), Value::Number(46303.0));
+        assert_eq!(Value::parse_literal("08/10/2026"), Value::Number(46303.0));
+        assert_eq!(Value::parse_literal("2026-10-08 06:00"), Value::Number(46303.25));
+        assert_eq!(Value::parse_literal("8 Oct 2026"), Value::Number(46303.0));
+        assert_eq!(Value::parse_literal("12/10"), Value::Text("12/10".into()));
+        assert_eq!(Value::parse_literal("1,500 Kz"), Value::Number(1500.0));
+        assert_eq!(Value::auto_format("2026-10-08"), Some("yyyy-mm-dd".into()));
+        assert_eq!(Value::auto_format("08/10/2026"), Some("dd/mm/yyyy".into()));
+        assert_eq!(Value::auto_format("12%"), Some("0%".into()));
+        assert_eq!(Value::auto_format("€ 1.000,00"), Some("€#,##0.00".into()));
+        assert_eq!(Value::auto_format("42"), None);
         assert_eq!(Value::parse_literal("TRUE"), Value::Bool(true));
         assert_eq!(Value::parse_literal("hello"), Value::Text("hello".into()));
         assert_eq!(Value::parse_literal(""), Value::Empty);

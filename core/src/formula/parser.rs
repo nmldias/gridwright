@@ -23,6 +23,9 @@ pub enum RefKind {
     Cols { c0: u32, c1: u32 },
     /// Whole rows, e.g. `2:5`
     Rows { r0: u32, r1: u32 },
+    /// Structured reference to a column by header name: `Orders[Amount]` (data rows)
+    /// or `Orders[@Amount]` (the value on the formula's own row).
+    Column { name: String, this_row: bool },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -62,6 +65,8 @@ pub enum Expr {
     Array(Vec<Vec<Expr>>),
     /// Error literal such as `#REF!`
     ErrorLit(String),
+    /// Workbook-level named range (resolved at evaluation time).
+    Name(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -268,12 +273,21 @@ impl Parser {
                 abs_col,
                 abs_row,
             } => self.finish_ref(None, row, col, abs_row, abs_col),
+            Token::Bracket(sel) => Ok(column_ref(None, &sel)),
             Token::Quoted(name) => {
+                if let Token::Bracket(sel) = self.peek().clone() {
+                    self.next();
+                    return Ok(column_ref(Some(name), &sel));
+                }
                 self.expect(Token::DoubleColon)?;
                 self.qualified_ref(name)
             }
             Token::Ident(name) => {
                 let upper = name.to_ascii_uppercase();
+                if let Token::Bracket(sel) = self.peek().clone() {
+                    self.next();
+                    return Ok(column_ref(Some(name), &sel));
+                }
                 if self.peek() == &Token::LParen {
                     self.next();
                     let mut args = Vec::new();
@@ -325,7 +339,8 @@ impl Parser {
                                 return Err(ParseError("bad column range".into()));
                             }
                         }
-                        Err(ParseError(format!("unknown name '{}'", name)))
+                        // anything else is a workbook-level name (checked at evaluation time)
+                        Ok(Expr::Name(name))
                     }
                 }
             }
@@ -450,7 +465,33 @@ fn fmt_table(name: &str) -> String {
     }
 }
 
+fn column_ref(table: Option<String>, selector: &str) -> Expr {
+    let s = selector.trim();
+    let (this_row, name) = match s.strip_prefix('@') {
+        Some(rest) => (true, rest.trim().to_string()),
+        None => (false, s.to_string()),
+    };
+    Expr::Ref(RefExpr {
+        table,
+        kind: RefKind::Column { name, this_row },
+    })
+}
+
 pub fn ref_to_string(r: &RefExpr) -> String {
+    if let RefKind::Column { name, this_row } = &r.kind {
+        let tbl = match r.table.as_deref() {
+            None => String::new(),
+            Some(t) => {
+                let simple = !t.is_empty() && t.chars().all(|c| c.is_alphanumeric() || c == '_') && !t.chars().next().unwrap().is_ascii_digit();
+                if simple {
+                    t.to_string()
+                } else {
+                    format!("'{}'", t.replace('\'', "''"))
+                }
+            }
+        };
+        return format!("{}[{}{}]", tbl, if *this_row { "@" } else { "" }, name.replace(']', "]]"));
+    }
     let prefix = r.table.as_deref().map(fmt_table).unwrap_or_default();
     let body = match &r.kind {
         RefKind::Cell {
@@ -466,6 +507,7 @@ pub fn ref_to_string(r: &RefExpr) -> String {
         ),
         RefKind::Cols { c0, c1 } => format!("{}:{}", col_to_letters(*c0), col_to_letters(*c1)),
         RefKind::Rows { r0, r1 } => format!("{}:{}", r0 + 1, r1 + 1),
+        RefKind::Column { .. } => unreachable!(),
     };
     format!("{}{}", prefix, body)
 }
@@ -527,9 +569,25 @@ pub fn to_string(e: &Expr) -> String {
                 format!("{{{}}}", rs.join("; "))
             }
             Expr::ErrorLit(e) => e.clone(),
+            Expr::Name(n) => n.clone(),
         }
     }
     go(e, 0)
+}
+
+/// Rename every table-qualified reference from `old` to `new` (case-insensitive match).
+pub fn rename_table_refs(e: &mut Expr, old: &str, new: &str) -> bool {
+    let needle = old.trim().to_lowercase();
+    let mut changed = false;
+    for_each_ref_mut(e, &mut |r| {
+        if let Some(t) = &r.table {
+            if t.trim().to_lowercase() == needle {
+                r.table = Some(new.to_string());
+                changed = true;
+            }
+        }
+    });
+    changed
 }
 
 /// Rewrite references; when `f` returns false the reference becomes `#REF!`.
@@ -606,6 +664,8 @@ mod tests {
             "10%",
             "{1, 2; 3, 4}",
             "Sales::2:4",
+            "SUM(Orders[Amount]) + [@Unit price] * 'Q3 sales'[Units]",
+            "TaxRate * [@Amount]",
         ] {
             let e = parse(src).unwrap();
             let printed = to_string(&e);

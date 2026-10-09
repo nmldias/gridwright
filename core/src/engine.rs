@@ -1,6 +1,6 @@
 //! Operations, recalculation and undo/redo on top of the model.
 
-use crate::formula;
+use crate::formula::{self, Arg};
 use crate::model::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -15,6 +15,12 @@ pub enum Op {
         input: String,
         #[serde(default)]
         kind: Option<CellKind>,
+        /// SQL cells: stored connection id.
+        #[serde(default)]
+        conn: Option<String>,
+        /// Code/SQL cells: refresh interval in seconds (0 = none).
+        #[serde(default)]
+        refresh: Option<u32>,
     },
     /// Paste a block of literal/formula strings starting at (row, col).
     SetCells {
@@ -115,6 +121,30 @@ pub enum Op {
         #[serde(default)]
         deps: Vec<Rect>,
     },
+    /// Make `table` the output of a pivot (None removes the pivot and keeps the values).
+    SetPivot {
+        table: TableId,
+        #[serde(default)]
+        spec: Option<PivotSpec>,
+    },
+    SetFilters {
+        table: TableId,
+        filters: Vec<ColumnFilter>,
+    },
+    SetCondFormats {
+        table: TableId,
+        rules: Vec<CondFormat>,
+    },
+    SetValidations {
+        table: TableId,
+        rules: Vec<Validation>,
+    },
+    /// Define or remove (reference = None) a workbook-level name.
+    SetName {
+        name: String,
+        #[serde(default)]
+        reference: Option<String>,
+    },
 }
 
 /// Cell as the host sees it.
@@ -135,6 +165,13 @@ pub struct CellView {
     pub out: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub err: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<u32>,
+    /// true when the cell breaks a validation rule
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub inv: bool,
 }
 
 impl CellView {
@@ -151,6 +188,9 @@ impl CellView {
                 ss: None,
                 out: None,
                 err: None,
+                conn: None,
+                refresh: None,
+                inv: false,
             },
             Some(c) => CellView {
                 r: key.row,
@@ -163,6 +203,9 @@ impl CellView {
                 ss: c.spill_size,
                 out: c.std_out.clone(),
                 err: c.std_err.clone(),
+                conn: c.conn.clone(),
+                refresh: c.refresh,
+                inv: c.invalid,
             },
         }
     }
@@ -179,6 +222,12 @@ pub struct TableMeta {
     pub header_rows: u32,
     pub col_widths: Vec<f64>,
     pub row_heights: Vec<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pivot: Option<PivotSpec>,
+    pub filters: Vec<ColumnFilter>,
+    pub hidden_rows: Vec<u32>,
+    pub cond_formats: Vec<CondFormat>,
+    pub validations: Vec<Validation>,
 }
 
 impl TableMeta {
@@ -193,6 +242,11 @@ impl TableMeta {
             header_rows: t.header_rows,
             col_widths: t.col_widths.clone(),
             row_heights: t.row_heights.clone(),
+            pivot: t.pivot.clone(),
+            filters: t.filters.clone(),
+            hidden_rows: t.hidden_rows.clone(),
+            cond_formats: t.cond_formats.clone(),
+            validations: t.validations.clone(),
         }
     }
 }
@@ -213,6 +267,9 @@ pub struct Changes {
     pub error: Option<String>,
     /// Which tables were created by this op (AddTable).
     pub created: Vec<TableId>,
+    /// Workbook names after the op (sent when they changed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub names: Option<Vec<NamedRange>>,
 }
 
 impl Changes {
@@ -228,7 +285,9 @@ impl Changes {
     }
     fn push_table(&mut self, wb: &Workbook, id: TableId) {
         if let Some(t) = wb.table(id) {
-            if !self.tables.iter().any(|m| m.id == id) {
+            if let Some(pos) = self.tables.iter().position(|m| m.id == id) {
+                self.tables[pos] = TableMeta::of(t);
+            } else {
                 self.tables.push(TableMeta::of(t));
             }
         }
@@ -241,6 +300,8 @@ enum Inverse {
     Cells(Vec<(CellRef, Option<Cell>)>),
     /// Restore whole tables (None = table did not exist).
     Tables(Vec<(TableId, Option<Table>)>),
+    /// Restore the workbook names.
+    Names(Vec<NamedRange>),
 }
 
 pub struct Engine {
@@ -252,6 +313,7 @@ pub struct Engine {
 const MAX_UNDO: usize = 200;
 const MAX_ROWS: u32 = 1_000_000;
 const MAX_COLS: u32 = 10_000;
+const MAX_SPILL_ROUNDS: usize = 8;
 
 impl Engine {
     pub fn new(wb: Workbook) -> Engine {
@@ -260,7 +322,14 @@ impl Engine {
             undo: vec![],
             redo: vec![],
         };
+        for t in e.wb.tables.iter_mut() {
+            t.normalise_geometry();
+        }
         e.recalc_all();
+        let ids: Vec<TableId> = e.wb.tables.iter().filter(|t| !t.validations.is_empty()).map(|t| t.id).collect();
+        for id in ids {
+            e.revalidate(id, None);
+        }
         e
     }
 
@@ -323,6 +392,37 @@ impl Engine {
         }
     }
 
+    /// Write one cell's input (shared by SetCell / SetCells / AddTable).
+    fn write_input(t: &mut Table, key: CellKey, input: &str, kind: CellKind) {
+        let entry = t.cells.entry(key).or_default();
+        entry.input = input.to_string();
+        entry.kind = kind;
+        entry.spill_size = None;
+        entry.std_err = None;
+        entry.std_out = None;
+        entry.code_deps.clear();
+        entry.deps.clear();
+        entry.deps_valid = false;
+        entry.value = match kind {
+            CellKind::Value => Value::parse_literal(input),
+            _ => Value::Empty,
+        };
+        if kind == CellKind::Value && entry.format.number_format.is_none() {
+            if let Some(f) = Value::auto_format(input) {
+                entry.format.number_format = Some(f);
+            }
+        }
+        if kind != CellKind::Sql {
+            entry.conn = None;
+        }
+        if !matches!(kind, CellKind::Python | CellKind::Javascript | CellKind::Sql) {
+            entry.refresh = None;
+        }
+        if entry.is_blank() {
+            t.cells.remove(&key);
+        }
+    }
+
     fn apply_inner(&mut self, op: Op, ch: &mut Changes) -> Result<Option<Inverse>, String> {
         match op {
             Op::SetCell {
@@ -331,11 +431,16 @@ impl Engine {
                 col,
                 input,
                 kind,
+                conn,
+                refresh,
             } => {
                 let key = CellKey::new(row, col);
                 let t = self.wb.table(table).ok_or("no such table")?;
                 if !t.in_bounds(key) {
                     return Err("cell outside table".into());
+                }
+                if t.pivot.is_some() {
+                    return Err("this table is the output of a pivot — edit the pivot settings instead".into());
                 }
                 if let Some(c) = t.get(key) {
                     if c.spill_from.is_some() {
@@ -343,6 +448,16 @@ impl Engine {
                     }
                 }
                 let kind = kind.unwrap_or_else(|| infer_kind(&input));
+                let mut invalid = false;
+                if kind == CellKind::Value {
+                    if let Err(msg) = crate::validation::check(&self.wb, table, key, &input) {
+                        let strict = t.validations.iter().any(|r| r.strict && key.row >= r.r0 && key.row <= r.r1 && key.col >= r.c0 && key.col <= r.c1);
+                        if strict {
+                            return Err(format!("not allowed: {}", msg));
+                        }
+                        invalid = true;
+                    }
+                }
                 let mut prev = vec![];
                 let origin = CellRef::new(table, row, col);
                 self.snapshot_spill(origin, &mut prev);
@@ -350,25 +465,20 @@ impl Engine {
                 let mut changed = self.clear_spill(origin);
                 {
                     let t = self.wb.table_mut(table).unwrap();
-                    let entry = t.cells.entry(key).or_default();
-                    entry.input = input.clone();
-                    entry.kind = kind;
-                    entry.spill_size = None;
-                    entry.std_err = None;
-                    entry.std_out = None;
-                    entry.code_deps.clear();
-                    match kind {
-                        CellKind::Value => entry.value = Value::parse_literal(&input),
-                        CellKind::Formula => entry.value = Value::Empty, // computed below
-                        CellKind::Python | CellKind::Javascript => entry.value = Value::Empty,
-                    }
-                    if entry.is_blank() {
-                        t.cells.remove(&key);
+                    Self::write_input(t, key, &input, kind);
+                    if let Some(entry) = t.cells.get_mut(&key) {
+                        entry.invalid = invalid;
+                        if kind == CellKind::Sql {
+                            entry.conn = conn;
+                        }
+                        if entry.is_code() {
+                            entry.refresh = refresh.filter(|s| *s > 0);
+                        }
                     }
                 }
                 changed.push(origin);
                 self.recalc_from(&changed, ch);
-                if matches!(kind, CellKind::Python | CellKind::Javascript) && !input.trim().is_empty() {
+                if matches!(kind, CellKind::Python | CellKind::Javascript | CellKind::Sql) && !input.trim().is_empty() {
                     ch.rerun_code.push(origin);
                 }
                 Ok(Some(Inverse::Cells(prev)))
@@ -380,6 +490,9 @@ impl Engine {
                 values,
             } => {
                 let t = self.wb.table(table).ok_or("no such table")?;
+                if t.pivot.is_some() {
+                    return Err("this table is the output of a pivot — edit the pivot settings instead".into());
+                }
                 let need_rows = row + values.len() as u32;
                 let need_cols = col + values.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
                 let mut prev_tables = vec![];
@@ -406,23 +519,12 @@ impl Engine {
                         }
                         prev.push((origin, t.cells.get(&key).cloned()));
                         let kind = infer_kind(s);
-                        let entry = t.cells.entry(key).or_default();
-                        entry.input = s.clone();
-                        entry.kind = kind;
-                        entry.spill_size = None;
-                        entry.std_err = None;
-                        entry.std_out = None;
-                        entry.code_deps.clear();
-                        entry.value = match kind {
-                            CellKind::Value => Value::parse_literal(s),
-                            _ => Value::Empty,
-                        };
-                        if entry.is_blank() {
-                            t.cells.remove(&key);
-                        }
+                        Self::write_input(t, key, s, kind);
                         changed.push(origin);
                     }
                 }
+                self.revalidate(table, Some((row, col, need_rows - 1, need_cols - 1)));
+                // sources of spills that were overwritten re-evaluate (they will show #SPILL! or re-spill)
                 self.recalc_from(&changed, ch);
                 if grew {
                     Ok(Some(Inverse::Tables(prev_tables)))
@@ -431,7 +533,10 @@ impl Engine {
                 }
             }
             Op::ClearRange { table, r0, c0, r1, c1 } => {
-                self.wb.table(table).ok_or("no such table")?;
+                let t = self.wb.table(table).ok_or("no such table")?;
+                if t.pivot.is_some() {
+                    return Err("this table is the output of a pivot — edit the pivot settings instead".into());
+                }
                 let mut prev = vec![];
                 let mut changed = vec![];
                 for r in r0..=r1 {
@@ -518,12 +623,43 @@ impl Engine {
                         return Err("a table with that name already exists".into());
                     }
                 }
-                let t = self.wb.table_mut(table).ok_or("no such table")?;
-                let prev = t.clone();
-                t.name = name;
+                let old = self.wb.table(table).ok_or("no such table")?.name.clone();
+                // every table holding a formula or pivot that mentions the old name is snapshotted
+                let mut inv: Vec<(TableId, Option<Table>)> = vec![];
+                for t in &self.wb.tables {
+                    let mentions = t.id == table || t.cells.values().any(|c| c.kind == CellKind::Formula && c.input.to_lowercase().contains(&old.to_lowercase()));
+                    if mentions {
+                        inv.push((t.id, Some(t.clone())));
+                    }
+                }
+                let names_before = self.wb.names.clone();
+                for t in self.wb.tables.iter_mut() {
+                    if t.id == table {
+                        t.name = name.clone();
+                    }
+                    for c in t.cells.values_mut() {
+                        if c.kind == CellKind::Formula {
+                            let body = formula::formula_body(&c.input).to_string();
+                            let new = formula::rename_table(&body, &old, &name);
+                            if new != body {
+                                c.input = format!("={}", new);
+                                c.deps_valid = false;
+                            }
+                        }
+                    }
+                }
+                for nr in self.wb.names.iter_mut() {
+                    nr.reference = formula::rename_table(&nr.reference, &old, &name);
+                }
                 ch.push_table(&self.wb, table);
+                for (id, _) in &inv {
+                    ch.reload.push(*id);
+                }
                 self.recalc_all_into(ch);
-                Ok(Some(Inverse::Tables(vec![(table, Some(prev))])))
+                if names_before != self.wb.names {
+                    ch.names = Some(self.wb.names.clone());
+                }
+                Ok(Some(Inverse::Tables(inv)))
             }
             Op::SetColWidth { table, col, width } => {
                 let t = self.wb.table_mut(table).ok_or("no such table")?;
@@ -549,7 +685,9 @@ impl Engine {
                 let t = self.wb.table_mut(table).ok_or("no such table")?;
                 let prev = t.clone();
                 t.header_rows = header_rows.min(t.rows);
+                t.apply_filters();
                 ch.push_table(&self.wb, table);
+                self.recalc_all_into(ch); // structured references depend on the header row
                 Ok(Some(Inverse::Tables(vec![(table, Some(prev))])))
             }
             Op::InsertRows { table, at, count } | Op::InsertCols { table, at, count } if count > 0 => {
@@ -596,6 +734,7 @@ impl Engine {
                         t.col_widths.insert(at as usize, DEFAULT_COL_WIDTH);
                     }
                 }
+                shift_rules(t, is_rows, at, count as i64);
                 t.normalise_geometry();
                 self.rewrite_formulas(table, &name, is_rows, at, count as i64);
                 ch.push_table(&self.wb, table);
@@ -657,6 +796,7 @@ impl Engine {
                     t.cols -= count;
                     t.col_widths.drain(at as usize..(at + count) as usize);
                 }
+                shift_rules(t, is_rows, at, -(count as i64));
                 t.normalise_geometry();
                 self.rewrite_formulas(table, &name, is_rows, at, -(count as i64));
                 ch.push_table(&self.wb, table);
@@ -705,15 +845,7 @@ impl Engine {
                                 continue;
                             }
                             let kind = infer_kind(s);
-                            t.cells.insert(
-                                CellKey::new(i as u32, j as u32),
-                                Cell {
-                                    input: s.clone(),
-                                    kind,
-                                    value: if kind == CellKind::Value { Value::parse_literal(s) } else { Value::Empty },
-                                    ..Default::default()
-                                },
-                            );
+                            Self::write_input(&mut t, CellKey::new(i as u32, j as u32), s, kind);
                         }
                     }
                 }
@@ -747,78 +879,17 @@ impl Engine {
                     return Err("not a code cell".into());
                 }
                 let mut changed = self.clear_spill(origin);
-                let mut grew = false;
-                {
-                    let (out_rows, out_cols) = match &output {
-                        Some(v) => (v.len() as u32, v.iter().map(|r| r.len()).max().unwrap_or(0) as u32),
-                        None => (0, 0),
-                    };
-                    let t = self.wb.table_mut(table).unwrap();
-                    if row + out_rows > t.rows || col + out_cols > t.cols {
-                        t.rows = t.rows.max(row + out_rows).min(MAX_ROWS);
-                        t.cols = t.cols.max(col + out_cols).min(MAX_COLS);
-                        t.normalise_geometry();
-                        grew = true;
-                    }
-                    // blocked?
-                    let mut blocked = false;
-                    if out_rows * out_cols > 1 {
-                        for i in 0..out_rows {
-                            for j in 0..out_cols {
-                                if i == 0 && j == 0 {
-                                    continue;
-                                }
-                                if let Some(c) = t.cells.get(&CellKey::new(row + i, col + j)) {
-                                    if !c.is_blank() && c.spill_from != Some(CellKey::new(row, col)) {
-                                        blocked = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    let entry = t.cells.get_mut(&CellKey::new(row, col)).unwrap();
-                    entry.std_out = std_out.filter(|s| !s.is_empty());
-                    entry.std_err = std_err.filter(|s| !s.is_empty());
-                    entry.code_deps = deps;
-                    entry.spill_size = None;
+                let grew = self.write_spill(origin, output.as_ref(), &mut changed, |entry| {
+                    entry.std_out = std_out.clone().filter(|s| !s.is_empty());
+                    entry.std_err = std_err.clone().filter(|s| !s.is_empty());
+                    entry.code_deps = deps.clone();
                     if entry.std_err.is_some() && output.is_none() {
                         entry.value = Value::Error(ErrorKind::Other);
-                    } else if blocked {
-                        entry.value = Value::Error(ErrorKind::Spill);
+                        true
                     } else {
-                        match &output {
-                            None => entry.value = Value::Empty,
-                            Some(v) => {
-                                entry.value = v.first().and_then(|r| r.first()).cloned().unwrap_or(Value::Empty);
-                                if out_rows * out_cols > 1 {
-                                    entry.spill_size = Some((out_rows, out_cols));
-                                    for i in 0..out_rows {
-                                        for j in 0..out_cols {
-                                            if i == 0 && j == 0 {
-                                                continue;
-                                            }
-                                            let val = v.get(i as usize).and_then(|r| r.get(j as usize)).cloned().unwrap_or(Value::Empty);
-                                            let key = CellKey::new(row + i, col + j);
-                                            let fmt = t.cells.get(&key).map(|c| c.format.clone()).unwrap_or_default();
-                                            t.cells.insert(
-                                                key,
-                                                Cell {
-                                                    input: String::new(),
-                                                    kind: CellKind::Value,
-                                                    value: val,
-                                                    spill_from: Some(CellKey::new(row, col)),
-                                                    format: fmt,
-                                                    ..Default::default()
-                                                },
-                                            );
-                                            changed.push(CellRef::new(table, key.row, key.col));
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        false
                     }
-                }
+                });
                 changed.push(origin);
                 if grew {
                     ch.push_table(&self.wb, table);
@@ -827,7 +898,194 @@ impl Engine {
                 // results are derived state: not undoable on their own
                 Ok(None)
             }
+            Op::SetPivot { table, spec } => {
+                let t = self.wb.table(table).ok_or("no such table")?;
+                if let Some(s) = &spec {
+                    if s.source == table {
+                        return Err("a pivot cannot use its own table as the source".into());
+                    }
+                    let src = self.wb.table(s.source).ok_or("pivot source table not found")?;
+                    if src.pivot.is_some() {
+                        return Err("the source of a pivot cannot itself be a pivot".into());
+                    }
+                }
+                let prev = t.clone();
+                let t = self.wb.table_mut(table).unwrap();
+                let had = t.pivot.is_some();
+                t.pivot = spec;
+                if had && t.pivot.is_none() {
+                    // keep the values as plain cells
+                    for c in t.cells.values_mut() {
+                        c.spill_from = None;
+                        c.input = c.value.to_display();
+                    }
+                }
+                ch.push_table(&self.wb, table);
+                ch.reload.push(table);
+                self.recalc_all_into(ch);
+                Ok(Some(Inverse::Tables(vec![(table, Some(prev))])))
+            }
+            Op::SetFilters { table, filters } => {
+                let t = self.wb.table_mut(table).ok_or("no such table")?;
+                let prev = t.clone();
+                t.filters = filters.into_iter().filter(|f| f.col < t.cols).collect();
+                t.apply_filters();
+                ch.push_table(&self.wb, table);
+                // SUBTOTAL(1xx) results depend on hidden rows
+                self.recalc_all_into(ch);
+                Ok(Some(Inverse::Tables(vec![(table, Some(prev))])))
+            }
+            Op::SetCondFormats { table, rules } => {
+                let t = self.wb.table_mut(table).ok_or("no such table")?;
+                let prev = t.clone();
+                t.cond_formats = rules;
+                ch.push_table(&self.wb, table);
+                Ok(Some(Inverse::Tables(vec![(table, Some(prev))])))
+            }
+            Op::SetValidations { table, rules } => {
+                let t = self.wb.table_mut(table).ok_or("no such table")?;
+                let prev = t.clone();
+                t.validations = rules;
+                let marked = self.revalidate(table, None);
+                ch.push_table(&self.wb, table);
+                for r in marked {
+                    ch.push_cell(&self.wb, r);
+                }
+                Ok(Some(Inverse::Tables(vec![(table, Some(prev))])))
+            }
+            Op::SetName { name, reference } => {
+                let name = name.trim().to_string();
+                if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') || name.chars().next().unwrap().is_ascii_digit() {
+                    return Err("a name must start with a letter and contain only letters, digits, '_' or '.'".into());
+                }
+                if crate::formula::parse(&name).map(|e| matches!(e, crate::formula::Expr::Ref(_))).unwrap_or(false) {
+                    return Err("that looks like a cell reference".into());
+                }
+                let prev = self.wb.names.clone();
+                let lower = name.to_lowercase();
+                self.wb.names.retain(|n| n.name.to_lowercase() != lower);
+                if let Some(r) = reference {
+                    let r = r.trim().trim_start_matches('=').to_string();
+                    if r.is_empty() {
+                        return Err("reference cannot be empty".into());
+                    }
+                    crate::formula::parse(&r).map_err(|e| format!("bad reference: {}", e.0))?;
+                    self.wb.names.push(NamedRange { name, reference: r });
+                    self.wb.names.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                }
+                ch.names = Some(self.wb.names.clone());
+                self.recalc_all_into(ch);
+                Ok(Some(Inverse::Names(prev)))
+            }
         }
+    }
+
+    /// Re-check validation marks of a table (optionally only inside a rectangle); returns cells whose mark changed.
+    fn revalidate(&mut self, table: TableId, rect: Option<(u32, u32, u32, u32)>) -> Vec<CellRef> {
+        let mut out = vec![];
+        let t = match self.wb.table(table) {
+            Some(t) => t,
+            None => return out,
+        };
+        if t.validations.is_empty() && rect.is_some() {
+            return out;
+        }
+        let mut updates: Vec<(CellKey, bool)> = vec![];
+        for (k, c) in &t.cells {
+            if let Some((r0, c0, r1, c1)) = rect {
+                if k.row < r0 || k.row > r1 || k.col < c0 || k.col > c1 {
+                    continue;
+                }
+            }
+            let covered = t.validations.iter().any(|r| k.row >= r.r0 && k.row <= r.r1 && k.col >= r.c0 && k.col <= r.c1);
+            let invalid = covered && c.kind == CellKind::Value && c.spill_from.is_none() && crate::validation::check(&self.wb, table, *k, &c.input).is_err();
+            if invalid != c.invalid {
+                updates.push((*k, invalid));
+            }
+        }
+        let t = self.wb.table_mut(table).unwrap();
+        for (k, inv) in updates {
+            if let Some(c) = t.cells.get_mut(&k) {
+                c.invalid = inv;
+                out.push(CellRef::new(table, k.row, k.col));
+            }
+        }
+        out
+    }
+
+    /// Write a rectangular output starting at `origin` as spilled cells; returns whether the table grew.
+    /// `patch` runs on the origin cell first and returns true when the value was set to an error already.
+    fn write_spill(&mut self, origin: CellRef, output: Option<&Vec<Vec<Value>>>, changed: &mut Vec<CellRef>, patch: impl FnOnce(&mut Cell) -> bool) -> bool {
+        let (table, row, col) = (origin.table, origin.row, origin.col);
+        let (out_rows, out_cols) = match output {
+            Some(v) => (v.len() as u32, v.iter().map(|r| r.len()).max().unwrap_or(0) as u32),
+            None => (0, 0),
+        };
+        let t = self.wb.table_mut(table).unwrap();
+        let mut grew = false;
+        if row + out_rows > t.rows || col + out_cols > t.cols {
+            t.rows = t.rows.max(row + out_rows).min(MAX_ROWS);
+            t.cols = t.cols.max(col + out_cols).min(MAX_COLS);
+            t.normalise_geometry();
+            grew = true;
+        }
+        let mut blocked = false;
+        if out_rows * out_cols > 1 {
+            for i in 0..out_rows {
+                for j in 0..out_cols {
+                    if i == 0 && j == 0 {
+                        continue;
+                    }
+                    if let Some(c) = t.cells.get(&CellKey::new(row + i, col + j)) {
+                        if !c.is_blank() && c.spill_from != Some(CellKey::new(row, col)) {
+                            blocked = true;
+                        }
+                    }
+                }
+            }
+        }
+        let entry = t.cells.get_mut(&CellKey::new(row, col)).unwrap();
+        entry.spill_size = None;
+        let already_error = patch(entry);
+        if already_error {
+            return grew;
+        }
+        if blocked {
+            entry.value = Value::Error(ErrorKind::Spill);
+            return grew;
+        }
+        match output {
+            None => entry.value = Value::Empty,
+            Some(v) => {
+                entry.value = v.first().and_then(|r| r.first()).cloned().unwrap_or(Value::Empty);
+                if out_rows * out_cols > 1 {
+                    entry.spill_size = Some((out_rows, out_cols));
+                    for i in 0..out_rows {
+                        for j in 0..out_cols {
+                            if i == 0 && j == 0 {
+                                continue;
+                            }
+                            let val = v.get(i as usize).and_then(|r| r.get(j as usize)).cloned().unwrap_or(Value::Empty);
+                            let key = CellKey::new(row + i, col + j);
+                            let fmt = t.cells.get(&key).map(|c| c.format.clone()).unwrap_or_default();
+                            t.cells.insert(
+                                key,
+                                Cell {
+                                    input: String::new(),
+                                    kind: CellKind::Value,
+                                    value: val,
+                                    spill_from: Some(CellKey::new(row, col)),
+                                    format: fmt,
+                                    ..Default::default()
+                                },
+                            );
+                            changed.push(CellRef::new(table, key.row, key.col));
+                        }
+                    }
+                }
+            }
+        }
+        grew
     }
 
     fn snapshot_other_tables(&self, except: TableId) -> Vec<(TableId, Option<Table>)> {
@@ -859,7 +1117,11 @@ impl Engine {
                 if new != body {
                     c.input = format!("={}", new);
                 }
+                c.deps_valid = false;
             }
+        }
+        for nr in self.wb.names.iter_mut() {
+            nr.reference = formula::adjust_for_insert_delete(&nr.reference, false, name, is_rows, at, count);
         }
     }
 
@@ -945,7 +1207,8 @@ impl Engine {
                     counter.push((r, self.wb.cell(r).cloned()));
                     if let Some(t) = self.wb.table_mut(r.table) {
                         match cell {
-                            Some(c) => {
+                            Some(mut c) => {
+                                c.deps_valid = false;
                                 t.cells.insert(r.key(), c);
                             }
                             None => {
@@ -988,6 +1251,13 @@ impl Engine {
                 self.recalc_all_into(&mut ch);
                 (Inverse::Tables(counter), ch)
             }
+            Inverse::Names(names) => {
+                let counter = self.wb.names.clone();
+                self.wb.names = names;
+                ch.names = Some(self.wb.names.clone());
+                self.recalc_all_into(&mut ch);
+                (Inverse::Names(counter), ch)
+            }
         }
     }
 
@@ -995,13 +1265,39 @@ impl Engine {
     // recalculation
     // ------------------------------------------------------------------
 
+    /// Make sure every formula cell has up-to-date dependency rectangles.
+    fn refresh_deps(&mut self, all: bool) {
+        let mut todo: Vec<(CellRef, String)> = vec![];
+        for t in &self.wb.tables {
+            for (k, c) in &t.cells {
+                if c.kind == CellKind::Formula && (all || !c.deps_valid) {
+                    todo.push((CellRef::new(t.id, k.row, k.col), c.input.clone()));
+                }
+            }
+        }
+        if todo.is_empty() {
+            return;
+        }
+        let computed: Vec<(CellRef, Vec<Rect>)> = todo
+            .iter()
+            .map(|(r, input)| (*r, formula::dependencies(&self.wb, r.table, formula::formula_body(input))))
+            .collect();
+        for (r, deps) in computed {
+            if let Some(t) = self.wb.table_mut(r.table) {
+                if let Some(c) = t.cells.get_mut(&r.key()) {
+                    c.deps = deps;
+                    c.deps_valid = true;
+                }
+            }
+        }
+    }
+
     fn formula_cells(&self) -> Vec<(CellRef, Vec<Rect>)> {
         let mut out = vec![];
         for t in &self.wb.tables {
             for (k, c) in &t.cells {
                 if c.kind == CellKind::Formula {
-                    let deps = formula::dependencies(&self.wb, t.id, formula::formula_body(&c.input));
-                    out.push((CellRef::new(t.id, k.row, k.col), deps));
+                    out.push((CellRef::new(t.id, k.row, k.col), c.deps.clone()));
                 }
             }
         }
@@ -1014,9 +1310,19 @@ impl Engine {
     }
 
     fn recalc_all_into(&mut self, ch: &mut Changes) {
+        self.refresh_deps(true);
         let all = self.formula_cells();
         let dirty: Vec<CellRef> = all.iter().map(|(r, _)| *r).collect();
-        self.evaluate_dirty(&all, &dirty, ch);
+        let mut extra = self.evaluate_dirty(&all, &dirty, ch);
+        let mut rounds = 0;
+        while !extra.is_empty() && rounds < MAX_SPILL_ROUNDS {
+            rounds += 1;
+            extra = self.recalc_round(&extra, ch);
+        }
+        self.recompute_pivots(None, ch);
+        for t in self.wb.tables.iter_mut() {
+            t.apply_filters();
+        }
         // after a structural change every code cell may read different data
         for t in &self.wb.tables {
             for (k, c) in &t.cells {
@@ -1032,32 +1338,50 @@ impl Engine {
         for r in changed {
             ch.push_cell(&self.wb, *r);
         }
-        let all = self.formula_cells();
-        let formula_set: HashSet<CellRef> = all.iter().map(|(r, _)| *r).collect();
-        let mut dirty: HashSet<CellRef> = HashSet::new();
-        // formulas among the changed cells are dirty themselves
-        for r in changed {
-            if formula_set.contains(r) {
-                dirty.insert(*r);
+        self.refresh_deps(false);
+        let mut frontier: Vec<CellRef> = changed.to_vec();
+        // blocked spills (#SPILL!) in a touched table get another chance: a blocking cell may have gone
+        let tables_touched: HashSet<TableId> = changed.iter().map(|r| r.table).collect();
+        for t in &self.wb.tables {
+            if !tables_touched.contains(&t.id) {
+                continue;
             }
-        }
-        // iterative closure: formulas reading any changed cell become dirty, and their
-        // own cells count as changed for the next round
-        let mut frontier: HashSet<CellRef> = changed.iter().cloned().collect();
-        while !frontier.is_empty() {
-            let hit = formulas_reading(&all, &frontier, &dirty);
-            frontier.clear();
-            for f in hit {
-                if dirty.insert(f) {
-                    frontier.insert(f);
+            for (k, c) in &t.cells {
+                if c.kind == CellKind::Formula && c.value == Value::Error(ErrorKind::Spill) {
+                    let me = CellRef::new(t.id, k.row, k.col);
+                    if !frontier.contains(&me) {
+                        frontier.push(me);
+                    }
                 }
             }
         }
-        let dirty_vec: Vec<CellRef> = dirty.into_iter().collect();
-        self.evaluate_dirty(&all, &dirty_vec, ch);
-        // code cells reading any changed cell
         let mut all_changed: HashSet<CellRef> = changed.iter().cloned().collect();
-        all_changed.extend(dirty_vec.iter().cloned());
+        let mut rounds = 0;
+        while !frontier.is_empty() && rounds < MAX_SPILL_ROUNDS {
+            rounds += 1;
+            let next = self.recalc_round(&frontier, ch);
+            all_changed.extend(frontier.iter().cloned());
+            frontier = next;
+        }
+        all_changed.extend(frontier.iter().cloned());
+        // pivots whose source table changed
+        let touched: HashSet<TableId> = all_changed.iter().map(|r| r.table).collect();
+        self.recompute_pivots(Some(&touched), ch);
+        // filters of touched tables
+        let mut refiltered = vec![];
+        for t in self.wb.tables.iter_mut() {
+            if touched.contains(&t.id) && !t.filters.is_empty() {
+                let before = t.hidden_rows.clone();
+                t.apply_filters();
+                if before != t.hidden_rows {
+                    refiltered.push(t.id);
+                }
+            }
+        }
+        for id in refiltered {
+            ch.push_table(&self.wb, id);
+        }
+        // code cells reading any changed cell
         let mut reruns = HashSet::new();
         for t in &self.wb.tables {
             for (k, c) in &t.cells {
@@ -1082,14 +1406,69 @@ impl Engine {
         }
     }
 
+    /// One recalculation round: formulas reading `frontier` are re-evaluated; returns the
+    /// cells written by spills (which may in turn feed other formulas).
+    fn recalc_round(&mut self, frontier: &[CellRef], ch: &mut Changes) -> Vec<CellRef> {
+        let all = self.formula_cells();
+        let formula_set: HashSet<CellRef> = all.iter().map(|(r, _)| *r).collect();
+        let mut dirty: HashSet<CellRef> = HashSet::new();
+        for r in frontier {
+            if formula_set.contains(r) {
+                dirty.insert(*r);
+            }
+        }
+        // iterative closure: formulas reading any changed cell become dirty, and their
+        // own cells (plus their current spill areas) count as changed for the next round
+        let mut front: HashSet<CellRef> = frontier.iter().cloned().collect();
+        while !front.is_empty() {
+            let hit = formulas_reading(&all, &front, &dirty);
+            front.clear();
+            for f in hit {
+                if dirty.insert(f) {
+                    front.insert(f);
+                    if let Some(c) = self.wb.cell(f) {
+                        if let Some((sr, sc)) = c.spill_size {
+                            for i in 0..sr {
+                                for j in 0..sc {
+                                    front.insert(CellRef::new(f.table, f.row + i, f.col + j));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let dirty_vec: Vec<CellRef> = dirty.into_iter().collect();
+        self.evaluate_dirty(&all, &dirty_vec, ch)
+    }
+
     /// Evaluate `dirty` formula cells in dependency order (cycles → #CYCLE!).
-    fn evaluate_dirty(&mut self, all: &[(CellRef, Vec<Rect>)], dirty: &[CellRef], ch: &mut Changes) {
+    /// Returns cells changed by spills other than the formula cells themselves.
+    fn evaluate_dirty(&mut self, all: &[(CellRef, Vec<Rect>)], dirty: &[CellRef], ch: &mut Changes) -> Vec<CellRef> {
         if dirty.is_empty() {
-            return;
+            return vec![];
         }
         let dirty_set: HashSet<CellRef> = dirty.iter().cloned().collect();
         let rects: HashMap<CellRef, &Vec<Rect>> = all.iter().map(|(r, d)| (*r, d)).collect();
-        // edges: f -> g when f reads g (both dirty)
+        // spill areas of dirty formulas (from their previous evaluation)
+        let spill_areas: Vec<(CellRef, Rect)> = dirty
+            .iter()
+            .filter_map(|f| {
+                self.wb.cell(*f).and_then(|c| c.spill_size).map(|(sr, sc)| {
+                    (
+                        *f,
+                        Rect {
+                            table: f.table,
+                            r0: f.row,
+                            c0: f.col,
+                            r1: f.row + sr - 1,
+                            c1: f.col + sc - 1,
+                        },
+                    )
+                })
+            })
+            .collect();
+        // edges: f -> g when f reads g (both dirty) or reads g's spill area
         let mut edges: HashMap<CellRef, Vec<CellRef>> = HashMap::new();
         for f in dirty {
             let mut precedents: Vec<CellRef> = vec![];
@@ -1111,6 +1490,11 @@ impl Engine {
                             if rect.table == g.table && rect.contains(g.key()) && seen.insert(*g) {
                                 precedents.push(*g);
                             }
+                        }
+                    }
+                    for (g, area) in &spill_areas {
+                        if g != f && rect.intersects(area) && seen.insert(*g) {
+                            precedents.push(*g);
                         }
                     }
                 }
@@ -1156,20 +1540,176 @@ impl Engine {
                 }
             }
         }
+        let mut extra: Vec<CellRef> = vec![];
         for r in order {
-            let value = if in_cycle.contains(&r) {
-                Value::Error(ErrorKind::Cycle)
+            let result = if in_cycle.contains(&r) {
+                Arg::Scalar(Value::Error(ErrorKind::Cycle))
             } else {
                 let input = self.wb.cell(r).map(|c| c.input.clone()).unwrap_or_default();
-                formula::evaluate(&self.wb, r.table, Some(r.key()), formula::formula_body(&input))
+                formula::evaluate_full(&self.wb, r.table, Some(r.key()), formula::formula_body(&input))
             };
-            if let Some(t) = self.wb.table_mut(r.table) {
-                if let Some(c) = t.cells.get_mut(&r.key()) {
-                    c.value = value;
+            let had_spill = self.wb.cell(r).map(|c| c.spill_size.is_some()).unwrap_or(false);
+            match result {
+                Arg::Array(a) if a.rows * a.cols > 1 && a.rows * a.cols <= 1_000_000 => {
+                    let rows: Vec<Vec<Value>> = (0..a.rows).map(|i| a.row(i)).collect();
+                    let removed = self.clear_spill(r);
+                    extra.extend(removed.iter().cloned());
+                    let mut written = vec![];
+                    let grew = self.write_spill(r, Some(&rows), &mut written, |_| false);
+                    if grew {
+                        ch.push_table(&self.wb, r.table);
+                    }
+                    extra.extend(written.iter().cloned());
+                    for w in written {
+                        ch.push_cell(&self.wb, w);
+                    }
+                }
+                other => {
+                    let value = other.scalar();
+                    if had_spill {
+                        let removed = self.clear_spill(r);
+                        for w in &removed {
+                            ch.push_cell(&self.wb, *w);
+                        }
+                        extra.extend(removed);
+                    }
+                    if let Some(t) = self.wb.table_mut(r.table) {
+                        if let Some(c) = t.cells.get_mut(&r.key()) {
+                            c.value = value;
+                            c.spill_size = None;
+                        }
+                    }
                 }
             }
             ch.push_cell(&self.wb, r);
         }
+        // cells removed and re-written in the same pass only count once
+        let mut seen = HashSet::new();
+        extra.retain(|x| seen.insert(*x));
+        extra
+    }
+
+    // ------------------------------------------------------------------
+    // pivots
+    // ------------------------------------------------------------------
+
+    /// Recompute pivot outputs (all, or those whose source is in `sources`).
+    fn recompute_pivots(&mut self, sources: Option<&HashSet<TableId>>, ch: &mut Changes) {
+        let targets: Vec<TableId> = self
+            .wb
+            .tables
+            .iter()
+            .filter(|t| t.pivot.as_ref().map(|p| sources.map(|s| s.contains(&p.source)).unwrap_or(true)).unwrap_or(false))
+            .map(|t| t.id)
+            .collect();
+        for id in targets {
+            let spec = self.wb.table(id).and_then(|t| t.pivot.clone()).unwrap();
+            let output = match self.wb.table(spec.source) {
+                Some(src) => crate::pivot::compute(src, &spec),
+                None => vec![vec![Value::Error(ErrorKind::Ref)]],
+            };
+            let t = self.wb.table_mut(id).unwrap();
+            // keep formats, replace values
+            let mut formats: HashMap<CellKey, Format> = HashMap::new();
+            for (k, c) in &t.cells {
+                if !c.format.is_default() {
+                    formats.insert(*k, c.format.clone());
+                }
+            }
+            t.cells.clear();
+            let rows = output.len() as u32;
+            let cols = output.iter().map(|r| r.len()).max().unwrap_or(1) as u32;
+            t.rows = rows.max(1).min(MAX_ROWS);
+            t.cols = cols.max(1).min(MAX_COLS);
+            t.header_rows = 1;
+            t.normalise_geometry();
+            for (i, r) in output.iter().enumerate() {
+                for (j, v) in r.iter().enumerate() {
+                    if v.is_empty() {
+                        continue;
+                    }
+                    let key = CellKey::new(i as u32, j as u32);
+                    t.cells.insert(
+                        key,
+                        Cell {
+                            input: String::new(),
+                            kind: CellKind::Value,
+                            value: v.clone(),
+                            spill_from: Some(CellKey::new(0, 0)),
+                            format: formats.remove(&key).unwrap_or_default(),
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            for (k, f) in formats {
+                if k.row < t.rows && k.col < t.cols {
+                    t.cells.insert(
+                        k,
+                        Cell {
+                            format: f,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            ch.push_table(&self.wb, id);
+            if !ch.reload.contains(&id) {
+                ch.reload.push(id);
+            }
+            // formulas reading the pivot output must follow
+            let cells: Vec<CellRef> = self.wb.table(id).unwrap().cells.keys().map(|k| CellRef::new(id, k.row, k.col)).collect();
+            let mut frontier = cells;
+            let mut rounds = 0;
+            while !frontier.is_empty() && rounds < MAX_SPILL_ROUNDS {
+                rounds += 1;
+                frontier = self.recalc_round(&frontier, ch);
+            }
+        }
+    }
+}
+
+/// Shift conditional-format and validation rectangles after rows/columns were inserted or deleted.
+fn shift_rules(t: &mut Table, is_rows: bool, at: u32, count: i64) {
+    let shift = |a: &mut u32, b: &mut u32| -> bool {
+        let (mut lo, mut hi) = (*a as i64, *b as i64);
+        if count > 0 {
+            if lo >= at as i64 {
+                lo += count;
+            }
+            if hi >= at as i64 {
+                hi += count;
+            }
+        } else {
+            let del = -count;
+            let (d0, d1) = (at as i64, at as i64 + del - 1);
+            if lo >= d0 && hi <= d1 {
+                return false; // fully deleted
+            }
+            if lo > d1 {
+                lo -= del;
+            } else if lo >= d0 {
+                lo = d0;
+            }
+            if hi > d1 {
+                hi -= del;
+            } else if hi >= d0 {
+                hi = d0 - 1;
+            }
+        }
+        *a = lo.max(0) as u32;
+        *b = hi.max(0) as u32;
+        true
+    };
+    t.cond_formats.retain_mut(|r| if is_rows { shift(&mut r.r0, &mut r.r1) } else { shift(&mut r.c0, &mut r.c1) });
+    t.validations.retain_mut(|r| if is_rows { shift(&mut r.r0, &mut r.r1) } else { shift(&mut r.c0, &mut r.c1) });
+    if !is_rows {
+        t.filters.retain_mut(|f| {
+            let (mut a, mut b) = (f.col, f.col);
+            let keep = shift(&mut a, &mut b);
+            f.col = a;
+            keep
+        });
     }
 }
 
@@ -1233,6 +1773,8 @@ mod tests {
             col: c,
             input: s.into(),
             kind: None,
+            conn: None,
+            refresh: None,
         })
     }
 
@@ -1297,16 +1839,19 @@ mod tests {
         assert_eq!(val(&e, 1, 0, 0), Value::Number(10.0));
         set(&mut e, 2, 1, 1, "3");
         assert_eq!(val(&e, 1, 0, 0), Value::Number(12.0));
+        // renaming rewrites the formulas that reference the table
         e.apply(Op::RenameTable {
             table: 2,
             name: "Costs".into(),
         });
-        assert_eq!(val(&e, 1, 0, 0), Value::Error(ErrorKind::Ref));
-        e.apply(Op::RenameTable {
-            table: 2,
-            name: "Prices".into(),
-        });
+        assert_eq!(e.wb.cell(CellRef::new(1, 0, 0)).unwrap().input, "=Costs::B2 * 4");
         assert_eq!(val(&e, 1, 0, 0), Value::Number(12.0));
+        e.undo();
+        assert_eq!(e.wb.cell(CellRef::new(1, 0, 0)).unwrap().input, "=Prices::B2*4");
+        assert_eq!(e.wb.table(2).unwrap().name, "Prices");
+        // structured reference by header name
+        set(&mut e, 1, 1, 0, "=SUM(Prices[price])");
+        assert_eq!(val(&e, 1, 1, 0), Value::Number(3.0));
     }
 
     #[test]
@@ -1379,6 +1924,8 @@ mod tests {
             col: 1,
             input: "q.cells('A1')".into(),
             kind: Some(CellKind::Python),
+            conn: None,
+            refresh: None,
         });
         assert_eq!(ch.rerun_code, vec![CellRef::new(1, 0, 1)]);
         let ch = e.apply(Op::CodeResult {
@@ -1456,5 +2003,228 @@ mod tests {
         let e2 = Engine::new(wb2);
         assert_eq!(val(&e2, 1, 5, 2), Value::Number(3.0));
         assert_eq!(e2.wb.table(1).unwrap().name, "Data");
+    }
+
+    #[test]
+    fn dynamic_arrays_spill_and_chain() {
+        let mut e = engine();
+        for (i, v) in ["1", "2", "3", "4"].iter().enumerate() {
+            set(&mut e, 1, i as u32, 0, v);
+        }
+        // =A1:A4*10 spills down column B
+        let ch = set(&mut e, 1, 0, 1, "=A1:A4*10");
+        assert!(ch.error.is_none());
+        assert_eq!(val(&e, 1, 0, 1), Value::Number(10.0));
+        assert_eq!(val(&e, 1, 3, 1), Value::Number(40.0));
+        assert_eq!(e.wb.cell(CellRef::new(1, 0, 1)).unwrap().spill_size, Some((4, 1)));
+        assert_eq!(e.wb.cell(CellRef::new(1, 3, 1)).unwrap().spill_from, Some(CellKey::new(0, 1)));
+        // a formula reading the spilled area follows changes in the source data
+        set(&mut e, 1, 5, 1, "=SUM(B1:B4)");
+        assert_eq!(val(&e, 1, 5, 1), Value::Number(100.0));
+        set(&mut e, 1, 0, 0, "11");
+        assert_eq!(val(&e, 1, 0, 1), Value::Number(110.0));
+        assert_eq!(val(&e, 1, 5, 1), Value::Number(200.0));
+        // blocked spill → #SPILL!, unblocking restores it
+        let ch = set(&mut e, 1, 2, 1, "x");
+        assert!(ch.error.is_some()); // spilled cells are read-only
+        set(&mut e, 1, 0, 2, "=TRANSPOSE(A1:A4)");
+        assert_eq!(val(&e, 1, 0, 5), Value::Number(4.0));
+        assert_eq!(e.wb.table(1).unwrap().cols, 6); // grew to fit
+        set(&mut e, 1, 4, 0, "=SEQUENCE(1,2)");
+        assert_eq!(val(&e, 1, 4, 1), Value::Number(2.0));
+        assert!(set(&mut e, 1, 4, 1, "=1").error.is_some()); // spilled cells are read-only
+        // a value placed where a spill wants to go blocks it: #SPILL!, then unblocking restores it
+        set(&mut e, 1, 4, 0, "1");
+        set(&mut e, 1, 4, 1, "wall");
+        set(&mut e, 1, 4, 0, "=SEQUENCE(1,2)");
+        assert_eq!(val(&e, 1, 4, 0), Value::Error(ErrorKind::Spill));
+        set(&mut e, 1, 4, 1, "");
+        assert_eq!(val(&e, 1, 4, 1), Value::Number(2.0));
+        // make the source scalar again: spill cleared and readers updated
+        set(&mut e, 1, 0, 1, "=A1*10");
+        assert_eq!(val(&e, 1, 3, 1), Value::Empty);
+        assert_eq!(val(&e, 1, 5, 1), Value::Number(110.0));
+        // FILTER with structured reference + dynamic growth
+        e.apply(Op::AddTable {
+            id: None,
+            name: Some("Orders".into()),
+            x: 0.0,
+            y: 0.0,
+            rows: 4,
+            cols: 2,
+            values: Some(vec![
+                vec!["Region".into(), "Amount".into()],
+                vec!["N".into(), "10".into()],
+                vec!["S".into(), "20".into()],
+                vec!["N".into(), "30".into()],
+            ]),
+        });
+        set(&mut e, 1, 5, 3, "=FILTER(Orders[Amount], Orders[Region]=\"N\")");
+        assert_eq!(val(&e, 1, 5, 3), Value::Number(10.0));
+        assert_eq!(val(&e, 1, 6, 3), Value::Number(30.0));
+        set(&mut e, 2, 2, 0, "N");
+        assert_eq!(val(&e, 1, 7, 3), Value::Number(30.0));
+        assert_eq!(val(&e, 1, 6, 3), Value::Number(20.0));
+        // dates typed as text become serials with a date format
+        set(&mut e, 1, 5, 0, "2026-10-08");
+        assert_eq!(val(&e, 1, 5, 0), Value::Number(46303.0));
+        assert_eq!(e.wb.cell(CellRef::new(1, 5, 0)).unwrap().format.number_format.as_deref(), Some("yyyy-mm-dd"));
+    }
+
+    #[test]
+    fn validation_rules_mark_and_block() {
+        let mut e = engine();
+        e.apply(Op::SetValidations {
+            table: 1,
+            rules: vec![
+                Validation {
+                    r0: 0,
+                    c0: 0,
+                    r1: 5,
+                    c1: 0,
+                    kind: "list".into(),
+                    op: None,
+                    values: vec!["North".into(), "South".into()],
+                    allow_blank: true,
+                    strict: true,
+                    message: None,
+                },
+                Validation {
+                    r0: 0,
+                    c0: 1,
+                    r1: 5,
+                    c1: 1,
+                    kind: "number".into(),
+                    op: Some("between".into()),
+                    values: vec!["0".into(), "100".into()],
+                    allow_blank: true,
+                    strict: false,
+                    message: None,
+                },
+            ],
+        });
+        assert!(set(&mut e, 1, 0, 0, "East").error.is_some());
+        assert!(set(&mut e, 1, 0, 0, "north").error.is_none());
+        let ch = set(&mut e, 1, 0, 1, "250");
+        assert!(ch.error.is_none());
+        assert!(ch.cells[&1].iter().any(|c| c.r == 0 && c.c == 1 && c.inv));
+        assert!(e.wb.cell(CellRef::new(1, 0, 1)).unwrap().invalid);
+        set(&mut e, 1, 0, 1, "50");
+        assert!(!e.wb.cell(CellRef::new(1, 0, 1)).unwrap().invalid);
+        // changing the rules re-marks existing cells
+        set(&mut e, 1, 1, 1, "7");
+        e.apply(Op::SetValidations {
+            table: 1,
+            rules: vec![Validation {
+                r0: 0,
+                c0: 1,
+                r1: 5,
+                c1: 1,
+                kind: "integer".into(),
+                op: Some("ge".into()),
+                values: vec!["10".into()],
+                allow_blank: true,
+                strict: false,
+                message: Some("at least 10, please".into()),
+            }],
+        });
+        assert!(e.wb.cell(CellRef::new(1, 1, 1)).unwrap().invalid);
+        assert!(!e.wb.cell(CellRef::new(1, 0, 1)).unwrap().invalid);
+    }
+
+    #[test]
+    fn names_filters_and_pivot() {
+        let mut e = engine();
+        e.apply(Op::AddTable {
+            id: None,
+            name: Some("Sales".into()),
+            x: 0.0,
+            y: 0.0,
+            rows: 6,
+            cols: 3,
+            values: Some(vec![
+                vec!["Region".into(), "Product".into(), "Amount".into()],
+                vec!["North".into(), "A".into(), "10".into()],
+                vec!["South".into(), "A".into(), "20".into()],
+                vec!["North".into(), "B".into(), "30".into()],
+                vec!["South".into(), "B".into(), "40".into()],
+                vec!["North".into(), "A".into(), "5".into()],
+            ]),
+        });
+        // names
+        let ch = e.apply(Op::SetName {
+            name: "Total".into(),
+            reference: Some("=Sales[Amount]".into()),
+        });
+        assert!(ch.error.is_none(), "{:?}", ch.error);
+        set(&mut e, 1, 0, 0, "=SUM(Total)");
+        assert_eq!(val(&e, 1, 0, 0), Value::Number(105.0));
+        let ch = e.apply(Op::SetName {
+            name: "A1".into(),
+            reference: Some("1".into()),
+        });
+        assert!(ch.error.is_some());
+        // filters hide rows; SUBTOTAL(109) ignores them
+        set(&mut e, 1, 1, 0, "=SUBTOTAL(109, Sales::C2:C6)");
+        assert_eq!(val(&e, 1, 1, 0), Value::Number(105.0));
+        e.apply(Op::SetFilters {
+            table: 2,
+            filters: vec![ColumnFilter {
+                col: 0,
+                values: Some(vec!["North".into()]),
+                op: None,
+                value: None,
+            }],
+        });
+        assert_eq!(e.wb.table(2).unwrap().hidden_rows, vec![2, 4]);
+        assert_eq!(val(&e, 1, 1, 0), Value::Number(45.0));
+        e.apply(Op::SetFilters { table: 2, filters: vec![] });
+        assert_eq!(val(&e, 1, 1, 0), Value::Number(105.0));
+        // pivot: Region × Product, sum of Amount
+        e.apply(Op::AddTable {
+            id: None,
+            name: Some("Pivot".into()),
+            x: 0.0,
+            y: 0.0,
+            rows: 2,
+            cols: 2,
+            values: None,
+        });
+        let ch = e.apply(Op::SetPivot {
+            table: 3,
+            spec: Some(PivotSpec {
+                source: 2,
+                rows: vec!["Region".into()],
+                cols: vec!["Product".into()],
+                values: vec![PivotValue {
+                    field: "Amount".into(),
+                    agg: "sum".into(),
+                }],
+                filters: vec![],
+                totals: true,
+            }),
+        });
+        assert!(ch.error.is_none(), "{:?}", ch.error);
+        let p = e.wb.table(3).unwrap();
+        // header: Region | A | B | Total ; rows North, South, Total
+        assert_eq!(p.value_at(CellKey::new(0, 0)), Value::Text("Region".into()));
+        assert_eq!(p.value_at(CellKey::new(0, 1)), Value::Text("A".into()));
+        assert_eq!(p.value_at(CellKey::new(1, 0)), Value::Text("North".into()));
+        assert_eq!(p.value_at(CellKey::new(1, 1)), Value::Number(15.0));
+        assert_eq!(p.value_at(CellKey::new(1, 2)), Value::Number(30.0));
+        assert_eq!(p.value_at(CellKey::new(1, 3)), Value::Number(45.0));
+        assert_eq!(p.value_at(CellKey::new(3, 3)), Value::Number(105.0));
+        // pivot output is read-only and follows the source
+        assert!(set(&mut e, 3, 1, 1, "9").error.is_some());
+        set(&mut e, 1, 2, 0, "=Pivot::D4");
+        assert_eq!(val(&e, 1, 2, 0), Value::Number(105.0));
+        set(&mut e, 2, 1, 2, "110");
+        assert_eq!(e.wb.table(3).unwrap().value_at(CellKey::new(1, 1)), Value::Number(115.0));
+        assert_eq!(val(&e, 1, 2, 0), Value::Number(205.0));
+        // round trip keeps the pivot
+        let json = serde_json::to_string(&e.wb).unwrap();
+        let e2 = Engine::new(serde_json::from_str(&json).unwrap());
+        assert_eq!(e2.wb.table(3).unwrap().value_at(CellKey::new(3, 3)), Value::Number(205.0));
+        assert_eq!(e2.wb.names.len(), 1);
     }
 }

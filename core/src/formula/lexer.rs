@@ -29,6 +29,8 @@ pub enum Token {
     Percent,
     /// Error literal such as `#REF!` (appears in rewritten formulas).
     ErrorLit(String),
+    /// Structured-reference column selector: `[Amount]`, `[@Amount]` (text between brackets).
+    Bracket(String),
     Eof,
 }
 
@@ -115,6 +117,29 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
                 i += 1;
             }
             out.push(Token::Quoted(s));
+            continue;
+        }
+        // structured reference column: [Amount] / [@Amount]  ("]]" escapes a bracket)
+        if c == '[' {
+            i += 1;
+            let mut s = String::new();
+            loop {
+                if i >= chars.len() {
+                    return Err(LexError("unterminated '['".into()));
+                }
+                if chars[i] == ']' {
+                    if i + 1 < chars.len() && chars[i + 1] == ']' {
+                        s.push(']');
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                s.push(chars[i]);
+                i += 1;
+            }
+            out.push(Token::Bracket(s));
             continue;
         }
         // error literal (#REF!, #DIV/0!, #N/A ...)
