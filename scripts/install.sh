@@ -17,8 +17,11 @@
 #                      matplotlib, openpyxl) for server-side Python cells. Without it the host's
 #                      python3 is used as it is. For GPU cells install RAPIDS into that venv:
 #                      ~/gridwright-data/pyenv/bin/pip install --extra-index-url=https://pypi.nvidia.com "cudf-cu13"
-#                      (pick the cuXX that matches `nvidia-smi`; see rapids.ai/start). Sandboxing is
-#                      strongest with bubblewrap: sudo apt install bubblewrap.
+#                      (pick the cuXX that matches `nvidia-smi`; see rapids.ai/start).
+#   --sandbox          strongest isolation for server-side Python cells: installs bubblewrap and, on
+#                      Ubuntu ≥ 23.10 (DGX OS included), an AppArmor profile that lets it create user
+#                      namespaces — without it those kernels confine the namespace and cells run as a
+#                      plain process. Uses sudo once; re-run the installer afterwards is not needed.
 #   --no-backup        do not install the nightly backup timer.
 #
 # Environment:
@@ -47,12 +50,14 @@ PYODIDE_VERSION="0.27.5"
 TAILSCALE=0
 PYODIDE=0
 PYVENV=0
+SANDBOX=0
 BACKUP=1
 for a in "$@"; do
   case "$a" in
     --tailscale) TAILSCALE=1 ;;
     --pyodide) PYODIDE=1 ;;
     --python) PYVENV=1 ;;
+    --sandbox) SANDBOX=1 ;;
     --no-backup) BACKUP=0 ;;
     -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
@@ -131,8 +136,24 @@ if [ "$PYVENV" = 1 ]; then
   "$DATA/pyenv/bin/pip" install -q --upgrade pip pandas numpy matplotlib openpyxl || die "pip install failed (is the internet reachable?)"
   say "venv ready: $("$DATA/pyenv/bin/python" --version) with pandas $("$DATA/pyenv/bin/python" -c 'import pandas; print(pandas.__version__)')"
 fi
-if ! command -v bwrap >/dev/null 2>&1; then
-  echo "note: bubblewrap is not installed; server-side Python cells fall back to a user namespace (no network) or a plain process. Strongest isolation: sudo apt install bubblewrap" >&2
+if [ "$SANDBOX" = 1 ]; then
+  command -v sudo >/dev/null 2>&1 || die "--sandbox needs sudo"
+  if ! command -v bwrap >/dev/null 2>&1; then
+    say "installing bubblewrap (sudo)"
+    sudo apt-get install -y -qq bubblewrap >/dev/null || die "apt-get install bubblewrap failed"
+  fi
+  if [ -d /etc/apparmor.d ] && [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ] && [ ! -f /etc/apparmor.d/bwrap ]; then
+    say "this kernel restricts unprivileged user namespaces; adding an AppArmor profile for bubblewrap (sudo)"
+    printf 'abi <abi/4.0>,\ninclude <tunables/global>\n\n# Lets bubblewrap create user namespaces on kernels with apparmor_restrict_unprivileged_userns=1\n# (installed by gridwright/scripts/install.sh --sandbox). The sandbox itself is set up by bwrap.\nprofile bwrap %s flags=(unconfined) {\n  userns,\n\n  include if exists <local/bwrap>\n}\n' "$(command -v bwrap)" | sudo tee /etc/apparmor.d/bwrap >/dev/null
+    sudo apparmor_parser -r -T -W /etc/apparmor.d/bwrap || die "apparmor_parser failed (is apparmor installed?)"
+  fi
+  if bwrap --ro-bind / / --tmpfs /tmp --proc /proc --dev /dev --unshare-all --die-with-parent true 2>/dev/null; then
+    say "bubblewrap sandbox works"
+  else
+    echo "warning: bubblewrap still cannot create its namespaces here; cells will fall back (see the health line below)" >&2
+  fi
+elif ! command -v bwrap >/dev/null 2>&1 || [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ] && [ ! -f /etc/apparmor.d/bwrap ]; then
+  echo "note: for the strongest isolation of server-side Python cells run the installer with --sandbox (bubblewrap + an AppArmor profile; needs sudo once)" >&2
 fi
 
 # --- run it: systemd user service when available, nohup otherwise --------------------------
@@ -243,7 +264,7 @@ for i in $(seq 1 30); do
   [ "$i" -eq 30 ] && { [ -f "$DATA/server.log" ] && tail -n 30 "$DATA/server.log"; journalctl --user -u gridwright --no-pager -n 30 2>/dev/null || true; die "server did not answer on port $PORT"; }
 done
 
-py_line="$(curl -fsS -H "Authorization: Bearer ${GW_TOKEN:-}" "http://127.0.0.1:$PORT/api/health" 2>/dev/null | "$NODE_BIN" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const p=JSON.parse(s).python;process.stdout.write(p?`CPython ${p.version}, sandbox: ${p.sandbox}${p.gpu&&p.gpu.startsWith("cudf")?", GPU: "+p.gpu:", no GPU (cuDF not installed)"}`:"off — no python3 found (run with --python or set GW_PYTHON)")}catch{process.stdout.write("unknown")}})')"
+py_line="$(curl -fsS -H "Authorization: Bearer ${GW_TOKEN:-}" "http://127.0.0.1:$PORT/api/python" 2>/dev/null | "$NODE_BIN" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const p=JSON.parse(s);process.stdout.write(p.available?`CPython ${p.version}, sandbox: ${p.sandbox}${p.sandbox!=="bwrap"&&p.fallbacks?" ("+p.fallbacks+" — run the installer with --sandbox)":""}${p.gpu&&p.gpu.startsWith("cudf")?", GPU: "+p.gpu:", no GPU (cuDF not installed)"}`:"off — "+(p.reason||"no python3 found (run with --python or set GW_PYTHON)"))}catch{process.stdout.write("unknown")}})')"
 say "server-side Python cells: $py_line"
 
 if [ "$TAILSCALE" = 1 ]; then

@@ -75,11 +75,12 @@ The `release` branch carries the prebuilt engine, client and server, so only Nod
 ```bash
 scripts/install.sh --tailscale   # HTTPS on the tailnet via `tailscale serve`, identity + roles from Tailscale
 scripts/install.sh --python      # venv with pandas/numpy/matplotlib for server-side Python cells (recommended)
+scripts/install.sh --sandbox     # bubblewrap + an AppArmor profile so cells run fully isolated on Ubuntu ≥ 23.10 (sudo once)
 scripts/install.sh --pyodide     # download the browser Python runtime (~400 MB) for offline Pyodide cells
 GW_TOKEN=$(openssl rand -hex 16) GW_ADMINS=you@example.com AI_BASE_URL=http://host:8888/v1 scripts/install.sh
 ```
 
-Re-run the same two lines in a fresh folder to upgrade (the data directory `~/gridwright-data` is kept). Server-side Python cells use the host's `python3` as it is, or the venv `--python` creates; install `bubblewrap` (`sudo apt install bubblewrap`) for the strongest sandbox — the installer prints what it found. `--tailscale` needs `sudo tailscale set --operator=$USER` once and HTTPS certificates enabled in the Tailscale admin console.
+Re-run the same two lines in a fresh folder to upgrade (the data directory `~/gridwright-data` is kept). Server-side Python cells use the host's `python3` as it is, or the venv `--python` creates. For the strongest sandbox run once with `--sandbox`: it installs bubblewrap and, on Ubuntu 23.10+ (DGX OS included, where the kernel confines unprivileged user namespaces so plain `bwrap`/`unshare` cannot set up a sandbox), a small AppArmor profile granting `userns` to bubblewrap — the installer prints the sandbox level it ends up with, and `/api/python` says why a stronger one was not used. `--tailscale` needs `sudo tailscale set --operator=$USER` once and HTTPS certificates enabled in the Tailscale admin console.
 
 ### Docker
 
@@ -184,7 +185,7 @@ CI (`.github/workflows/ci.yml`) runs all of this on every push against PostgreSQ
 - SQL Server is exercised in CI against the official container, not yet against a Primavera instance — report the first error you see.
 - The AI assistant needs a model that follows the JSON action format and, for tools, OpenAI-style function calling; small local models may need a retry.
 - The SQL policy's text filter is a first line only; the database-side read-only session is what actually prevents writes, and it exists for PostgreSQL and MySQL. SQL Server has no equivalent, so a read-write login there relies on the filter and the row/time limits — give Gridwright a read-only login. MySQL streaming is compiled and unit-exercised but not yet run in CI.
-- Server-side Python runs arbitrary code on the host as the service user. With bubblewrap it cannot see the data directory, home directories or the network; with only a user namespace it cannot use the network but can read what the service user can read; with neither it is an ordinary process — `GRIDWRIGHT_PYTHON_SANDBOX=require` refuses that. The GPU path (cuDF, `/dev/nvidia*` bound into the sandbox) is implemented but has not yet been exercised on a DGX Spark; the CPU path has.
+- Server-side Python runs arbitrary code on the host as the service user. With bubblewrap it cannot see the data directory, home directories or the network; with only a user namespace it cannot use the network but can read what the service user can read; with neither it is an ordinary process — `GRIDWRIGHT_PYTHON_SANDBOX=require` refuses that. On Ubuntu 23.10+ the sandbox needs the AppArmor profile `install.sh --sandbox` adds (CI proves the recipe on 24.04); inside Docker the container is the boundary. The GPU path (cuDF, `/dev/nvidia*` bound into the sandbox) is implemented but has not yet been exercised on a DGX Spark; the CPU path has.
 - Run records attest that an output came from a given code and inputs on a given runtime; they do not re-execute anything. A record is written by the client that ran the cell, so a tampered client could lie — the audit trail says who.
 - MCP is stateless HTTP only (no SSE sessions, no resources or prompts); agents see documents with the permission of the identity the request carries.
 - Sharing is enforced by the server only when identity is on (Tailscale headers); without identity every document — and the MCP endpoint — is open to whoever reaches the server. Put it behind Tailscale or a reverse proxy for anything beyond a trusted network.

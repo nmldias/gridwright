@@ -71,9 +71,13 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client >/dev/null
           PGPASSWORD=gw psql -h 127.0.0.1 -p 54329 -U gw -d demo -c "CREATE TABLE orders(id serial primary key, region text, product text, amount numeric); INSERT INTO orders(region,product,amount) VALUES ('North','A',10),('South','A',20),('North','B',30),('South','B',40),('North','A',5);"
 
-      - name: Python runtime for server-side cells (venv + bubblewrap)
+      - name: Python runtime for server-side cells (venv + bubblewrap with the installer's AppArmor recipe)
         run: |
           sudo apt-get install -y -qq bubblewrap >/dev/null
+          # Ubuntu ≥ 23.10 confines unprivileged user namespaces; this is what install.sh --sandbox does
+          printf 'abi <abi/4.0>,\ninclude <tunables/global>\n\nprofile bwrap /usr/bin/bwrap flags=(unconfined) {\n  userns,\n\n  include if exists <local/bwrap>\n}\n' | sudo tee /etc/apparmor.d/bwrap >/dev/null
+          sudo apparmor_parser -r -T -W /etc/apparmor.d/bwrap
+          bwrap --ro-bind / / --tmpfs /tmp --proc /proc --dev /dev --unshare-all --die-with-parent python3 -c 'print("bwrap ok")'
           python3 -m venv /tmp/gw-py && /tmp/gw-py/bin/pip install -q pandas matplotlib
           /tmp/gw-py/bin/python -c "import pandas, matplotlib; print('pandas', pandas.__version__)"
       - name: Browser tests
