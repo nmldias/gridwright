@@ -1005,6 +1005,16 @@ impl Engine {
                 for nr in self.wb.names.iter_mut() {
                     nr.reference = formula::rename_table(&nr.reference, &old, &name);
                 }
+                let charts_before = self.wb.charts.clone();
+                for c in self.wb.charts.iter_mut() {
+                    c.categories = formula::rename_table(&c.categories, &old, &name);
+                    for s in c.series.iter_mut() {
+                        s.range = formula::rename_table(&s.range, &old, &name);
+                    }
+                }
+                if charts_before != self.wb.charts {
+                    ch.charts = Some(self.wb.charts.clone());
+                }
                 ch.push_table(&self.wb, table);
                 for (id, _) in &inv {
                     ch.reload.push(*id);
@@ -1090,7 +1100,11 @@ impl Engine {
                 }
                 shift_rules(t, is_rows, at, count as i64);
                 t.normalise_geometry();
+                let charts_before = self.wb.charts.clone();
                 self.rewrite_formulas(table, &name, is_rows, at, count as i64);
+                if charts_before != self.wb.charts {
+                    ch.charts = Some(self.wb.charts.clone());
+                }
                 ch.push_table(&self.wb, table);
                 ch.reload.push(table);
                 self.recalc_all_into(ch);
@@ -1157,7 +1171,11 @@ impl Engine {
                 }
                 shift_rules(t, is_rows, at, -(count as i64));
                 t.normalise_geometry();
+                let charts_before = self.wb.charts.clone();
                 self.rewrite_formulas(table, &name, is_rows, at, -(count as i64));
+                if charts_before != self.wb.charts {
+                    ch.charts = Some(self.wb.charts.clone());
+                }
                 ch.push_table(&self.wb, table);
                 ch.reload.push(table);
                 self.recalc_all_into(ch);
@@ -1653,6 +1671,13 @@ impl Engine {
         }
         for nr in self.wb.names.iter_mut() {
             nr.reference = formula::adjust_for_insert_delete(&nr.reference, false, name, is_rows, at, count);
+        }
+        // chart ranges are reference texts too: keep them pointing at the same data
+        for c in self.wb.charts.iter_mut() {
+            c.categories = formula::adjust_for_insert_delete(&c.categories, false, name, is_rows, at, count);
+            for s in c.series.iter_mut() {
+                s.range = formula::adjust_for_insert_delete(&s.range, false, name, is_rows, at, count);
+            }
         }
     }
 
@@ -2925,6 +2950,27 @@ mod tests {
         let json = serde_json::to_string(&e.wb).unwrap();
         let wb: Workbook = serde_json::from_str(&json).unwrap();
         assert_eq!(wb.charts.len(), 1);
+        // chart ranges follow inserts, deletes and renames like formulas do
+        e.apply(Op::UpdateChart {
+            chart: Chart {
+                id: 2,
+                categories: "Data::A2:A5".into(),
+                series: vec![ChartSeries {
+                    name: "v".into(),
+                    range: "Data[Units]".into(),
+                    color: None,
+                }],
+                ..e.wb.charts[0].clone()
+            },
+        });
+        let ch = e.apply(Op::InsertRows { table: 1, at: 0, count: 2 });
+        assert!(ch.charts.is_some());
+        assert_eq!(e.wb.charts[0].categories, "Data::A4:A7");
+        e.apply(Op::RenameTable { table: 1, name: "Facts".into() });
+        assert_eq!(e.wb.charts[0].categories, "Facts::A4:A7");
+        assert_eq!(e.wb.charts[0].series[0].range, "Facts[Units]");
+        e.apply(Op::DeleteRows { table: 1, at: 0, count: 1 });
+        assert_eq!(e.wb.charts[0].categories, "Facts::A3:A6");
     }
 
     #[test]

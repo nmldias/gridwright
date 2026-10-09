@@ -142,7 +142,7 @@ python3 e2e/features.py http://localhost:8787 --pg host:port:db:user:pass --mock
                                                         # AI diff, convergence, touch (40 checks)
 python3 e2e/features2.py http://localhost:8787 --pg … --mock-llm … --acl http://127.0.0.1:8795
                                                         # charts, sign-offs, CHECK/FX/RECONCILE/AGEING, trace, merges,
-                                                        # undo as ops, OT, audit CSV, AI tools, templates, sharing (43 checks)
+                                                        # undo as ops, OT, audit CSV, AI tools, templates, sharing (44 checks)
 python3 e2e/sqlserver.py http://localhost:8787 --mssql host:port:db:user:pass   # SQL Server driver (5 checks)
 python3 e2e/perf.py http://localhost:8787               # fill / edit / frame timings
 ```

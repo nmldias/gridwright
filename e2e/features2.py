@@ -277,6 +277,8 @@ def main():
 
         w1, w2 = where(page), where(page2)
         check("concurrent insert + edit converge on the same cell in both clients", w1 == w2 and len(w1) == 1, f"{w1} vs {w2}")
+        cats = [c["categories"] for c in state()["charts"]]
+        check("chart ranges follow the inserted rows", cats and cats[0].endswith("A4:A7"), str(cats))
         page2.close()
         code, csv = rest("GET", f"/api/files/{fid}/history.csv", raw=True)
         lines = csv.strip().split("\n")
