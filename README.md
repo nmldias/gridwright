@@ -141,7 +141,7 @@ The browser tests use Playwright (`pip install playwright && playwright install 
 
 ## Limitations (honest list)
 
-- Formulas return a single value; array formulas/dynamic arrays spill only from code cells. No charts yet (a Python cell can compute series; rendering is on the roadmap). No cell merging, conditional formatting, or data validation.
+- Formulas return a single value; array formulas/dynamic arrays spill only from code cells. Charts come only from Python (matplotlib) cells — no native chart objects yet. No cell merging, conditional formatting, or data validation.
 - Dates are stored as serial numbers; text that looks like a date stays text unless a date function parses it or a date number format is applied.
 - Multiplayer relays operations last-write-wins per cell (no CRDT); undo/redo by one client re-syncs the others with a snapshot.
 - Code cells see a snapshot of the workbook taken when they start; very large documents (hundreds of thousands of cells) will feel the per-run snapshot cost.
