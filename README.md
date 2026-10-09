@@ -160,7 +160,7 @@ python3 e2e/features2.py http://localhost:8787 --pg … --mock-llm … --acl htt
                                                         # undo as ops, OT, audit CSV, AI tools, templates, sharing (44 checks)
 python3 e2e/features3.py http://localhost:8787 --pg … --acl http://127.0.0.1:8795
                                                         # SQL policy (refusals, read-only session, limits, timeout, allow-list),
-                                                        # run records, MCP tools, proposals end to end, private by default (31 checks)
+                                                        # run records, MCP tools, proposals end to end, private by default (32 checks)
 python3 e2e/sqlserver.py http://localhost:8787 --mssql host:port:db:user:pass   # SQL Server driver (8 checks)
 python3 e2e/perf.py http://localhost:8787               # fill / edit / frame timings
 ```

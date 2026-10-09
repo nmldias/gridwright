@@ -86,6 +86,12 @@ def main():
     check("MCP lists the eleven typed workbook tools", names == MCP_TOOLS, ", ".join(names))
     code, _ = rest("GET", "/mcp", raw=True)
     check("MCP refuses GET (stateless: POST only)", code == 405, str(code))
+    # the engine throws plain strings; they must come back as a readable tool error, not a protocol error
+    bad = rest("POST", "/api/files", {"name": "Malformed", "json": json.dumps({"name": "Malformed", "tables": [{"id": 1, "name": "T", "x": 0, "y": 0, "rows": 2, "cols": 2, "cells": {}}], "next_table_id": 2})})
+    _, r = mcp("tools/call", {"name": "evaluate", "arguments": {"id": bad["id"], "formula": "=1+1"}}, msg_id=3)
+    res = r.get("result", {})
+    check("an engine refusal is reported as a tool error with the engine's message", res.get("isError") is True and "expected a sequence" in "".join(c.get("text", "") for c in res.get("content", [])), json.dumps(r)[:160])
+    rest("DELETE", f"/api/files/{bad['id']}", raw=True)
 
     with sync_playwright() as p:
         args = ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist"]

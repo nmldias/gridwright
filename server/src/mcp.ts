@@ -8,7 +8,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { canView, permissionFor, readAccess, canEdit } from './access.js';
-import { a1, engineAvailable, openDocument, tableByName, tableMetas, tableRows } from './headless.js';
+import { a1, engineAvailable, openDocument, tableByName, tableMetas, tableRows, errorMessage } from './headless.js';
 import { currentSeq, describeOp, recentEntries } from './history.js';
 import { identityOf, type Identity } from './identity.js';
 import { createProposal, listProposals, type Action } from './proposals.js';
@@ -87,7 +87,7 @@ export function buildServer(who: Identity): McpServer {
           book.free();
         }
       } catch (e) {
-        return fail((e as Error).message);
+        return fail(errorMessage(e));
       }
     },
   );
@@ -107,7 +107,7 @@ export function buildServer(who: Identity): McpServer {
           book.free();
         }
       } catch (e) {
-        return fail((e as Error).message);
+        return fail(errorMessage(e));
       }
     },
   );
@@ -127,7 +127,7 @@ export function buildServer(who: Identity): McpServer {
           book.free();
         }
       } catch (e) {
-        return fail((e as Error).message);
+        return fail(errorMessage(e));
       }
     },
   );
@@ -147,7 +147,7 @@ export function buildServer(who: Identity): McpServer {
           book.free();
         }
       } catch (e) {
-        return fail((e as Error).message);
+        return fail(errorMessage(e));
       }
     },
   );
@@ -165,7 +165,7 @@ export function buildServer(who: Identity): McpServer {
           book.free();
         }
       } catch (e) {
-        return fail((e as Error).message);
+        return fail(errorMessage(e));
       }
     },
   );
@@ -183,7 +183,7 @@ export function buildServer(who: Identity): McpServer {
         });
         return text(entries);
       } catch (e) {
-        return fail((e as Error).message);
+        return fail(errorMessage(e));
       }
     },
   );
@@ -203,7 +203,7 @@ export function buildServer(who: Identity): McpServer {
         notifyProposal?.(id, p);
         return text({ proposal: p.id, status: p.status, changes: p.ops.length, preview: p.preview.slice(0, 100), errors: p.errors, note: 'A person must apply this proposal in the Review panel before it takes effect.' });
       } catch (e) {
-        return fail((e as Error).message);
+        return fail(errorMessage(e));
       }
     },
   );
@@ -216,7 +216,7 @@ export function buildServer(who: Identity): McpServer {
         visibleDoc(id, who);
         return text(listProposals(id, status).map((p) => ({ id: p.id, title: p.title, by: p.by.name, agent: p.agent, at: p.at, status: p.status, changes: p.ops.length, decidedBy: p.decidedBy?.name, decidedAt: p.decidedAt, note: p.decisionNote })));
       } catch (e) {
-        return fail((e as Error).message);
+        return fail(errorMessage(e));
       }
     },
   );
@@ -240,7 +240,7 @@ export function buildServer(who: Identity): McpServer {
         const r = await runQuery(c, sql, MAX_TOOL_ROWS, params ?? []);
         return text({ columns: r.columns, rows: r.rows, rowCount: r.rowCount, truncated: r.truncated, ms: r.ms });
       } catch (e) {
-        return fail((e as Error).message);
+        return fail(errorMessage(e));
       }
     },
   );
@@ -276,6 +276,6 @@ export async function handleMcp(req: Request, res: Response) {
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
   } catch (e) {
-    if (!res.headersSent) res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: (e as Error).message }, id: null });
+    if (!res.headersSent) res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: errorMessage(e) }, id: null });
   }
 }

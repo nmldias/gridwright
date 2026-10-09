@@ -33,6 +33,17 @@ interface CoreModule {
   Book: { new (name: string): BookApi; from_json(json: string): BookApi; version(): string; format_number(n: number, pattern: string): string };
 }
 
+/** Message of anything thrown: the wasm engine throws plain strings, Node throws Errors. */
+export function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === 'string') return e;
+  try {
+    return JSON.stringify(e);
+  } catch {
+    return String(e);
+  }
+}
+
 let core: CoreModule | null = null;
 let loadError: string | null = null;
 
@@ -49,7 +60,7 @@ export function engine(): CoreModule {
       core = require(p) as CoreModule;
       return core;
     } catch (e) {
-      loadError = `engine at ${p} failed to load: ${(e as Error).message}`;
+      loadError = `engine at ${p} failed to load: ${errorMessage(e)}`;
     }
   }
   loadError = loadError ?? 'headless engine not built (run `wasm-pack build --target nodejs` in core/, see scripts/build.sh)';

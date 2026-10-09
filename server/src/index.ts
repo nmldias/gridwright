@@ -14,7 +14,7 @@ import { appendEntry, checkpointSeqs, compactCheckpoints, currentSeq, deleteHist
 import { identityEnabled, identityOf } from './identity.js';
 import { attachMultiplayer, notifyProposal as notifyProposalRoom, notifySaved } from './multiplayer.js';
 import { handleMcp, setProposalNotifier } from './mcp.js';
-import { engineAvailable } from './headless.js';
+import { engineAvailable, errorMessage } from './headless.js';
 import { createProposal, decideProposal, getProposal, listProposals } from './proposals.js';
 import { runQuery, testConnection, type Param } from './sql.js';
 import { authorizeQuery, canSeeConnection, SqlRefused } from './sqlpolicy.js';
@@ -143,7 +143,7 @@ app.post('/api/files', requireRole('editor'), (req, res) => {
     writeCheckpoint(meta.id, seq, json);
     res.json({ ...meta, seq, permission: 'own' });
   } catch (e) {
-    res.status(400).json({ error: (e as Error).message });
+    res.status(400).json({ error: errorMessage(e) });
   }
 });
 app.put('/api/files/:id', requireRole('editor'), (req, res) => {
@@ -169,7 +169,7 @@ app.put('/api/files/:id', requireRole('editor'), (req, res) => {
     notifySaved(req.params.id, typeof client === 'string' ? client : undefined);
     res.json({ ...meta, seq: currentSeq(req.params.id) });
   } catch (e) {
-    res.status(400).json({ error: (e as Error).message });
+    res.status(400).json({ error: errorMessage(e) });
   }
 });
 app.delete('/api/files/:id', requireRole('editor'), (req, res) => {
@@ -269,7 +269,7 @@ app.post('/api/files/:id/proposals', requireRole('editor'), (req, res) => {
     notifyProposalRoom(req.params.id, p);
     res.json(p);
   } catch (e) {
-    res.status(400).json({ error: (e as Error).message });
+    res.status(400).json({ error: errorMessage(e) });
   }
 });
 app.post('/api/files/:id/proposals/:pid/decide', requireRole('editor'), (req, res) => {
@@ -283,7 +283,7 @@ app.post('/api/files/:id/proposals/:pid/decide', requireRole('editor'), (req, re
     notifyProposalRoom(req.params.id, p);
     res.json(p);
   } catch (e) {
-    res.status(400).json({ error: (e as Error).message });
+    res.status(400).json({ error: errorMessage(e) });
   }
 });
 
@@ -345,7 +345,7 @@ app.post('/api/connections', requireRole('admin'), (req, res) => {
     saveConnections(list);
     res.json(publicConn(c));
   } catch (e) {
-    res.status(400).json({ error: (e as Error).message });
+    res.status(400).json({ error: errorMessage(e) });
   }
 });
 app.put('/api/connections/:id', requireRole('admin'), (req, res) => {
@@ -357,7 +357,7 @@ app.put('/api/connections/:id', requireRole('admin'), (req, res) => {
     saveConnections(list);
     res.json(publicConn(list[idx]));
   } catch (e) {
-    res.status(400).json({ error: (e as Error).message });
+    res.status(400).json({ error: errorMessage(e) });
   }
 });
 app.delete('/api/connections/:id', requireRole('admin'), (req, res) => {
@@ -384,13 +384,13 @@ app.post('/api/connections/:id/query', requireRole('editor'), async (req, res) =
     authorizeQuery(c, who, sql);
   } catch (e) {
     const status = e instanceof SqlRefused ? e.status : 403;
-    return res.status(status).json({ error: (e as Error).message });
+    return res.status(status).json({ error: errorMessage(e) });
   }
   const params: Param[] = Array.isArray(req.body?.params) ? req.body.params.map((p: unknown) => (p === null || ['string', 'number', 'boolean'].includes(typeof p) ? (p as Param) : String(p))) : [];
   try {
     res.json(await runQuery(c, sql, Number(req.body?.limit ?? 5000), params));
   } catch (e) {
-    res.status(400).json({ error: (e as Error).message });
+    res.status(400).json({ error: errorMessage(e) });
   }
 });
 
@@ -422,7 +422,7 @@ app.get('/api/ai/models', async (_req, res) => {
     const models: string[] = Array.isArray(body?.data) ? body.data.map((m: any) => String(m.id)) : [];
     res.json({ models });
   } catch (e) {
-    res.json({ models: [], error: (e as Error).message });
+    res.json({ models: [], error: errorMessage(e) });
   }
 });
 app.post('/api/ai/chat', chat);

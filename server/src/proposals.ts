@@ -7,7 +7,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { appendEntry, type Author } from './history.js';
-import { a1, diffBooks, engine, nowSerial, openDocument, parseA1, tableByName, type DiffLine } from './headless.js';
+import { a1, diffBooks, engine, nowSerial, openDocument, parseA1, tableByName, type DiffLine, errorMessage } from './headless.js';
 import { DATA_DIR } from './storage.js';
 
 export interface Action {
@@ -208,7 +208,7 @@ export function actionsToOps(book: ReturnType<typeof openDocument>['book'], acti
           errors.push(`unknown action ${act.action}`);
       }
     } catch (e) {
-      errors.push(`${act.action}: ${(e as Error).message}`);
+      errors.push(`${act.action}: ${errorMessage(e)}`);
     }
   }
   return { ops, errors };
