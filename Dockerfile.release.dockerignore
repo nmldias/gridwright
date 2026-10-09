@@ -1,0 +1,8 @@
+# used automatically by BuildKit for `docker build -f Dockerfile.release` — keeps the prebuilt dist/ trees
+.git
+**/node_modules
+core/target
+data
+docs
+e2e
+*.tar.gz
