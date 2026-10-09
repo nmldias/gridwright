@@ -202,6 +202,20 @@ code {
   font-size: 10px;
   color: var(--muted);
 }
+.menu-wrap.split .split-main {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.menu-wrap.split .menu-trigger {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  margin-left: -1px;
+  padding-left: 5px;
+  padding-right: 5px;
+}
+.menu-wrap.split .menu-trigger .caret {
+  margin-left: 0;
+}
 .menu {
   position: fixed;
   z-index: 60;

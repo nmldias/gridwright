@@ -156,10 +156,9 @@ def main():
 
         T = 1
         apply({"type": "set_cells", "table": T, "row": 0, "col": 6, "values": [["Item", "Amount"], ["a", "10"], ["b", "20"], ["c", "30.5"]]})
-        # Add → Python cell: the new cell runs on the server by default
+        # one click on Py: the new cell runs on the server by default
         page.evaluate("([t,r,c]) => window.__gw.getState().set({ selection: { table: t, r0: r, c0: c, r1: r, c1: c, ar: r, ac: c }, selectedTable: null })", [T, 6, 6])
-        page.click(".topbar button[data-menu='add']")
-        page.click(".menu button[title='Turn the selected cell into a Python cell']")
+        page.click(".topbar button[title^='Turn the selected cell into a Python cell']")
         time.sleep(0.4)
         made = cell(T, 6, 6)
         check("a new Python cell defaults to the server runtime", made is not None and made["k"] == "python" and made.get("runtime") == "server", str(made)[:120])
@@ -253,8 +252,8 @@ def main():
             page.wait_for_function("() => document.querySelector('.topbar button .count')?.textContent === '2'", timeout=5000)
         except Exception:
             pass
-        bar = page.evaluate("() => [...document.querySelectorAll('.topbar > button, .topbar > .menu-wrap > button')].map((b) => b.textContent.trim().replace(/▾$/, '').trim())")
-        check("the primary bar is: name · Save · undo/redo · Add · Ask · Review · Share (+ contextual Format, Code, More)", bar[1:4] == ["Save", "↶", "↷"] and bar[4:8] == ["Add", "Ask", "Review2", "Share"] and "Py" not in bar and "SQL" not in bar and bar[-1] == "More", str(bar))
+        bar = [b for b in page.evaluate("() => [...document.querySelectorAll('.topbar > button, .topbar > .menu-wrap > button')].map((b) => b.textContent.trim().replace(/▾$/, '').trim())") if b]
+        check("the primary bar is: name · Save · undo/redo · Add · Py · Ask · Review · Share (+ contextual Format, More)", bar[1:4] == ["Save", "↶", "↷"] and bar[4:9] == ["Add", "Py", "Ask", "Review2", "Share"] and "JS" not in bar and "SQL" not in bar and bar[-1] == "More", str(bar))
         check("the Review button carries the number of changes awaiting approval, pushed by the server as proposals arrive", page.locator(".topbar button .count").text_content() == "2", "")
         page.evaluate("() => window.__gw.getState().set({ panel: 'review' })")
         page.wait_for_selector(".review-panel .proposal.pending", timeout=8000)

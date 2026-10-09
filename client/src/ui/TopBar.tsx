@@ -57,17 +57,20 @@ export function TopBar() {
   const addItems: MenuEntry[] = [
     { label: 'Table', title: 'Add a new table to the canvas', onClick: () => addTable(), disabled: readOnly },
     { label: 'Chart from selection', title: 'Insert a chart built from the selection (exhibit style)', onClick: () => void insertChart(), disabled: readOnly || !selection },
-    'sep',
+  ];
+  // code cells: Py is one click (the common case); JavaScript, SQL and the panel sit under its caret
+  const codeItems: MenuEntry[] = [
     { head: 'Turn the selected cell into' },
     { label: 'Python cell', title: 'Turn the selected cell into a Python cell', hint: 'runs on the server or in the browser', onClick: () => makeCodeCell('python'), disabled: readOnly || !selection },
     { label: 'JavaScript cell', title: 'Turn the selected cell into a JavaScript cell', onClick: () => makeCodeCell('javascript'), disabled: readOnly || !selection },
     { label: 'SQL cell', title: 'Turn the selected cell into a SQL cell (query result spills from it)', hint: 'needs a database connection', onClick: () => makeCodeCell('sql'), disabled: readOnly || !selection },
+    'sep',
+    { label: 'Code panel', title: 'Code editor for Python / JavaScript / SQL cells: edit, run, runtime, GPU', onClick: () => toggle('code'), active: panel === 'code' },
   ];
   const moreItems: MenuEntry[] = [
     { label: 'Table', title: 'Table inspector: name, size, header row, pivot', onClick: () => toggle('table'), active: panel === 'table' },
     { label: 'Rules', title: 'Conditional formatting, validation, names', onClick: () => toggle('format'), active: panel === 'format' },
     { label: 'Chart', title: 'Charts as exhibits: title, series, highlight, benchmark, export', onClick: () => toggle('chart'), active: panel === 'chart' },
-    { label: 'Code', title: 'Code editor for Python / JavaScript / SQL cells', onClick: () => toggle('code'), active: panel === 'code' },
     { label: 'Database', title: 'Database connections and ad-hoc queries', onClick: () => toggle('sql'), active: panel === 'sql' },
     'sep',
     { label: 'History', title: 'Audit trail: every change, by whom, restore versions', onClick: () => toggle('history'), active: panel === 'history' },
@@ -124,7 +127,19 @@ export function TopBar() {
         ↷
       </button>
       <span className="sep" />
-      <Menu label="Add" title="Tables, charts and code cells" items={addItems} testId="add" />
+      <Menu label="Add" title="Tables and charts" items={addItems} testId="add" />
+      <Menu
+        main={{
+          label: 'Py',
+          title: onCodeCell ? 'Open the code of the selected cell (a Python cell runs on the server or in the browser)' : 'Turn the selected cell into a Python cell',
+          onClick: () => makeCodeCell('python'),
+          disabled: readOnly || !selection,
+          active: panel === 'code',
+        }}
+        title="JavaScript and SQL cells, the Code panel"
+        items={codeItems}
+        testId="code"
+      />
       {btn('ai', 'Ask', 'Ask the AI assistant about this document')}
       {btn('review', 'Review', 'Changes awaiting approval, checks, code-cell evidence, sign-offs', pendingCount ? <span className="count">{pendingCount}</span> : null)}
       {btn('share', 'Share', 'Who can open this document, and copies to send')}
@@ -204,7 +219,6 @@ export function TopBar() {
         </Menu>
       )}
       {selectedChart !== null && btn('chart', 'Chart', 'The selected chart: title, series, highlight, benchmark, export')}
-      {onCodeCell && btn('code', 'Code', 'The selected code cell: edit, run, runtime')}
       <Menu label="More" title="Everything else: tables, rules, charts, code, database, history, files, print, settings" items={moreItems} testId="more" active={['table', 'format', 'sql', 'history', 'files', 'settings'].includes(panel)} />
       {touch && panel !== 'none' && (
         <button className="tb-icon" onClick={() => useStore.setState({ panel: 'none' })} title="Close panel">

@@ -12,11 +12,20 @@ export interface MenuItem {
 
 export type MenuEntry = MenuItem | 'sep' | { head: string };
 
+export interface MainAction {
+  label: ReactNode;
+  title?: string;
+  onClick: () => void;
+  disabled?: boolean;
+  active?: boolean;
+}
+
 /**
  * A small dropdown: a trigger button and a list of actions. Closes after an action, on Escape, or on
  * a click anywhere else. `children` renders a custom body instead of the action list (the Format menu).
+ * With `main`, it is a split button: the main part is a one-click action and only the caret opens the list.
  */
-export function Menu({ label, title, className, items, children, active, testId }: { label: ReactNode; title?: string; className?: string; items?: MenuEntry[]; children?: ReactNode; active?: boolean; testId?: string }) {
+export function Menu({ label, title, className, items, children, active, testId, main }: { label?: ReactNode; title?: string; className?: string; items?: MenuEntry[]; children?: ReactNode; active?: boolean; testId?: string; main?: MainAction }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<{ top: number; left: number }>({ top: 0, left: 0 });
   const ref = useRef<HTMLDivElement>(null);
@@ -43,10 +52,16 @@ export function Menu({ label, title, className, items, children, active, testId 
     };
   }, [open]);
   return (
-    <div className={`menu-wrap ${className ?? ''}`} ref={ref}>
+    <div className={`menu-wrap ${main ? 'split' : ''} ${className ?? ''}`} ref={ref}>
+      {main && (
+        <button className={`split-main ${main.active ? 'active' : ''}`} title={main.title} disabled={main.disabled} onClick={main.onClick}>
+          {main.label}
+        </button>
+      )}
       <button
         className={`menu-trigger ${open || active ? 'active' : ''}`}
         title={title}
+        aria-label={main ? 'More options' : undefined}
         onClick={() => {
           place();
           setOpen((v) => !v);
