@@ -100,7 +100,7 @@ app.get('/api/health', (_req, res) => {
 // --- server-side Python cells -------------------------------------------------------------
 app.get('/api/python', (_req, res) => {
   const p = pythonStatus();
-  res.json({ available: p.available, version: p.version, sandbox: p.sandbox, gpu: p.gpu, reason: p.reason, limits: p.limits, interpreter: p.interpreter });
+  res.json({ available: p.available, version: p.version, sandbox: p.sandbox, gpu: p.gpu, reason: p.reason, fallbacks: p.fallbacks, limits: p.limits, interpreter: p.interpreter });
 });
 // re-probe (after installing python, bubblewrap or cuDF) — administrators only
 app.post('/api/python/probe', requireRole('admin'), async (_req, res) => {
@@ -518,7 +518,7 @@ server.on('upgrade', (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
 });
 
-void probePython().then((p) => console.log(p.available ? `server-side Python: ${p.interpreter} ${p.version}, sandbox ${p.sandbox}` : `server-side Python off: ${p.reason}`));
+void probePython().then((p) => console.log(p.available ? `server-side Python: ${p.interpreter} ${p.version}, sandbox ${p.sandbox}${p.fallbacks ? ` (stronger sandboxes unavailable — ${p.fallbacks})` : ''}` : `server-side Python off: ${p.reason}`));
 server.listen(PORT, HOST, () => {
   console.log(
     `gridwright ${VERSION} listening on http://${HOST}:${PORT}  data=${DATA_DIR}  client=${CLIENT_DIR}${TOKEN ? '  (token required)' : ''}${identityEnabled ? '  (trusting Tailscale identity headers)' : ''}${pyDir ? `  pyodide=${pyDir}` : ''}`,

@@ -91,7 +91,7 @@ jobs:
       - name: MCP and SQL policy from the command line
         run: |
           # the strongest sandbox must be the one in use on an Ubuntu 24.04 host (bubblewrap under AppArmor)
-          curl -fsS http://127.0.0.1:8787/api/health | tee /dev/stderr | grep -q '"sandbox":"bwrap"'
+          curl -fsS http://127.0.0.1:8787/api/python | tee /dev/stderr | grep -q '"sandbox":"bwrap"' || { echo; grep -i "python" /tmp/server.log; sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone 2>&1; ls /etc/apparmor.d | grep -iE "bwrap|unshare|userns" ; bwrap --ro-bind / / --unshare-all --die-with-parent python3 -c 'print(1)'; unshare -rn python3 -c 'print(1)'; exit 1; }
           # the MCP endpoint answers JSON-RPC without a browser, and the health endpoint reports it
           curl -fsS http://127.0.0.1:8787/api/health | grep -q '"mcp":true'
           curl -fsS -X POST http://127.0.0.1:8787/mcp -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \

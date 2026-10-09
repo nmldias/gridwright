@@ -29,6 +29,8 @@ export interface PythonStatus {
   /** "cudf 25.10" when a GPU-requested probe found RAPIDS, otherwise the reason it did not */
   gpu: string | null;
   reason?: string;
+  /** why the stronger sandboxes were not used (e.g. "bwrap: not installed; unshare: Operation not permitted") */
+  fallbacks?: string;
   limits: PythonLimits;
 }
 
@@ -200,7 +202,8 @@ async function probeSandbox(py: string, sb: Sandbox): Promise<{ ok: boolean; ver
   if (r.result?.ok && Array.isArray(out) && out[0]?.[0] === 2) {
     return { ok: true, version: String((r.result.runtime as { version?: string })?.version ?? '') };
   }
-  return { ok: false, version: '', reason: (r.stderr || (r.result?.error as string) || `exit ${r.code ?? r.signal}`).trim().split('\n').slice(-1)[0] };
+  const detail = (r.stderr || (r.result?.error as string) || '').trim().split('\n').filter(Boolean).slice(-1)[0];
+  return { ok: false, version: '', reason: `${detail || 'no output'} (exit ${r.code ?? r.signal ?? '?'})` };
 }
 
 /** Find the interpreter and the strongest working sandbox; GPU availability is probed separately. */
@@ -222,7 +225,7 @@ export function probePython(force = false): Promise<PythonStatus> {
       }
       const p = await probeSandbox(py, sb);
       if (p.ok) {
-        status = { available: true, interpreter: py, version: p.version, sandbox: sb, gpu: status.gpu, limits: LIMITS };
+        status = { available: true, interpreter: py, version: p.version, sandbox: sb, gpu: status.gpu, fallbacks: reasons.length ? reasons.join('; ') : undefined, limits: LIMITS };
         void probeGpu();
         return status;
       }
