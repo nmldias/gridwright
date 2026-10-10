@@ -366,6 +366,29 @@ def main():
             row = prof["sets"][0]["rows"][1]
             check("15b. a SQL snapshot takes the database's declared types as the contract: a VARCHAR of digits is an identifier with its zeros, NUMERIC is a number, DATE a date, a 20-digit NUMERIC keeps every digit", cols["vin"]["type"] == "identifier" and cols["vin"]["declared"] == "text" and row[0] == "'000123" and cols["landed_cost"]["type"] == "number" and cols["landed_cost"]["declared"] == "number" and row[2] == "24150009" and cols["entry_date"]["type"] == "date" and row[3] == "2026-10-06" and row[4] == "'12345678901234567890" and cols["days"]["type"] == "number", f"{[(h, c['type'], c.get('declared')) for h, c in cols.items()]} {row}")
             check("   the profile says the types came from the source, and the query is kept without credentials", any("declarations" in n for n in prof["sanitised"]) and prof["query"]["connection"] == "intake pg" and "password" not in json.dumps(prof["query"]) and prof["query"]["kinds"][0] == "text", str(prof["query"])[:160])
+            # placed, the snapshot defines a connected source: Context lists it with its recipe, as-of and a Refresh; the card for it came from the server
+            page.reload(wait_until="networkidle")
+            page.wait_for_selector(".canvas-host canvas", timeout=30000)
+            set_panel("ai")
+            page.wait_for_selector(f".intake-card[data-key='{prof['key']}']", timeout=10000)
+            check("   a profile left undecided comes back as a card after a reload: the decision is still open on the server", page.locator(f".intake-card[data-key='{prof['key']}']").count() == 1, "")
+            page.locator(f".intake-card[data-key='{prof['key']}'] button.primary").first.click()
+            page.wait_for_selector(f".intake-card[data-key='{prof['key']}']", state="detached", timeout=20000)
+            page.click(".companion button:has-text('Context')")
+            page.wait_for_selector(".connected-sources .source-def", timeout=10000)
+            src_text = page.text_content(".connected-sources .source-def") or ""
+            check("   Context lists the connected source with its recipe version, as-of and a Refresh on request", "intake pg" in src_text and "recipe v1" in src_text and "as of" in src_text and page.locator(".connected-sources button:text-is('Refresh')").count() == 1, src_text[:160])
+            page.locator(".connected-sources button:text-is('Refresh')").first.click()
+            page.wait_for_selector(".status-msg:has-text('Refresh')", timeout=10000)
+            srcs = rest("GET", f"/api/files/{fid}/sources")
+            for _ in range(60):
+                jobs = rest("GET", f"/api/files/{fid}/jobs?status=queued,running")["jobs"]
+                if not jobs:
+                    break
+                time.sleep(0.5)
+            srcs = rest("GET", f"/api/files/{fid}/sources")
+            check("   the refresh ran as a job and, the result being unchanged, confirmed coverage without inventing a change", srcs and srcs[0]["lastResult"].startswith("unchanged"), str(srcs and srcs[0].get("lastResult")))
+            page.screenshot(path=f"{OUT}/intake-02-sources.png")
             rest("DELETE", f"/api/connections/{conn['id']}")
         else:
             print("SKIP 15b. SQL snapshot (no --pg)")

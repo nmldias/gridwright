@@ -153,6 +153,15 @@ function connect() {
         // the companion re-checked this document (a change, a timer): the brief refreshes itself
         useStore.setState({ companionVersion: getState().companionVersion + 1, attention: typeof msg.attention === 'number' ? msg.attention : getState().attention });
         break;
+      case 'job': {
+        // a job of this document changed state: when it finished, what it left (a held refresh, a placed version, an investigation) is reloaded
+        const job = msg.job as { id: string; type: string; status: string; error?: string } | undefined;
+        if (job && job.status !== 'queued' && job.status !== 'running') {
+          useStore.setState({ companionVersion: getState().companionVersion + 1 });
+          if (job.type === 'refresh') setStatus(job.status === 'done' ? 'Refresh finished' : `Refresh ${job.status}${job.error ? `: ${job.error}` : ''}`, 6000);
+        }
+        break;
+      }
       case 'permission':
         // the owner changed this document's sharing while we are connected
         if (typeof msg.permission === 'string') {

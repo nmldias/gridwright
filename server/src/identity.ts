@@ -60,4 +60,14 @@ export function identityOf(req: IncomingMessage): Identity {
   return { login, name, role };
 }
 
+/** The identity a login has on this server (the same role rules as a request's), for work done later on a person's behalf. */
+export function identityForLogin(login: string, name: string): Identity {
+  const l = (login || '').toLowerCase();
+  let role: Identity['role'] = 'editor';
+  if (l && READONLY.includes(l)) role = 'viewer';
+  else if (ADMINS.length === 0 || (l && ADMINS.includes(l))) role = 'admin';
+  if (!l && ADMINS.length > 0) role = 'editor';
+  return { login: login || '', name: name || login.split('@')[0] || '', role };
+}
+
 export const identityEnabled = TRUST;

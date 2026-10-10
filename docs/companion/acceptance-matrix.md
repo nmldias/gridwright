@@ -19,7 +19,7 @@ The gates of the brief (§15) and the eight steps of the journey (§4), each wit
 | Coverage change | 6 → 2 rows suspends the trend comparison, baseline restarts, said in the activity | `intake.py` 9 | passed — unit/currency/definition changes are not detected (a Kz column arriving in USD is placed as numbers; the unit is read, not compared) |
 | Quiet monitoring | a data-quality watch speaks once; worsening once is *worth a look*, twice an issue; the brief never repeats itself; related deliveries update one issue | `companion.py`; `situation.py` 10, measures | passed |
 | Monitoring failure | a broken formula and text in a numeric watch → never *all quiet*; old issues keep their evidence labelled historical | `intake.py` 13; `companion.py` (stale essential source) | passed |
-| Durable continuity | the situation survives a reload (objective, constraints, exclusions, decisions, next move); investigation threads are checkpointed in SQLite and continue; a restart interrupts a running investigation cleanly | `situation.py` 12, 7; `recovery.py` C | partial — the chat transcript is per browser (localStorage), so *another authorized device* sees the situation and the context, not the conversation; server-side conversation persistence is deferred (see the surprise log) |
+| Durable continuity | the situation and the conversation survive a reload and appear in a fresh browser context (another device); a viewer's transcript is not the owner's; investigation threads are checkpointed in SQLite and continue; jobs are in the store; a restart interrupts a running investigation and a claimed job cleanly | `situation.py` 12, 7; `interface.py` (per-person transcript); `recovery.py` C | passed |
 | Real steering | *Stop* ends the process and sets aside what it proposed; a change of direction supersedes a running investigation, its result kept as history; a change of assumptions marks a finished investigation provisional | `situation.py` 7 (Stop, direction), 8 | passed (mocked model) |
 | Approval integrity | the preview and the committed change agree; the same command does not apply twice; a change under a pending proposal yields a fresh preview; a decision against the wrong revision is refused | `controls.mjs` gate 2 | passed |
 | Authority boundaries | a sign-off share cannot write, restore, push or decide; a downgrade reaches an open session; revocation closes it; agents get 403 on ratify/approve/decide/apply; editing does not grant code execution | `controls.mjs` gates 1, 3, execution permission; `companion.py` (agent's record proposed); `intake.py` 14 | passed |
@@ -28,9 +28,11 @@ The gates of the brief (§15) and the eight steps of the journey (§4), each wit
 | Injection and lineage | instruction-like cells counted and inert, nothing approved or decided by a file; a re-imported brief is recognised as generated material, never independent evidence | `intake.py` 12; `situation.py` 9 | passed |
 | Decision revisit | the condition behind a hold decision breaches → *A decision needs another look*, with the failing condition, no reversal | `situation.py` 6 | passed |
 | Private / shared separation | a private hypothesis stays with its author and never reaches an outside agent's context | `situation.py` 9 | passed |
-| Usability | import, steer, review without configuration; the card's primary action within the phone viewport, ≥ 44 px; the bar and panels on a phone; menus from the keyboard | `intake.py` 16; `interface.py` | passed — the keyboard path through the intake card itself is not checked |
+| Usability | import, steer, review without configuration; a refresh from Context in one tap; the card's primary action within the phone viewport, ≥ 44 px; the bar and panels on a phone; menus from the keyboard | `intake.py` 15b, 16; `interface.py` | passed — the keyboard path through the intake card itself is not checked |
 | Financial results | the engine's totals equal `expected.json` (Decimal, no rounding) for 06 Oct and 13 Oct; the reference workbooks reconcile | `intake.py` 1, 4; `reference.py` | passed |
-| Crash recovery | a placement interrupted after its commit completes once from the log; two concurrent placements make one table; an investigation interrupted by a restart is marked and nothing it proposed is current | `recovery.py` A, B, C | partial — the proposal-commit and notification boundaries have no fault point; `controls.mjs` gate 2 covers the retry of a decision, not a kill |
+| Crash recovery | a placement interrupted after its commit completes once from the log; two concurrent placements make one table; an investigation and a job claimed by the worker interrupted by a restart are marked, nothing they proposed is current | `recovery.py` A, B, C (12 checks) | partial — the proposal-commit and notification boundaries have no fault point; `controls.mjs` gate 2 covers the retry of a decision, not a kill |
+| Repeatable refresh (review §7) | a SQL snapshot placed defines its source and recipe v1; a refresh job applies the recipe, reconciles and places version 2 through the log; unchanged confirms coverage; drift, an older period and a failed query are held or failed, never placed; a held version follows the person's decision; every refresh on the job list | `sources.py` (21 checks); `intake.py` 15b (the card returns, the source in Context, a refresh from the panel) | passed — control totals and unit/currency changes are not reconciled (named in the README) |
+| Approval integrity of a refresh | a refresh runs under the requester's permissions (connection visibility and query policy checked at request and at run); a disabled source refuses; an agent cannot request one | `sources.py` 7 | passed |
 
 ## The journey (§4)
 
@@ -41,7 +43,7 @@ The gates of the brief (§15) and the eight steps of the journey (§4), each wit
 | 3. An invoice conflicts with a cost: both kept, what depends on it, the smallest investigation | `intake.py` 11; `situation.py` 4 | passed |
 | 4. “Before discounts, see whether another branch could use them.” → direction changed, valid calculations kept, obsolete results never current | `situation.py` 7 | passed (mocked model) |
 | 5. A later snapshot: new period / correction / unrelated; material developments without repetition | `intake.py` 4, 5, 6, 8; `companion.py`; `situation.py` 10 | passed |
-| 6. Close and reopen, another device: conversation, material, objective, uncertainty, jobs, decisions | `situation.py` 12 | partial — all but the conversation (per browser) |
+| 6. Close and reopen, another device: conversation, material, objective, uncertainty, jobs, decisions | `situation.py` 12 | passed |
 | 7. A proposed change reviewed with consequences; approval commits exactly once through the controls | `controls.mjs` gate 2; `features2.py` (diff before applying) | passed |
 | 8. A later update contradicts an assumption behind a decision → revisit, not a silent change | `situation.py` 6, 8 | passed |
 
@@ -49,8 +51,11 @@ The gates of the brief (§15) and the eight steps of the journey (§4), each wit
 
 - A real model (not the mock) running an investigation end to end; `situation.py` 7 and `recovery.py` C use the scripted mock.
 - A human assessment of decision-ready outcomes, missed issues, false alerts and repeated explanations; the measures in `situation.py` are the planted-issue count and the no-repetition check only.
-- Rollback from 0.10.0 to 0.9.0 (restore of a backup was exercised by hand on 2026-10-10; the previous build was not started on 0.10.0 data).
-- Upgrade on Spark 1 (arm64, DGX OS) to 0.10.0 — not deployed in this pass.
+- Rollback from 0.11.0 to 0.10.0 (restore of a backup was exercised by hand on 2026-10-10, twice — once with the WAL store present; the previous build was not started on 0.11.0 data).
+- Upgrade on Spark 1 (arm64, DGX OS) to 0.11.0 — not deployed in this pass; 0.10.0 was published to the release branch.
+- The release image's three CI runs (as it ships, with user namespaces, with sandbox=none) run on push to main; they had not run when this was written.
+- A SQL source on MySQL/MariaDB or SQL Server (the kinds are mapped; `sources.py` runs on PostgreSQL only).
+- A worker in a process of its own (the loop runs inside the server; the code is the same).
 - PDF extraction (text-native or scanned): no extractor is wired; the invoice fixture is XML and JSON.
 - Two people giving conflicting instructions on one document (authority is per person; the conflict is not surfaced as such).
 - Unit or currency changes between snapshots of one series.

@@ -30,12 +30,13 @@ export function registerInvestigationRoutes(app: Express, ctx: { token: string; 
   });
   app.get('/api/investigation', (_req, res) => res.json(stackStatus()));
   app.post('/api/investigation/probe', requireRole('admin'), async (_req, res) => res.json(await probeStack(true)));
-  app.post('/api/files/:id/companion/investigate', requireRole('editor'), (req, res) => {
+  app.post('/api/files/:id/companion/investigate', requireRole('editor'), async (req, res) => {
     if (!docPermission(req, res, 'view') || !noAgent(req, res)) return;
     const b = body(InvestigateSchema, req, res);
     if (!b) return;
     const who = identityOf(req);
     try {
+      await probeStack(); // the probe runs at start-up; a request in its first seconds waits for it rather than being refused
       const issue = b.issue ? findIssue(req.params.id, b.issue) : null;
       const question = (b.question ?? (issue ? `Investigate: ${issue.issue.summary}` : '')).trim();
       const inv = startInvestigationProcess(req.params.id, who, authorOf(req), { question, issue: issue?.issue.id, thread: b.thread }, ctx.selfUrl(), ctx.token);

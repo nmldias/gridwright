@@ -110,6 +110,8 @@ export interface IntakeProfile {
   applied?: { at: string; by: string; decision: string; tables: { set: string; table: number; name: string; placed: 'new' | 'update' | 'history' }[]; records: string[]; seqs: number[]; /** completed from the log after an interruption or a repeated request: nothing was committed twice */ recovered?: true };
   /** for a SQL snapshot: the connection and the query (never credentials) */
   query?: { connection: string; sql: string; rows: number; truncated: boolean; kinds?: ColumnKind[] };
+  /** a refresh the companion held for a person: which checks failed (set when the profile is read back) */
+  held?: { version: number; checks: { name: string; ok: boolean; detail: string }[] };
   original?: string;
 }
 
@@ -310,6 +312,8 @@ const DATE_HEADER = /\b(date|data|as of|snapshot|entrada|entry|received|arrival|
 const AMOUNT_HEADER = /\b(cost|amount|value|price|total|valor|custo|montante|pre[cç]o|margin|margem|landed|cif|fob|balance|saldo)\b/i;
 const UNIT_IN_HEADER = /\((kz|aoa|usd|eur|€|\$|%|days|dias|kg|units?)\)|\b(kz|aoa|usd|eur|days|dias)\b/i;
 const INSTRUCTION_LIKE = /\b(ignore (all |the )?(previous|prior|above) instructions|system prompt|you are (an?|the) (ai|assistant|model)|approve (this|the) (change|proposal)|disable (the )?checks?|as an ai)\b/i;
+/** a header as words: landed_cost and snapshot_date are read like "landed cost" and "snapshot date" */
+const words = (h: string) => h.replace(/[_]+/g, ' ');
 
 export interface Parsed {
   kind: 'number' | 'date' | 'boolean' | 'text' | 'empty';
@@ -440,8 +444,8 @@ export function profileSet(raw: RawSet, family: string): Omit<IntakeSet, 'relati
     const values = body.map((r) => r[c] ?? '');
     const filledVals = values.filter((v) => v !== '');
     const counts = { number: 0, date: 0, boolean: 0, text: 0 };
-    const idLike = ID_HEADER.test(header);
-    const dateLike = DATE_HEADER.test(header);
+    const idLike = ID_HEADER.test(words(header));
+    const dateLike = DATE_HEADER.test(words(header));
     // a declared kind (a database column) is the contract: text is text whatever it looks like, numbers are canonical
     const declared = raw.hints?.[c];
     const parsed: Parsed[] = values.map((v) => {
@@ -476,7 +480,7 @@ export function profileSet(raw: RawSet, family: string): Omit<IntakeSet, 'relati
     let normalised = 0;
     let textInNumber = 0;
     let leadingZeros = 0;
-    let unit: string | undefined = UNIT_IN_HEADER.exec(header)?.[1] ?? UNIT_IN_HEADER.exec(header)?.[2];
+    let unit: string | undefined = UNIT_IN_HEADER.exec(words(header))?.[1] ?? UNIT_IN_HEADER.exec(words(header))?.[2];
     if (unit) unit = unit.toUpperCase() === 'KZ' ? 'Kz' : unit;
     let min: number | undefined;
     let max: number | undefined;
@@ -570,7 +574,7 @@ function relate(doc: string, set: Omit<IntakeSet, 'relation'>, family: string, p
   for (const r of state.records) if (r.kind === 'source' && live(r)) for (const l of r.links ?? []) if (typeof l.table === 'number') seriesOf.set(l.table, r);
   const fileHeaders = set.columns.map((c) => norm(c.header));
   const fileId = set.columns.find((c) => c.type === 'identifier');
-  const fileEntity = set.columns.find((c) => c.constant && !AMOUNT_HEADER.test(c.header) && !DATE_HEADER.test(c.header));
+  const fileEntity = set.columns.find((c) => c.constant && !AMOUNT_HEADER.test(words(c.header)) && !DATE_HEADER.test(words(c.header)));
   const { book } = openDocument(doc);
   try {
     let best: Relation | null = null;
@@ -696,7 +700,7 @@ export function intake(doc: string, by: Author, input: IntakeInput): IntakeProfi
     const prof = profileSet(raw, raws.length > 1 && raw.name ? `${family} ${raw.name}` : family);
     if (!period) {
       // the data's own dates: the latest "as of" date in a date column named like one
-      const dcol = prof.columns.find((c) => c.type === 'date' && DATE_HEADER.test(c.header) && c.maxDate);
+      const dcol = prof.columns.find((c) => c.type === 'date' && DATE_HEADER.test(words(c.header)) && c.maxDate);
       if (dcol) {
         period = dcol.maxDate;
         periodFrom = 'column';
@@ -743,11 +747,14 @@ export async function intakeQuery(doc: string, by: Author, connectionId: string,
   // the result's values are already under their declared kinds (sql.ts); the kinds travel with the text so the profiler keeps the contract
   const rows = [r.columns, ...r.rows.map((row) => row.map((v) => (v === null || v === undefined ? '' : String(v))))];
   const text = rows.map((row) => row.map((v) => `"${v.replace(/"/g, '""')}"`).join(',')).join('\n');
-  const name = `${c.name.replace(/[^\w-]+/g, '-').toLowerCase()}-${now().slice(0, 10)}.csv`;
+  // the series is the table the query reads (its first FROM), else the connection: the snapshot's name carries no date, so
+  // the period comes from a date column in the result, or the day it arrived
+  const from = /\bfrom\s+([a-zA-Z_][\w.]*)/i.exec(sql)?.[1]?.split('.').pop() ?? '';
+  const base = (from || c.name).replace(/[^\w-]+/g, '-').toLowerCase();
+  const name = `${base}.csv`;
   const p = intake(doc, by, { name, text, origin: 'sql', kinds: r.kinds });
   p.query = { connection: c.name, sql: sql.slice(0, 2000), rows: r.rowCount, truncated: r.truncated, kinds: r.kinds };
-  p.period = p.period ?? now().slice(0, 10);
-  p.periodFrom = p.periodFrom === 'none' ? 'column' : p.periodFrom;
+  if (!p.period) p.period = now().slice(0, 10);
   writeProfile(p);
   return p;
 }
@@ -759,7 +766,7 @@ export interface Placement {
   period?: string;
 }
 
-const columnFormats = (set: IntakeSet): { col: number; format: string }[] => set.columns.filter((c) => c.type === 'date' || (c.type === 'number' && AMOUNT_HEADER.test(c.header))).map((c) => ({ col: c.index, format: c.type === 'date' ? 'yyyy-mm-dd' : c.unit === 'Kz' || c.unit === 'AOA' ? '#,##0.00 "Kz"' : c.unit === 'USD' || c.unit === '$' ? '$#,##0.00' : c.unit === 'EUR' || c.unit === '€' ? '€#,##0.00' : '#,##0.00' }));
+const columnFormats = (set: IntakeSet): { col: number; format: string }[] => set.columns.filter((c) => c.type === 'date' || (c.type === 'number' && AMOUNT_HEADER.test(words(c.header)))).map((c) => ({ col: c.index, format: c.type === 'date' ? 'yyyy-mm-dd' : c.unit === 'Kz' || c.unit === 'AOA' ? '#,##0.00 "Kz"' : c.unit === 'USD' || c.unit === '$' ? '$#,##0.00' : c.unit === 'EUR' || c.unit === '€' ? '€#,##0.00' : '#,##0.00' }));
 
 const letters = (c: number) => {
   let s = '';
@@ -771,6 +778,32 @@ const letters = (c: number) => {
   }
   return s;
 };
+
+type PlacementHook = (profile: IntakeProfile, by: Author, placed: NonNullable<IntakeProfile['applied']>['tables']) => void;
+let placementHook: PlacementHook | null = null;
+/** Called after every placement (sources.ts turns a placed SQL snapshot into a source definition with its recipe). */
+export function setPlacementHook(fn: PlacementHook | null) {
+  placementHook = fn;
+}
+let declineHook: ((profile: IntakeProfile, by: Author) => void) | null = null;
+export function setDeclineHook(fn: typeof declineHook) {
+  declineHook = fn;
+}
+
+/** A profile a person decided not to place: it stays on record (the original kept) and is not offered again. */
+export function declineIntake(doc: string, by: Author, key: string): IntakeProfile {
+  const p = readProfile(doc, key);
+  if (!p) throw new Error('intake not found');
+  if (p.status === 'applied') throw new Error('already placed');
+  p.status = 'declined';
+  writeProfile(p);
+  try {
+    declineHook?.(p, by);
+  } catch (e) {
+    console.error('decline hook failed:', errorMessage(e));
+  }
+  return p;
+}
 
 /** The originals and profiles of a document go with it when it is deleted (they are reachable through nothing else). */
 export function deleteIntake(doc: string) {
@@ -872,7 +905,7 @@ export function applyIntake(doc: string, by: Author, key: string, placement: Pla
     }
     placed.push({ set: item.set.name, table, name: item.action === 'update' ? item.name : item.name, placed: item.action });
     const idCol = item.set.columns.find((c) => c.type === 'identifier');
-    const ent = item.set.columns.find((c) => c.constant && !AMOUNT_HEADER.test(c.header) && !DATE_HEADER.test(c.header));
+    const ent = item.set.columns.find((c) => c.constant && !AMOUNT_HEADER.test(words(c.header)) && !DATE_HEADER.test(words(c.header)));
     const fields = item.set.columns.map((c) => c.header);
     const text = `${item.action === 'update' ? 'Updated' : 'Imported'} ${item.name} from ${p.name}: ${item.set.dataRows} row${item.set.dataRows === 1 ? '' : 's'}${fields.length ? ` (${fields.slice(0, 12).join(', ')}${fields.length > 12 ? ', …' : ''})` : ''}`;
     // a snapshot placed as an update belongs to the table's series, whatever the file was called (a "corrected" export is still the inventory)
@@ -884,6 +917,11 @@ export function applyIntake(doc: string, by: Author, key: string, placement: Pla
   p.period = period;
   p.applied = { at: now(), by: by.name || by.login || 'someone', decision: plan.map((x) => `${x.action}:${x.name}`).join(', '), tables: placed, records, seqs: entries.map((e) => e.seq), recovered: prior.length ? true : undefined };
   writeProfile(p);
+  try {
+    placementHook?.(p, by, placed);
+  } catch (e) {
+    console.error('placement hook failed:', errorMessage(e));
+  }
   // the checks run now (cross-checks between sources, watches on the new snapshot) and the first reading is recorded
   try {
     checkDocument(doc, 'intake', placed.map((x) => x.table));
@@ -942,13 +980,13 @@ export function readingOf(doc: string, tableId: number): Reading | null {
     };
     const figures: Reading['figures'] = [];
     const dataRows = Math.max(0, t.rows - t.header_rows);
-    const idH = names.find((h) => ID_HEADER.test(h) && prof(h).numbers < 1);
+    const idH = names.find((h) => ID_HEADER.test(words(h)) && prof(h).numbers < 1);
     const keyH = idH ?? names[0];
     const rowWord = /vehic|viatur|carro|stock|invent/i.test(t.name) ? 'vehicles' : 'rows';
     const countF = `=COUNTA(${col(t.name, original(keyH).s)})`;
     const count = eval_(countF);
     figures.push({ label: rowWord, formula: countF, value: count });
-    const amountH = names.find((h) => AMOUNT_HEADER.test(h) && prof(h).numbers >= Math.max(1, dataRows * 0.5) && !/days|dias/i.test(h));
+    const amountH = names.find((h) => AMOUNT_HEADER.test(words(h)) && prof(h).numbers >= Math.max(1, dataRows * 0.5) && !/days|dias/i.test(h));
     const daysH = names.find((h) => /\b(days?|age|ageing|aging|dias|idade)\b/i.test(h) && prof(h).numbers >= Math.max(1, dataRows * 0.5));
     const flagH = names.find((h) => prof(h).yesNo >= Math.max(1, dataRows * 0.8) && /reserv|hold|sold|exclu|vendid|block/i.test(h)) ?? names.find((h) => prof(h).yesNo >= Math.max(1, dataRows * 0.8));
     if (amountH) {

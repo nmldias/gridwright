@@ -48,10 +48,18 @@ Every file is invented; `README.md` in the folder says so. `expected.py` compute
 11. **Deleting a document left its originals behind** under `intake/<doc>/`, reachable through nothing. Fixed: they go with the document. (`intake.py` 17)
 12. **React render loop** in the intake card (a selector returning a new array each render). Fixed with a constant empty list.
 
+13. **SQL values were typed by their look, not their column.** `sql.ts` turned any numeric-looking string under 16 characters into a number, so a `VARCHAR` identifier `000123` arriving through a SQL snapshot lost its zeros (the CSV path was sound). Found by the architecture review's inspection, reproduced, fixed: kinds come from the driver's column metadata (OID, type code, type name), 16+-digit numerics stay text, dates are the day they name. (`intake.py` 15b)
+14. **Underscored headers defeated the header heuristics.** `snapshot_date`, `landed_cost`, `entry_date` — ordinary SQL names — matched neither the date nor the amount nor the identifier patterns, because `_` is a word character; a SQL snapshot's period was therefore dated by arrival. Fixed: headers are read as words for those tests. (`sources.py` 1)
+15. **Drift and a failing query are different things.** With a query that names its columns, a dropped column makes the query fail (a failed refresh with the database's reason, the table untouched); only `SELECT *` yields a changed shape that the recipe can hold as drift. The suite tests both; the runbook says which to expect.
+16. **A SQL snapshot's name carried the date**, so the period came from the name (the day of the query), never from a date column. Fixed: the name is the table the query reads; the period comes from the data or, failing that, the arrival.
+17. **The conversation was in memory**, not in browser storage as an earlier note said — a reload lost it. Now owned by the server per document and person.
+
 ## Assumptions that still need checking (not reproduced as defects)
 
 - The header-row heuristic (first row, mostly distinct text) on exports whose first rows are a title block; such files would need the title rows quarantined — untested.
 - A lone `1.500` read as a decimal: an Angolan export writing thousands without a decimal part would be misread by a factor of 1000 — the profile states the locale it chose, but nothing cross-checks magnitudes against the column.
 - A file whose period cannot be read from the name or a date column is asked for on the card; a wrong period typed there is not detected.
 - The 30 % identifier overlap threshold for *same series* and the 50 % population ratio for *comparable*: chosen, not derived; both are stated on the card and in the activity so a person can disagree.
-- Investigations with a real model were run on Spark 1 at 0.9.0 (the probe), not at 0.10.0 and not through the gate tests.
+- Investigations with a real model were run on Spark 1 at 0.9.0 (the probe), not at 0.10.0 or 0.11.0 and not through the gate tests.
+- The reconciliation thresholds (30 % identifiers in common, 50 % coverage change) are the intake heuristics restated as recipe rules; a person cannot yet edit them per source.
+- A refresh job re-checks the requester's permission on the document before placing (withdrawn between request and run → the version is held with a `permission` check); this path is implemented, not yet covered by a check.

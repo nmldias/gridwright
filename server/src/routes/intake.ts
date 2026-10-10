@@ -7,7 +7,8 @@ import type { Express } from 'express';
 import { brief as companionBrief } from '../companion.js';
 import { IntakeRequestSchema, PlacementSchema } from '../contracts.js';
 import { identityOf } from '../identity.js';
-import { applyIntake, inboxRoot, inboxTaken, intake, intakeFromInbox, intakeQuery, listInbox, listProfiles, originalPath, readingOf, readProfile, MAX_INTAKE_BYTES } from '../intake.js';
+import { applyIntake, declineIntake, inboxRoot, inboxTaken, intake, intakeFromInbox, intakeQuery, listInbox, listProfiles, originalPath, readingOf, readProfile, MAX_INTAKE_BYTES } from '../intake.js';
+import { heldReason } from '../sources.js';
 import { broadcastEntries, notifyCompanion } from '../multiplayer.js';
 import { SqlRefused, authorizeQuery, canSeeConnection } from '../sqlpolicy.js';
 import type { StoredConnection } from '../storage.js';
@@ -20,7 +21,20 @@ export function registerIntakeRoutes(app: Express) {
   });
   app.get('/api/files/:id/intake', (req, res) => {
     if (!docPermission(req, res, 'view')) return;
-    res.json(listProfiles(req.params.id));
+    // ?pending=1: the decisions still open — profiles neither placed nor declined, with the reason a refresh was held
+    const all = listProfiles(req.params.id);
+    const pending = req.query.pending === '1';
+    const list = (pending ? all.filter((p) => p.status === 'profiled') : all).map((p) => ({ ...p, held: heldReason(req.params.id, p.key) ?? undefined }));
+    res.json(pending ? list.map((p) => ({ ...p, sets: p.sets.map((x) => ({ ...x, rows: x.rows.slice(0, 21) })) })) : list);
+  });
+  // a person's "not now": the profile stays on record (the original kept) and is not offered again
+  app.post('/api/files/:id/intake/:key/decline', requireRole('editor'), (req, res) => {
+    if (!docPermission(req, res, 'edit') || !noAgent(req, res)) return;
+    try {
+      res.json(declineIntake(req.params.id, authorOf(req), req.params.key));
+    } catch (e) {
+      fail(res, e);
+    }
   });
   // profile a file (base64 or text), a file from the inbox, or a read-only query result; nothing is placed
   app.post('/api/files/:id/intake', requireRole('editor'), async (req, res) => {
@@ -44,7 +58,7 @@ export function registerIntakeRoutes(app: Express) {
     if (!docPermission(req, res, 'view')) return;
     const p = readProfile(req.params.id, req.params.key);
     if (!p) return res.status(404).json({ error: 'not found' });
-    res.json({ ...p, sets: p.sets.map((x) => ({ ...x, rows: x.rows.slice(0, 21) })) });
+    res.json({ ...p, held: heldReason(req.params.id, p.key) ?? undefined, sets: p.sets.map((x) => ({ ...x, rows: x.rows.slice(0, 21) })) });
   });
   app.get('/api/files/:id/intake/:key/original', (req, res) => {
     if (!docPermission(req, res, 'view')) return;

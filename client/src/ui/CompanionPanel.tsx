@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
-import { api, RECORD_KINDS, type Companion, type ContextRecord, type IntakeProfile, type IntakeSet, type Investigation, type RecordKind, type Suggestion, type Understanding, type Watch, type WatchDef } from '../api/client';
+import { api, RECORD_KINDS, type Companion, type ContextRecord, type IntakeProfile, type IntakeSet, type Investigation, type SourceDef, type RecordKind, type Suggestion, type Understanding, type Watch, type WatchDef } from '../api/client';
 import { readOnly, setStatus, useStore } from '../state/store';
 import { acceptSuggestion, addWatch, applyExclusion, approveWatch, changeWatch, checkNow, clearReflection, confirmReading, confirmRecord, correctRecord, dismissSuggestion, investigate, loadCompanion, markExpectation, markSeen, remember, removeRecord, removeWatch, resolveRecord, restoreSuggestion, retireRecord, statementOf, stopInvestigation, useCompanion } from './companion';
-import { applyIntake, skipIntake, useIntake } from './intake';
+import { applyIntake, refreshSource, skipIntake, useIntake } from './intake';
 
 const KIND_LABEL: Record<RecordKind, string> = { objective: 'What matters', constraint: 'Within', exclusion: 'Left out', decision: 'Decisions', question: 'Open questions', expectation: 'Expected', scenario: 'Scenarios (explored, not adopted)', contradiction: 'Sources disagree', hypothesis: 'Hypotheses', fact: 'Facts', source: 'Snapshots and sources' };
 const KIND_HINT: Partial<Record<RecordKind, string>> = { question: 'what it bears on, after a dash: "Is the freight final? — bears on which vehicles to reprice"', expectation: '"final freight invoice for SH-001 by 2026-10-20 in invoices"', decision: '"hold the Creta — because an order is expected; reconsider if the order lapses"', constraint: 'e.g. replacement-cost margin stays positive on every disposal' };
@@ -208,6 +208,11 @@ function IntakeCard({ p }: { p: IntakeProfile }) {
           {one ? ` × ${sets[0].cols} columns` : ` in ${sets.length} sets`} · {Math.round(p.size / 1024) || 1} KB{p.origin === 'inbox' ? ' · from the inbox' : p.origin === 'sql' ? ` · query on ${p.query?.connection}` : ''}
         </span>
       </div>
+      {p.held && (
+        <div className="small amber-text held-reason">
+          <b>Refresh held (version {p.held.version}):</b> {p.held.checks.filter((c) => !c.ok).map((c) => `${c.name} — ${c.detail}`).join('; ')}. Nothing was placed; the table keeps its last snapshot. Place it anyway, or not now.
+        </div>
+      )}
       {sets.map((set) => (
         <div key={set.name} className={`intake-set rel-${set.relation.kind}`}>
           {!one && <div className="small">
@@ -408,6 +413,66 @@ function ConditionState({ c }: { c: { text: string; holds?: boolean; purpose?: s
   );
 }
 
+/** The definitions a document's SQL snapshots made: refreshed on request, never on a schedule; every version with its checks. */
+function ConnectedSources() {
+  const fileId = useStore((s) => s.fileId);
+  const companionVersion = useStore((s) => s.companionVersion);
+  const [list, setList] = useState<SourceDef[]>([]);
+  const [open, setOpen] = useState<string | null>(null);
+  const ro = readOnly();
+  useEffect(() => {
+    if (!fileId) return;
+    let alive = true;
+    void api.files.sources(fileId).then((l) => alive && setList(l)).catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [fileId, companionVersion]);
+  if (!fileId || !list.length) return null;
+  return (
+    <div className="connected-sources">
+      <div className="brief-h">Connected sources</div>
+      {list.map((s) => {
+        const held = s.versions.find((v) => v.status === 'held');
+        return (
+          <div key={s.id} className={`ctx-item source-def ${s.enabled ? '' : 'disabled'}`}>
+            <div className="row">
+              <span className="grow">
+                <b>{s.name}</b> <span className="muted small">recipe v{s.recipeVersion ?? '?'} · as of {s.asOf ?? 'unknown'} · last refresh {s.lastSuccessAt ? ago(s.lastSuccessAt) : 'never'} · {s.lastResult ?? 'no result yet'}</span>
+              </span>
+              {!ro && s.enabled && (
+                <button className="small" onClick={() => void refreshSource(fileId, s.id)} title="Run the query again, apply the saved preparation, reconcile and place — or hold it for you">
+                  Refresh
+                </button>
+              )}
+              <button className="link small" onClick={() => setOpen(open === s.id ? null : s.id)}>
+                {open === s.id ? 'hide versions' : `${s.versions.length} version${s.versions.length === 1 ? '' : 's'}`}
+              </button>
+            </div>
+            {held && <div className="small amber-text">version {held.version} is held: {held.reconciliation.checks.filter((c) => !c.ok).map((c) => `${c.name} — ${c.detail}`).join('; ')}</div>}
+            {open === s.id && (
+              <ul className="versions small">
+                {s.versions.map((v) => (
+                  <li key={v.id} className={`version ${v.status}`}>
+                    v{v.version} · {v.period ?? 'period by arrival'} · {v.rows} rows · <b>{v.status}</b> · {ago(v.createdAt)} — {v.reconciliation.checks.map((c) => `${c.ok ? '✓' : '✗'} ${c.name}: ${c.detail}`).join(' · ')}
+                  </li>
+                ))}
+              </ul>
+            )}
+            {!ro && (
+              <div className="row">
+                <button className="link small" onClick={() => void api.files.setSource(fileId, s.id, !s.enabled).then(() => useStore.setState({ companionVersion: useStore.getState().companionVersion + 1 }))}>
+                  {s.enabled ? 'disable refreshes' : 'enable refreshes'}
+                </button>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function ContextView({ data }: { data: Companion }) {
   const { records, dismissed } = data;
   const sources = data.brief.sources;
@@ -453,6 +518,7 @@ function ContextView({ data }: { data: Companion }) {
           ))}
         </div>
       )}
+      <ConnectedSources />
       {groups.map(([k, rs]) => (
         <div key={k}>
           <div className="brief-h">{KIND_LABEL[k]}</div>

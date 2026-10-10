@@ -356,6 +356,52 @@ export interface Suggestion {
   why: string;
   def: WatchDef;
 }
+export interface Job {
+  id: string;
+  type: 'investigation' | 'refresh' | 'recipe';
+  doc: string;
+  input: Record<string, unknown>;
+  status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | 'superseded' | 'interrupted';
+  by: { id: string; name: string; login?: string };
+  createdAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  attempts: number;
+  maxAttempts: number;
+  cancelRequested?: string;
+  result?: { ref?: string; summary?: string };
+  error?: string;
+}
+
+export interface DatasetCheck {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+export interface SourceDef {
+  id: string;
+  doc: string;
+  name: string;
+  series: string;
+  table?: number;
+  kind: 'sql' | 'file';
+  connection?: string;
+  connectionName?: string;
+  sql?: string;
+  recipe?: string;
+  recipeVersion?: number;
+  createdAt: string;
+  createdBy: string;
+  updatedAt: string;
+  lastAttemptAt?: string;
+  lastSuccessAt?: string;
+  lastResult?: string;
+  lastVersion?: string;
+  asOf?: string;
+  enabled: boolean;
+  versions: { id: string; version: number; period?: string; rows: number; status: 'held' | 'accepted' | 'rejected' | 'superseded'; createdAt: string; reconciliation: { ok: boolean; checks: DatasetCheck[] }; intake?: string }[];
+}
+
 export interface IntakeColumn {
   index: number;
   header: string;
@@ -420,7 +466,8 @@ export interface IntakeProfile {
   warnings: string[];
   status: 'profiled' | 'applied' | 'declined';
   applied?: { at: string; by: string; decision: string; tables: { set: string; table: number; name: string; placed: 'new' | 'update' | 'history' }[]; records: string[]; seqs: number[] };
-  query?: { connection: string; sql: string; rows: number; truncated: boolean };
+  held?: { version: number; checks: DatasetCheck[] };
+  query?: { connection: string; sql: string; rows: number; truncated: boolean; kinds?: string[] };
   readings?: Reading[];
 }
 export interface Reading {
@@ -591,8 +638,27 @@ export const api = {
     async intake(id: string, body: { name: string; base64?: string; text?: string } | { inbox: string } | { connection: string; sql: string }): Promise<IntakeProfile> {
       return j(await fetch(`/api/files/${encodeURIComponent(id)}/intake`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));
     },
-    async intakes(id: string): Promise<IntakeProfile[]> {
-      return j(await fetch(`/api/files/${encodeURIComponent(id)}/intake`));
+    async intakes(id: string, pending = false): Promise<IntakeProfile[]> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/intake${pending ? '?pending=1' : ''}`));
+    },
+    async declineIntake(id: string, key: string): Promise<IntakeProfile> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/intake/${encodeURIComponent(key)}/decline`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }));
+    },
+    // sources: the definitions a document's SQL snapshots made, their versions, a refresh on request
+    async sources(id: string): Promise<SourceDef[]> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/sources`));
+    },
+    async refreshSource(id: string, source: string): Promise<Job> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/sources/${encodeURIComponent(source)}/refresh`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }));
+    },
+    async setSource(id: string, source: string, enabled: boolean): Promise<SourceDef> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/sources/${encodeURIComponent(source)}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled }) }));
+    },
+    async jobs(id: string): Promise<{ worker: { worker: string; concurrency: number; active: number; types: string[] }; jobs: Job[] }> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/jobs`));
+    },
+    async cancelJob(id: string, job: string): Promise<Job> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/jobs/${encodeURIComponent(job)}/cancel`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }));
     },
     async applyIntake(id: string, key: string, body: { decisions: { set?: string; action: 'update' | 'new' | 'history' | 'skip'; table?: number; name?: string }[]; period?: string }): Promise<IntakeProfile> {
       return j(await fetch(`/api/files/${encodeURIComponent(id)}/intake/${encodeURIComponent(key)}/apply`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));

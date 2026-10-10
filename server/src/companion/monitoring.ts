@@ -524,7 +524,7 @@ function crossCheck(s: CompanionState, metas: TableMetaView[], cellsOf: ((id: nu
       if (seriesOf.get(a.id) && seriesOf.get(a.id) === seriesOf.get(b.id)) continue;
       const ca = columnsOf(cellsOf(a.id), a);
       const cb = columnsOf(cellsOf(b.id), b);
-      const idA = ca.find((c) => ID_HEADER.test(c.header) && cb.some((d) => d.key === c.key));
+      const idA = ca.find((c) => ID_HEADER.test(c.header.replace(/_+/g, ' ')) && cb.some((d) => d.key === c.key));
       if (!idA) continue;
       const idB = cb.find((d) => d.key === idA.key)!;
       const shared = ca.filter((c) => c.key !== idA.key && cb.some((d) => d.key === c.key));
@@ -699,7 +699,7 @@ export function suggestWatches(doc: string, includeDismissed = false): Suggestio
           add(`${t.id}:${p.index}:blank`, cap(`${prefix}${rowWord} with no ${h.toLowerCase()}`), `a missing ${h.toLowerCase()} makes a margin or a total provisional`, { formula: `=COUNTIFS(${col(t.name, h)}, ""${present})`, kind: 'threshold', op: '>', value: 0, sustain: 1, scope: t.name, sources: [t.name] });
           add(`${t.id}:${p.index}:total`, cap(`${prefix}total ${h.toLowerCase()}`), `the total moves when a snapshot changes; a movement is worth a look, not an alarm`, { formula: `=SUM(${col(t.name, h)})`, kind: 'change', sustain: 1, scope: t.name, sources: [t.name] });
         }
-        if (!mostly(p, 'numbers') && ID_HEADER.test(h) && p.unique >= Math.max(2, (dataRows - p.blanks) * 0.7)) {
+        if (!mostly(p, 'numbers') && ID_HEADER.test(h.replace(/_+/g, ' ')) && p.unique >= Math.max(2, (dataRows - p.blanks) * 0.7)) {
           add(`${t.id}:${p.index}:dup`, cap(`${prefix}duplicate ${h}${/s$/i.test(h) ? '' : 's'}`), `“${h}” looks like an identifier; a duplicate is usually a posting error`, { formula: `=COUNTA(${col(t.name, h)}) - COUNTUNIQUE(${col(t.name, h)})`, kind: 'threshold', op: '>', value: 0, sustain: 1, scope: t.name, sources: [t.name] });
         }
       }

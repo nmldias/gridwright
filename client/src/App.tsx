@@ -20,6 +20,7 @@ import { SidePanel } from './ui/SidePanel';
 import { loadProposals } from './ui/proposals';
 import { loadCompanion } from './ui/companion';
 import { loadConversation } from './ui/chat';
+import { loadPendingIntakes } from './ui/intake';
 import { SqlPanel } from './ui/SqlPanel';
 import { StatusBar } from './ui/StatusBar';
 import { TablePanel } from './ui/TablePanel';
@@ -137,6 +138,9 @@ export function App() {
   useEffect(() => {
     if (fileId) void loadConversation(fileId);
   }, [fileId]);
+  useEffect(() => {
+    if (fileId) void loadPendingIntakes(fileId);
+  }, [fileId, companionVersion]);
   useEffect(() => {
     const url = new URL(location.href);
     if (fileId) url.searchParams.set('file', fileId);

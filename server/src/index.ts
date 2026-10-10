@@ -19,6 +19,7 @@ import { registerDocumentRoutes } from './routes/documents.js';
 import { registerIntakeRoutes } from './routes/intake.js';
 import { registerInvestigationRoutes } from './routes/investigation.js';
 import { registerPythonRoutes } from './routes/python.js';
+import { registerSourceRoutes } from './routes/sources.js';
 import { requireRole } from './routes/common.js';
 import { identityEnabled, identityOf } from './identity.js';
 import { attachMultiplayer, notifyCompanion, notifyJob, notifyProposal as notifyProposalRoom } from './multiplayer.js';
@@ -28,7 +29,7 @@ import { probePython, pythonStatus } from './pyrun.js';
 import { canRunPython, canUseGpu } from './execpolicy.js';
 import { DATA_DIR, ensureDirs, pyodideDir } from './storage.js';
 
-const VERSION = '0.10.0';
+const VERSION = '0.11.0';
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? '0.0.0.0';
 const TOKEN = process.env.GRIDWRIGHT_TOKEN ?? '';
@@ -88,6 +89,7 @@ registerCompanionRoutes(app);
 registerIntakeRoutes(app);
 registerInvestigationRoutes(app, { token: TOKEN, selfUrl: () => process.env.GRIDWRIGHT_SELF_URL ?? `http://127.0.0.1:${PORT}` });
 registerConnectionRoutes(app);
+registerSourceRoutes(app);
 
 // --- MCP (agents) --------------------------------------------------------------------------
 setProposalNotifier((doc, p) => notifyProposalRoom(doc, p));

@@ -11,6 +11,7 @@ import { getState, setStatus, useStore } from '../state/store';
 import { saveCurrentFile } from './files';
 import { loadCompanion, reflectLine } from './companion';
 import { familyOf } from './snapshots';
+import { autoFitColumns } from '../grid/actions';
 
 interface IntakeState {
   /** profiles waiting for a decision, per document */
@@ -114,6 +115,8 @@ export async function applyIntake(p: IntakeProfile, decisions: { set?: string; a
     const done = await api.files.applyIntake(fileId, p.key, { decisions, period });
     dropIntake(fileId, p.key);
     const placed = done.applied?.tables ?? [];
+    // the placed table arrives over the log a moment later: fit its columns then, so no amount shows as ####
+    for (const t of placed) for (const delay of [400, 1500]) setTimeout(() => getState().tables.has(t.table) && autoFitColumns(t.table), delay);
     for (const t of placed) {
       const reading = done.readings?.find((r) => r.table === t.table);
       reflectLine(fileId, { text: `${t.placed === 'update' ? `${t.name} updated from ${p.name}` : t.placed === 'history' ? `${p.name} kept as history (${t.name})` : `${p.name} added as ${t.name}`}${done.period ? ` — period ${done.period}` : ' — period not set'}${reading ? `. ${reading.text}` : ''}` });
@@ -130,5 +133,33 @@ export function skipIntake(p: IntakeProfile) {
   const fileId = getState().fileId;
   if (!fileId) return;
   dropIntake(fileId, p.key);
+  void api.files.declineIntake(fileId, p.key).catch(() => undefined);
   setStatus(`${p.name} was not placed; the original stays on the server under Context → sources`, 5000);
+}
+
+/** The decisions still open on the server (a held refresh, a profile left undecided): the cards come back after a reload or on another device. */
+export async function loadPendingIntakes(fileId: string) {
+  try {
+    const list = await api.files.intakes(fileId, true);
+    useIntake.setState((s) => {
+      const local = s.pending[fileId] ?? [];
+      // union: what this browser holds (a card just profiled here) and what the server still has open; the server's copy carries the held reason
+      const merged = [...local.map((x) => list.find((p) => p.key === x.key) ?? x), ...list.filter((p) => !local.some((x) => x.key === p.key))];
+      return { pending: { ...s.pending, [fileId]: merged } };
+    });
+  } catch {
+    /* not permitted or offline */
+  }
+}
+
+/** A refresh on request: the job runs on the server; the card appears if the result is held, the table changes if it is placed. */
+export async function refreshSource(fileId: string, sourceId: string) {
+  try {
+    const job = await api.files.refreshSource(fileId, sourceId);
+    setStatus(`Refresh queued (job ${job.id.slice(0, 8)})`, 4000);
+    return job;
+  } catch (e) {
+    setStatus(`Refresh refused: ${(e as Error).message}`, 8000);
+    return null;
+  }
 }
