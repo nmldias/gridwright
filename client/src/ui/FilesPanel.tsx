@@ -66,7 +66,7 @@ export function FilesPanel() {
           Download .xlsx
         </button>
         <button onClick={downloadJson}>Download JSON</button>
-        {me.role === 'admin' && (
+        {(me.auth === 'accounts' ? me.platformAdmin : me.role === 'admin') && (
           <a className="button" href="/api/backup" download title="tar.gz of the server's data directory: documents, history, connections (encrypted), settings">
             Backup
           </a>

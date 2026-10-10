@@ -8,6 +8,7 @@ import { canEdit, canSign, canView, permissionFor, readAccess, SIGN_OPS, type Pe
 import { appendEntry, currentSeq, entriesSince, sanitiseRun, writeCheckpoint, type Author, type LogEntry } from './history.js';
 import { identityOf, type Identity } from './identity.js';
 import { readFile } from './storage.js';
+import { ACCOUNTS } from './tenancy.js';
 
 interface Peer {
   id: string;
@@ -36,7 +37,9 @@ export function attachMultiplayer(wss: WebSocketServer) {
     }
     const identity = identityOf(req);
     // per-document access, computed now and again before every change (never only at connect time)
-    const permissionNow = (): Permission => (readFile(file) ? permissionFor(readAccess(file), identity) : identity.role === 'viewer' ? 'view' : 'own');
+    // (accounts mode: a room exists only for a saved document of the caller's client — an unsaved id
+    // is nobody's, so it could otherwise be shared across clients by guessing it)
+    const permissionNow = (): Permission => (readFile(file) ? permissionFor(readAccess(file), identity) : ACCOUNTS ? 'none' : identity.role === 'viewer' ? 'view' : 'own');
     const permission = permissionNow();
     if (!canView(permission)) {
       ws.close(1008, 'no access to this document');
@@ -155,7 +158,7 @@ export function accessChanged(file: string) {
   const room = rooms.get(file);
   if (!room) return;
   for (const p of Array.from(room.values())) {
-    const now: Permission = readFile(file) ? permissionFor(readAccess(file), p.identity) : p.identity.role === 'viewer' ? 'view' : 'own';
+    const now: Permission = readFile(file) ? permissionFor(readAccess(file), p.identity) : ACCOUNTS ? 'none' : p.identity.role === 'viewer' ? 'view' : 'own';
     if (now === p.permission) continue;
     p.permission = now;
     if (p.ws.readyState !== WebSocket.OPEN) continue;
@@ -164,6 +167,11 @@ export function accessChanged(file: string) {
       p.ws.close(1008, 'access removed');
     } else p.ws.send(JSON.stringify({ type: 'permission', permission: now }));
   }
+}
+
+/** A membership, a role or a client's status changed: every open session is checked again. */
+export function accessChangedEverywhere() {
+  for (const file of Array.from(rooms.keys())) accessChanged(file);
 }
 
 /** Operations the server committed itself (an applied proposal): every session applies them in log order. */

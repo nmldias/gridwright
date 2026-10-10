@@ -25,7 +25,7 @@ export interface Editing {
   source?: 'cell' | 'bar';
 }
 
-export type Panel = 'none' | 'code' | 'ai' | 'sql' | 'files' | 'share' | 'table' | 'settings' | 'history' | 'format' | 'chart' | 'review' | 'navigate';
+export type Panel = 'none' | 'code' | 'ai' | 'sql' | 'files' | 'share' | 'table' | 'settings' | 'history' | 'format' | 'chart' | 'review' | 'navigate' | 'admin';
 
 export interface Presence {
   id: string;
@@ -42,11 +42,29 @@ export interface CodeRunState {
   startedAt: number;
 }
 
+export interface TenantRef {
+  id: string;
+  name: string;
+  slug: string;
+  role: 'admin' | 'editor' | 'viewer';
+  status?: 'active' | 'suspended';
+}
 export interface Me {
   login: string;
   name: string;
+  /** the role in the client this tab works in (accounts), or on the server */
   role: 'admin' | 'editor' | 'viewer';
   identity: boolean;
+  /** how people are told apart: accounts (multi-tenant sign-in), Tailscale, or not at all */
+  auth?: 'accounts' | 'tailscale' | 'none';
+  authenticated?: boolean;
+  platformAdmin?: boolean;
+  mustChangePassword?: boolean;
+  /** accounts: the client this tab works in, and every client the person belongs to */
+  tenant?: TenantRef | null;
+  tenants?: TenantRef[];
+  denied?: 'suspended' | 'not-a-member';
+  can?: { python: boolean; gpu: boolean };
 }
 
 /** What the current user may do with the open document (server-side sharing). */
@@ -120,6 +138,8 @@ interface State {
   start: boolean;
   /** what the Files panel shows */
   filesView: 'documents' | 'templates';
+  /** what the Clients & people panel shows (accounts mode) */
+  adminView: 'members' | 'activity' | 'account' | 'clients' | 'people';
   /** open companion issues needing attention (the Ask badge) */
   attention: number;
   /** bumped when the server says the companion re-checked the document */
@@ -181,6 +201,7 @@ export const useStore = create<State>((set) => ({
   })(),
   start: false,
   filesView: 'documents',
+  adminView: 'members',
   attention: 0,
   companionVersion: 0,
   touch: typeof window !== 'undefined' && (navigator.maxTouchPoints > 0 || 'ontouchstart' in window) && !matchMedia('(pointer: fine)').matches,

@@ -21,8 +21,10 @@ import { registerIntakeRoutes } from './routes/intake.js';
 import { registerInvestigationRoutes } from './routes/investigation.js';
 import { registerPythonRoutes } from './routes/python.js';
 import { registerSourceRoutes } from './routes/sources.js';
-import { requireRole } from './routes/common.js';
-import { agentTokenValid, identityEnabled, identityOf, markAgentChannel, onAgentChannel } from './identity.js';
+import { registerAccountRoutes } from './routes/accounts.js';
+import { requirePlatformAdmin } from './routes/common.js';
+import { agentTokenValid, authMode, identityEnabled, identityOf, markAgentChannel, onAgentChannel } from './identity.js';
+import { ACCOUNTS, initTenancy } from './tenancy.js';
 import { attachMultiplayer, notifyCompanion, notifyJob, notifyProposal as notifyProposalRoom } from './multiplayer.js';
 import { handleMcp, setProposalNotifier } from './mcp.js';
 import { engineAvailable, errorMessage } from './headless.js';
@@ -35,10 +37,15 @@ const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? '0.0.0.0';
 const TOKEN = process.env.GRIDWRIGHT_TOKEN ?? '';
 const here = fileURLToPath(new URL('.', import.meta.url));
-/** Sharing level of a new document: GRIDWRIGHT_DEFAULT_SHARING=edit|view|none (private when identity is on). */
+/**
+ * Sharing level of a new document: GRIDWRIGHT_DEFAULT_SHARING=edit|view|none (private when identity
+ * is on). With accounts the client is the boundary and "public" means everyone in the client, so a
+ * new document is open to the client's members to edit unless the operator says otherwise.
+ */
 const DEFAULT_SHARING: 'edit' | 'view' | 'none' = (() => {
   const v = (process.env.GRIDWRIGHT_DEFAULT_SHARING ?? '').toLowerCase();
   if (v === 'edit' || v === 'view' || v === 'none' || v === 'private') return v === 'private' ? 'none' : v;
+  if (ACCOUNTS) return 'edit';
   return identityEnabled ? 'none' : 'edit';
 })();
 const CLIENT_DIR = process.env.CLIENT_DIR ?? [resolve(here, '../../client/dist'), resolve(here, '../client')].find((p) => existsSync(join(p, 'index.html'))) ?? resolve(here, '../../client/dist');
@@ -48,6 +55,9 @@ process.on('unhandledRejection', (e) => console.error('unhandled rejection:', e)
 process.on('uncaughtException', (e) => console.error('uncaught exception:', e));
 
 ensureDirs();
+// accounts (multi-tenant): the clients, people and sessions are open before the first request
+await initTenancy();
+if (ACCOUNTS && TOKEN) console.log('accounts: GRIDWRIGHT_TOKEN is not used with GRIDWRIGHT_AUTH=accounts — people sign in, scripts and MCP clients use API tokens');
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '64mb' }));
@@ -70,7 +80,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 // Optional shared-token gate: GRIDWRIGHT_TOKEN=... then open /?token=... once.
 const COOKIE = 'gridwright_token';
 app.use((req: Request, res: Response, next: NextFunction) => {
-  if (!TOKEN || onAgentChannel(req)) return next();
+  if (!TOKEN || ACCOUNTS || onAgentChannel(req)) return next();
   if (req.path === '/api/health') return next(); // liveness probe stays reachable (it reveals nothing private)
   const q = typeof req.query.token === 'string' ? req.query.token : '';
   if (q === TOKEN) {
@@ -87,6 +97,57 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   res.status(401).type('html').send('<h3>Gridwright</h3><p>This server requires a token: open <code>/?token=…</code> with the value of <code>GRIDWRIGHT_TOKEN</code>.</p>');
 });
 
+// Accounts gate (GRIDWRIGHT_AUTH=accounts): the API needs a signed-in person (session cookie or an
+// API token), a changed temporary password, and a client they are a member of. The static client
+// stays reachable — it shows the sign-in. Writes from another site are refused outright.
+const ALLOWED_ORIGINS = (process.env.GRIDWRIGHT_ALLOWED_ORIGINS ?? '')
+  .split(',')
+  .map((s) => s.trim().replace(/\/+$/, ''))
+  .filter(Boolean);
+const originAllowed = (req: { headers: Record<string, string | string[] | undefined> }) => {
+  const origin = String(req.headers.origin ?? '');
+  if (!origin || origin === 'null') return !origin; // no Origin: not a browser page (curl, MCP clients)
+  if (ALLOWED_ORIGINS.includes(origin.replace(/\/+$/, ''))) return true;
+  try {
+    const host = new URL(origin).host;
+    const fwd = String(req.headers['x-forwarded-host'] ?? '').split(',')[0].trim();
+    return host === String(req.headers.host ?? '') || (!!fwd && host === fwd);
+  } catch {
+    return false;
+  }
+};
+const OPEN_PATHS = new Set(['/api/health', '/api/me', '/api/auth/login', '/api/auth/logout']);
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (!ACCOUNTS || onAgentChannel(req)) return next();
+  const p = req.path;
+  if (!(p.startsWith('/api/') || p === '/mcp')) return next();
+  if (req.method !== 'GET' && req.method !== 'HEAD' && !originAllowed(req)) {
+    res.status(403).json({ error: 'cross-site request refused' });
+    return;
+  }
+  if (OPEN_PATHS.has(p)) return next();
+  const id = identityOf(req);
+  if (!id.login) {
+    res.setHeader('x-gridwright-auth', 'signed-out');
+    res.status(401).json({ error: 'sign in to use this server', auth: 'required' });
+    return;
+  }
+  if (id.mustChangePassword && p !== '/api/auth/password') {
+    res.setHeader('x-gridwright-auth', 'change-password');
+    res.status(403).json({ error: 'change your temporary password first', mustChangePassword: true });
+    return;
+  }
+  // one's own account and the platform console do not depend on a client
+  if (p.startsWith('/api/auth/') || p.startsWith('/api/account') || p.startsWith('/api/platform/')) return next();
+  if (!id.tenant) {
+    const error = id.denied === 'suspended' ? 'this client account is suspended' : id.denied === 'not-a-member' ? 'you are not a member of this client' : 'you are not a member of any client yet — ask an administrator to add you';
+    res.setHeader('x-gridwright-auth', 'no-client');
+    res.status(403).json({ error, denied: id.denied ?? 'no-client' });
+    return;
+  }
+  next();
+});
+
 // roles: viewers cannot write; only admins manage connections, AI settings and backups
 
 const publicPython = (req: Request) => {
@@ -95,10 +156,11 @@ const publicPython = (req: Request) => {
   return p.available ? { version: p.version, sandbox: p.sandbox, gpu: p.gpu, timeoutMs: p.limits.timeoutMs, memoryMb: p.limits.memoryMb, can: { run: canRunPython(who), gpu: canUseGpu(who) } } : null;
 };
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, version: VERSION, contract: CONTRACT_VERSION, multiplayer: true, pyodide: !!pyodideDir(), identity: identityEnabled, token: !!TOKEN, tools: true, defaultSharing: DEFAULT_SHARING, mcp: engineAvailable(), python: publicPython(req), investigation: stackStatus().available, worker: workerStatus() });
+  res.json({ ok: true, version: VERSION, contract: CONTRACT_VERSION, multiplayer: true, pyodide: !!pyodideDir(), identity: identityEnabled, auth: authMode, token: !!TOKEN && !ACCOUNTS, tools: true, defaultSharing: DEFAULT_SHARING, mcp: engineAvailable(), python: publicPython(req), investigation: stackStatus().available, worker: workerStatus() });
 });
 
 // --- routes: ./routes/*; the rules they call live in the services ---------------------------------
+registerAccountRoutes(app);
 registerPythonRoutes(app);
 registerDocumentRoutes(app, { defaultSharing: DEFAULT_SHARING });
 registerCompanionRoutes(app);
@@ -126,8 +188,8 @@ startWorker();
 void probeStack().then((st) => console.log(st.available ? `investigation stack: ${st.python} (${Object.entries(st.versions ?? {}).map(([k, v]) => `${k} ${v}`).join(', ')})` : `investigation stack off: ${st.reason}`));
 app.all('/mcp', (req, res) => void handleMcp(req, res));
 
-// --- backup (tar.gz of the data directory, admins only) ---------------------------------
-app.get('/api/backup', requireRole('admin'), (req, res) => {
+// --- backup (tar.gz of the data directory — every client's: the platform's administrators only) ---
+app.get('/api/backup', requirePlatformAdmin, (req, res) => {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   res.setHeader('content-type', 'application/gzip');
   res.setHeader('content-disposition', `attachment; filename="gridwright-backup-${stamp}.tar.gz"`);
@@ -181,7 +243,15 @@ server.on('upgrade', (req, socket, head) => {
     socket.destroy();
     return;
   }
-  if (TOKEN) {
+  if (ACCOUNTS) {
+    // the same rules as the API: a signed-in member of the client the tab names (?tenant=), from this site
+    const id = identityOf(req);
+    if (!originAllowed(req) || !id.login || !id.tenant || id.mustChangePassword) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\nconnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+  } else if (TOKEN) {
     const cookie = (req.headers.cookie ?? '').split(';').map((s) => s.trim()).find((s) => s.startsWith(COOKIE + '='));
     const ok = (cookie && decodeURIComponent(cookie.slice(COOKIE.length + 1)) === TOKEN) || url.searchParams.get('token') === TOKEN;
     if (!ok) {
@@ -218,6 +288,6 @@ void probePython().then((p) => console.log(p.available ? `server-side Python: ${
 
 server.listen(PORT, HOST, () => {
   console.log(
-    `gridwright ${VERSION} listening on http://${HOST}:${PORT}  data=${DATA_DIR}  client=${CLIENT_DIR}${TOKEN ? '  (token required)' : ''}${identityEnabled ? '  (trusting Tailscale identity headers)' : ''}${pyDir ? `  pyodide=${pyDir}` : ''}`,
+    `gridwright ${VERSION} listening on http://${HOST}:${PORT}  data=${DATA_DIR}  client=${CLIENT_DIR}${ACCOUNTS ? '  (accounts: multi-tenant, sign-in required)' : TOKEN ? '  (token required)' : ''}${identityEnabled && !ACCOUNTS ? '  (trusting Tailscale identity headers)' : ''}${pyDir ? `  pyodide=${pyDir}` : ''}`,
   );
 });

@@ -4,7 +4,7 @@
 // proposals — agent edits awaiting a person's decision, committed once against an expected revision.
 
 import type { Express } from 'express';
-import { canManage, canView, deleteAccess, normalise, permissionFor, readAccess, writeAccess, type FileAccess } from '../access.js';
+import { canManage, canView, deleteAccess, normalise, permissionFor, readAccess, tenantOf, writeAccess, type FileAccess } from '../access.js';
 import { brief as companionBrief, deleteCompanion, recordRejection } from '../companion.js';
 import { errorMessage, openDocument } from '../headless.js';
 import { appendEntry, checkpointSeqs, compactCheckpoints, currentSeq, deleteHistory, historyCsv, opTouchesCell, readAll, recentEntries, replayBundle, writeCheckpoint } from '../history.js';
@@ -17,6 +17,7 @@ import { theStore } from '../store.js';
 import { deleteCellWork } from '../investigate.js';
 import { clearConversation, deleteConversationsOf, readConversation, writeConversation } from '../conversations.js';
 import { ConversationSchema } from '../contracts.js';
+import { ACCOUNTS, getTenant, isMember } from '../tenancy.js';
 import { body, docPermission, fail, noAgent, requireRole } from './common.js';
 
 export function registerDocumentRoutes(app: Express, ctx: { defaultSharing: 'edit' | 'view' | 'none' }) {
@@ -24,10 +25,17 @@ export function registerDocumentRoutes(app: Express, ctx: { defaultSharing: 'edi
   app.get('/api/files', (req, res) => {
     const id = identityOf(req);
     const out = [];
-    for (const f of listFiles()) {
-      const access = readAccess(f.id);
+    // access first (the small metadata file): a document the caller may not see is never read
+    const seen = new Map<string, { access: FileAccess; permission: ReturnType<typeof permissionFor> }>();
+    const files = listFiles((fid) => {
+      const access = readAccess(fid);
       const permission = permissionFor(access, id);
-      if (!canView(permission)) continue;
+      if (!canView(permission)) return false;
+      seen.set(fid, { access, permission });
+      return true;
+    });
+    for (const f of files) {
+      const { access, permission } = seen.get(f.id)!;
       out.push({ ...f, folder: access.folder, owner: access.owner, ownerName: access.ownerName, public: access.public, shared: Object.keys(access.shares).length, permission });
     }
     res.json(out);
@@ -44,8 +52,10 @@ export function registerDocumentRoutes(app: Express, ctx: { defaultSharing: 'edi
       if (typeof json !== 'string') return res.status(400).json({ error: 'json (string) required' });
       const meta = writeFile(null, String(name || 'Untitled').slice(0, 120), json);
       const id = identityOf(req);
-      // with identity on, the creator owns the document (open to everyone on the server until restricted)
-      writeAccess(meta.id, normalise({ owner: identityEnabled ? id.login : '', ownerName: id.name || undefined, public: DEFAULT_SHARING, shares: {}, folder: typeof folder === 'string' ? folder : '' }));
+      if (ACCOUNTS && !id.tenant) return res.status(403).json({ error: 'no client selected' });
+      // with identity on, the creator owns the document (open to everyone on the server — with
+      // accounts: everyone in the client — until restricted); with accounts it belongs to the client
+      writeAccess(meta.id, normalise({ owner: identityEnabled ? id.login : '', ownerName: id.name || undefined, public: DEFAULT_SHARING, shares: {}, folder: typeof folder === 'string' ? folder : '', tenant: ACCOUNTS ? id.tenant : undefined }));
       const seq = appendEntry(meta.id, { author: { id: typeof client === 'string' ? client : 'api', name: id.name || 'Guest', login: id.login || undefined }, origin: 'user', checkpoint: true, note: 'created' });
       writeCheckpoint(meta.id, seq, json);
       res.json({ ...meta, seq, permission: 'own' });
@@ -137,7 +147,7 @@ export function registerDocumentRoutes(app: Express, ctx: { defaultSharing: 'edi
   app.get('/api/files/:id/access', (req, res) => {
     const p = docPermission(req, res, 'view');
     if (!p) return;
-    res.json({ ...p.access, permission: p.permission, identity: identityEnabled });
+    res.json({ ...p.access, permission: p.permission, identity: identityEnabled, ...clientOf(p.access) });
   });
   app.put('/api/files/:id/access', requireRole('editor'), (req, res) => {
     const p = docPermission(req, res, 'edit');
@@ -156,10 +166,24 @@ export function registerDocumentRoutes(app: Express, ctx: { defaultSharing: 'edi
       }
     }
     const saved = normalise(next);
+    if (ACCOUNTS) {
+      // a document is shared within its client only: every name must be a member there
+      const tenant = tenantOf(p.access);
+      const outsiders = Object.keys(saved.shares).filter((login) => !isMember(tenant, login));
+      if (saved.owner && !isMember(tenant, saved.owner)) outsiders.push(saved.owner);
+      if (outsiders.length) return res.status(400).json({ error: `not a member of this client: ${outsiders.join(', ')} — an administrator adds people to the client first` });
+      saved.tenant = p.access.tenant;
+    }
     writeAccess(req.params.id, saved);
     accessChanged(req.params.id); // connected sessions are downgraded or closed at once
-    res.json({ ...saved, permission: permissionFor(saved, identityOf(req)), identity: identityEnabled });
+    res.json({ ...saved, permission: permissionFor(saved, identityOf(req)), identity: identityEnabled, ...clientOf(saved) });
   });
+  /** accounts mode: the client a document belongs to, for the Share panel ("everyone in …") */
+  const clientOf = (a: FileAccess) => {
+    if (!ACCOUNTS) return {};
+    const t = getTenant(tenantOf(a));
+    return { client: t ? { id: t.id, name: t.name, slug: t.slug } : undefined };
+  };
 
   // --- history (audit trail) ---------------------------------------------------------------
   app.get('/api/files/:id/history', (req, res) => {

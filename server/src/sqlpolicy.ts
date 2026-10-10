@@ -5,7 +5,8 @@
 
 import type { Identity } from './identity.js';
 import { identityEnabled } from './identity.js';
-import type { StoredConnection } from './storage.js';
+import { connectionTenant, type StoredConnection } from './storage.js';
+import { ACCOUNTS } from './tenancy.js';
 
 export class SqlRefused extends Error {
   status: number;
@@ -64,6 +65,8 @@ export function isReadOnlySql(sql: string): { ok: boolean; reason?: string } {
 
 /** Throws `SqlRefused` unless `who` may run `sql` on `conn`. */
 export function authorizeQuery(conn: StoredConnection, who: Identity, sql: string): void {
+  // another client's connection does not exist for this caller
+  if (!sameClient(conn, who)) throw new SqlRefused('no such connection', 404);
   if (who.role === 'viewer') throw new SqlRefused('read-only access: viewers cannot run queries');
   const allowed = (conn.allowed ?? []).map((s) => s.trim().toLowerCase()).filter(Boolean);
   if (allowed.length && who.role !== 'admin') {
@@ -78,7 +81,14 @@ export function authorizeQuery(conn: StoredConnection, who: Identity, sql: strin
 
 /** Can `who` see this connection in lists at all? */
 export function canSeeConnection(conn: StoredConnection, who: Identity): boolean {
+  if (!sameClient(conn, who)) return false;
   const allowed = (conn.allowed ?? []).map((s) => s.trim().toLowerCase()).filter(Boolean);
   if (!allowed.length || who.role === 'admin') return true;
   return identityEnabled && allowed.includes(who.login.toLowerCase());
+}
+
+/** Accounts mode: a connection belongs to one client, and only that client's members reach it. */
+export function sameClient(conn: StoredConnection, who: Identity): boolean {
+  if (!ACCOUNTS) return true;
+  return !!who.tenant && connectionTenant(conn) === who.tenant;
 }

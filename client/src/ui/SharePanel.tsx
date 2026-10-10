@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { PanelHeader } from './PanelHeader';
 import { api, type FileAccess } from '../api/client';
+import { accounts, type Member } from '../api/accounts';
 import { setStatus, useStore } from '../state/store';
 import { saveCurrentFile } from './files';
 import { openPrintView } from './print';
@@ -19,6 +20,16 @@ export function SharePanel() {
   const [shareLogin, setShareLogin] = useState('');
   const [shareLevel, setShareLevel] = useState<'view' | 'edit' | 'sign'>('edit');
   const [copied, setCopied] = useState(false);
+  // accounts mode: a document is shared within its client, so the people to pick from are its members
+  const [members, setMembers] = useState<Member[]>([]);
+  useEffect(() => {
+    if (me.auth !== 'accounts') return;
+    accounts.tenant
+      .members()
+      .then(setMembers)
+      .catch(() => setMembers([]));
+  }, [me.auth, me.tenant?.id]);
+  const clientName = access?.client?.name ?? me.tenant?.name;
   useEffect(() => {
     setAccess(null);
     if (!fileId) return;
@@ -39,7 +50,7 @@ export function SharePanel() {
     }
   };
   const canManage = access?.permission === 'own';
-  const link = fileId ? `${location.origin}${location.pathname}?file=${encodeURIComponent(fileId)}` : '';
+  const link = fileId ? `${location.origin}${location.pathname}?file=${encodeURIComponent(fileId)}${me.tenant?.slug ? `&tenant=${encodeURIComponent(me.tenant.slug)}` : ''}` : '';
 
   return (
     <div className="panel share-panel">
@@ -73,7 +84,7 @@ export function SharePanel() {
                 {access.owner && access.owner === me.login.toLowerCase() ? ' (you)' : ''}
               </div>
               <label className="row">
-                <span className="muted small grow">Everyone on this server</span>
+                <span className="muted small grow">{me.auth === 'accounts' ? `Everyone in ${clientName ?? 'this client'}` : 'Everyone on this server'}</span>
                 <select value={access.public} disabled={!canManage} onChange={(e) => void updateAccess({ public: e.target.value as FileAccess['public'] })}>
                   <option value="edit">can edit</option>
                   <option value="view">can view</option>
@@ -106,7 +117,18 @@ export function SharePanel() {
               ))}
               {canManage && (
                 <div className="row">
-                  <input className="grow" placeholder="login (e.g. ana@example.com)" value={shareLogin} onChange={(e) => setShareLogin(e.target.value)} onKeyDown={(e) => e.stopPropagation()} />
+                  <input className="grow" list={members.length ? 'share-members' : undefined} placeholder={me.auth === 'accounts' ? 'a member of this client' : 'login (e.g. ana@example.com)'} value={shareLogin} onChange={(e) => setShareLogin(e.target.value)} onKeyDown={(e) => e.stopPropagation()} />
+                  {members.length > 0 && (
+                    <datalist id="share-members">
+                      {members
+                        .filter((m) => m.login !== access.owner && !(m.login in access.shares))
+                        .map((m) => (
+                          <option key={m.login} value={m.login}>
+                            {m.name} · {m.role}
+                          </option>
+                        ))}
+                    </datalist>
+                  )}
                   <select value={shareLevel} onChange={(e) => setShareLevel(e.target.value as 'view' | 'edit' | 'sign')}>
                     {(['view', 'sign', 'edit'] as const).map((l) => (
                       <option key={l} value={l}>
@@ -131,7 +153,10 @@ export function SharePanel() {
                   Take ownership (lets you restrict who sees this document)
                 </button>
               )}
-              <p className="muted small">“Can sign off” lets someone attest ranges in Review without editing values. Access changes reach open sessions at once.</p>
+              <p className="muted small">
+                “Can sign off” lets someone attest ranges in Review without editing values. Access changes reach open sessions at once.
+                {me.auth === 'accounts' && ` Only members of ${clientName ?? 'this client'} can be given access; administrators of the client see every document in it.`}
+              </p>
             </>
           ) : (
             <p className="muted small">This server does not identify people, so everyone who can reach it can open the link. Put it behind Tailscale to share by login.</p>

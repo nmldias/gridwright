@@ -82,12 +82,20 @@ export interface FileMeta {
 
 const safeId = (id: string) => /^[a-zA-Z0-9_-]{1,64}$/.test(id);
 
-export function listFiles(): FileMeta[] {
+/** The client a record belongs to when it predates multi-tenancy (or the server runs without it). */
+export const DEFAULT_TENANT = 'default';
+
+/**
+ * Every document, newest first. `include` is asked first, by id (cheap: the access metadata), so a
+ * document the caller may not see is never read — with many clients on one server that matters.
+ */
+export function listFiles(include?: (id: string) => boolean): FileMeta[] {
   ensureDirs();
   const out: FileMeta[] = [];
   for (const f of readdirSync(FILES_DIR)) {
     if (!f.endsWith('.json') || f.endsWith('.meta.json')) continue;
     const id = f.slice(0, -5);
+    if (include && !include(id)) continue;
     const p = join(FILES_DIR, f);
     try {
       const st = statSync(p);
@@ -168,7 +176,11 @@ export interface StoredConnection {
   maxRows?: number;
   /** statement timeout in milliseconds (default 30 000, cap 300 000) */
   timeoutMs?: number;
+  /** the client (tenant) the connection belongs to; absent = the default client */
+  tenant?: string;
 }
+
+export const connectionTenant = (c: StoredConnection) => c.tenant || DEFAULT_TENANT;
 
 const CONN_PATH = () => join(DATA_DIR, 'connections.json');
 
@@ -190,20 +202,82 @@ export interface AiConfig {
   baseUrl: string;
   model: string;
   apiKeyEnc?: string;
+  /** where the settings come from: the platform default, or a client's own override */
+  scope?: 'platform' | 'client';
+  /** whether AI_API_KEY from the environment may be used for this endpoint */
+  envKey?: boolean;
 }
 
 const AI_PATH = () => join(DATA_DIR, 'ai.json');
+const safeTenant = (t: string) => /^[a-zA-Z0-9_-]{1,64}$/.test(t);
+const TENANT_AI_PATH = (tenant: string) => join(DATA_DIR, 'tenants', tenant, 'ai.json');
+const sameEndpoint = (a: string, b: string) => a.trim().replace(/\/+$/, '') === b.trim().replace(/\/+$/, '');
 
-export function readAiConfig(): AiConfig {
+/** The platform default (ai.json, then AI_BASE_URL / AI_MODEL / AI_API_KEY). */
+export function readPlatformAiConfig(): AiConfig {
   const stored = readJson<Partial<AiConfig>>(AI_PATH(), {});
   return {
     baseUrl: stored.baseUrl ?? process.env.AI_BASE_URL ?? '',
     model: stored.model ?? process.env.AI_MODEL ?? '',
     apiKeyEnc: stored.apiKeyEnc,
+    scope: 'platform',
+    envKey: true,
   };
 }
 
-export function writeAiConfig(cfg: AiConfig) {
+/** A client's own settings, or null when it uses the platform default. */
+export function readTenantAiConfig(tenant: string): AiConfig | null {
+  if (!safeTenant(tenant)) return null;
+  const p = TENANT_AI_PATH(tenant);
+  if (!existsSync(p)) return null;
+  const t = readJson<Partial<AiConfig>>(p, {});
+  if (!t.baseUrl && !t.model && !t.apiKeyEnc) return null;
+  return { baseUrl: t.baseUrl ?? '', model: t.model ?? '', apiKeyEnc: t.apiKeyEnc, scope: 'client' };
+}
+
+/**
+ * The settings in force for a client (or the platform default without one). A client may name its
+ * own endpoint, model and key; whatever it leaves empty comes from the platform default — except the
+ * key: the platform's key is only ever sent to the platform's own endpoint, never to an endpoint a
+ * client typed in (that would hand the operator's key to whoever runs it).
+ */
+export function readAiConfig(tenant?: string): AiConfig {
+  const platform = readPlatformAiConfig();
+  const t = tenant ? readTenantAiConfig(tenant) : null;
+  if (!t) return platform;
+  const baseUrl = t.baseUrl || platform.baseUrl;
+  const platformEndpoint = sameEndpoint(baseUrl, platform.baseUrl);
+  return {
+    baseUrl,
+    model: t.model || platform.model,
+    apiKeyEnc: t.apiKeyEnc ?? (platformEndpoint ? platform.apiKeyEnc : undefined),
+    scope: 'client',
+    envKey: !t.apiKeyEnc && platformEndpoint,
+  };
+}
+
+/** The key to send with a configuration ("" = none). */
+export function aiKeyOf(cfg: AiConfig): string {
+  if (cfg.apiKeyEnc) return decrypt(cfg.apiKeyEnc);
+  return cfg.envKey === false ? '' : process.env.AI_API_KEY ?? '';
+}
+
+/** Write the platform default (no tenant) or a client's override. */
+export function writeAiConfig(cfg: AiConfig, tenant?: string) {
   ensureDirs();
-  writeJsonAtomic(AI_PATH(), cfg);
+  const plain = { baseUrl: cfg.baseUrl, model: cfg.model, apiKeyEnc: cfg.apiKeyEnc };
+  if (!tenant) return writeJsonAtomic(AI_PATH(), plain);
+  if (!safeTenant(tenant)) throw new Error('bad client id');
+  mkdirSync(join(DATA_DIR, 'tenants', tenant), { recursive: true });
+  writeJsonAtomic(TENANT_AI_PATH(tenant), plain);
+}
+
+/** A client's override removed: it uses the platform default again. */
+export function clearTenantAiConfig(tenant: string) {
+  if (!safeTenant(tenant)) return;
+  try {
+    unlinkSync(TENANT_AI_PATH(tenant));
+  } catch {
+    /* none */
+  }
 }

@@ -8,13 +8,14 @@ import { canView, permissionFor, readAccess } from '../access.js';
 import { fnv, inputsHashFromSnapshot, outputHashOf } from '../evidence.js';
 import { canRunPython, canUseGpu, executionPolicy } from '../execpolicy.js';
 import { appendEntry } from '../history.js';
-import { identityEnabled, identityOf } from '../identity.js';
+import { authMode, identityEnabled, identityOf } from '../identity.js';
+import { ACCOUNTS, membershipsOf } from '../tenancy.js';
 import { admissionState, probeGpu, probePython, pythonStatus, QUEUE_MAX, runPython, type Snapshot } from '../pyrun.js';
 import { readFile } from '../storage.js';
 import { brief as companionBrief } from '../companion.js';
 import { probeStack, runAgentCell } from '../investigate.js';
 import { notifyCompanion } from '../multiplayer.js';
-import { authorOf, docPermission, fail, noAgent, requireRole } from './common.js';
+import { authorOf, docPermission, fail, noAgent, requirePlatformAdmin, requireRole } from './common.js';
 
 export function registerPythonRoutes(app: Express) {
   app.get('/api/python', (req, res) => {
@@ -22,8 +23,8 @@ export function registerPythonRoutes(app: Express) {
     const who = identityOf(req);
     res.json({ available: p.available, version: p.version, sandbox: p.sandbox, gpu: p.gpu, reason: p.reason, fallbacks: p.fallbacks, limits: { ...p.limits, queue: QUEUE_MAX }, interpreter: p.interpreter, policy: executionPolicy(), admission: admissionState(), can: { run: canRunPython(who), gpu: canUseGpu(who) } });
   });
-  // re-probe (after installing python, bubblewrap or cuDF) — administrators only
-  app.post('/api/python/probe', requireRole('admin'), async (_req, res) => {
+  // re-probe (after installing python, bubblewrap or cuDF) — the host's administrators only
+  app.post('/api/python/probe', requirePlatformAdmin, async (_req, res) => {
     const p = await probePython(true);
     if (p.available) await probeGpu();
     res.json(pythonStatus());
@@ -114,6 +115,17 @@ app.post('/api/python/run', requireRole('editor'), async (req, res) => {
   });
   app.get('/api/me', (req, res) => {
     const id = identityOf(req);
-    res.json({ login: id.login, name: id.name, role: id.role, identity: identityEnabled, can: { python: canRunPython(id), gpu: canUseGpu(id) } });
+    const base = { login: id.login, name: id.name, role: id.role, identity: identityEnabled, auth: authMode, can: { python: canRunPython(id), gpu: canUseGpu(id) } };
+    if (!ACCOUNTS) return res.json(base);
+    // accounts mode: the client this tab acts in, every client the person belongs to, and what they run
+    res.json({
+      ...base,
+      authenticated: !!id.login,
+      platformAdmin: !!id.platformAdmin,
+      mustChangePassword: !!id.mustChangePassword,
+      tenant: id.tenant ? { id: id.tenant, name: id.tenantName ?? '', slug: id.tenantSlug ?? '', role: id.role } : null,
+      denied: id.denied,
+      tenants: id.login ? membershipsOf(id.login).map((m) => ({ id: m.tenant.id, name: m.tenant.name, slug: m.tenant.slug, role: m.role, status: m.tenant.status })) : [],
+    });
   });
 }

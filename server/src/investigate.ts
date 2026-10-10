@@ -14,9 +14,11 @@ import { fileURLToPath } from 'node:url';
 import { finishInvestigation, recordRun, requestCancel, setFenceHook, setInvestigationJob, startInvestigation, type Investigation } from './companion.js';
 import { fnv } from './evidence.js';
 import { openDocument, snapshotOf } from './headless.js';
-import { issueAgentToken, revokeAgentToken, type Identity } from './identity.js';
+import { identityForLogin, issueAgentToken, revokeAgentToken, type Identity } from './identity.js';
 import { runAsAgentCell, runPython, type RunResult, type Snapshot } from './pyrun.js';
-import { crashPoint, DATA_DIR, decrypt, readAiConfig } from './storage.js';
+import { aiKeyOf, crashPoint, DATA_DIR, readAiConfig } from './storage.js';
+import { tenantOfDoc } from './access.js';
+import { ACCOUNTS } from './tenancy.js';
 import type { Author } from './history.js';
 import { cancelJob, enqueue, kick, listJobs, registerRunner, supersedeJobsOf, type JobOutcome } from './jobs.js';
 
@@ -163,7 +165,7 @@ export async function runAgentCell(fileId: string, who: Identity, by: Author, co
   const st = stack;
   if (!st.available) throw new Error(`the investigation stack is not available: ${st.reason ?? 'not probed'}`);
   if (!agentSocket) throw new Error('the agent channel is not listening (see the server log)');
-  const cfg = readAiConfig();
+  const cfg = readAiConfig(ACCOUNTS ? tenantOfDoc(fileId) : undefined);
   if (!cfg.baseUrl) throw new Error('no model endpoint is configured (Settings → model)');
   const paths = await probeStackPaths(st.python);
   const hidden = HIDDEN_ROOTS();
@@ -237,9 +239,10 @@ registerRunner('investigation', (ctl) =>
       return done({ status: 'failed', error: `the investigation stack is not available: ${st.reason ?? 'not probed'}` });
     }
     const whoIn = (job.input.who ?? {}) as { login?: string; name?: string; role?: string };
-    const who: Identity = { login: whoIn.login ?? '', name: whoIn.name ?? '', role: (whoIn.role as Identity['role']) ?? 'editor' };
-    const cfg = readAiConfig();
-    const apiKey = cfg.apiKeyEnc ? decrypt(cfg.apiKeyEnc) : process.env.AI_API_KEY ?? '';
+    // accounts mode: the person as a member of the document's client now (removed since = no access)
+    const who: Identity = ACCOUNTS ? identityForLogin(whoIn.login ?? '', whoIn.name ?? '', tenantOfDoc(fileId)) : { login: whoIn.login ?? '', name: whoIn.name ?? '', role: (whoIn.role as Identity['role']) ?? 'editor' };
+    const cfg = readAiConfig(ACCOUNTS ? tenantOfDoc(fileId) : undefined);
+    const apiKey = aiKeyOf(cfg);
     const token = issueAgentToken(who, `investigation ${invId}`, job.limits.timeoutMs + 60_000);
     const env: NodeJS.ProcessEnv = {
       PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',

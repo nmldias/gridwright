@@ -15,9 +15,11 @@ import type { StoredConnection } from '../storage.js';
 import { authorOf, body, docPermission, fail, noAgent, requireRole } from './common.js';
 
 export function registerIntakeRoutes(app: Express) {
-  app.get('/api/inbox', (_req, res) => {
-    const root = inboxRoot();
-    res.json({ configured: !!root, mode: root ? 'manual: files in GRIDWRIGHT_INBOX are listed on request, never watched' : 'not configured (set GRIDWRIGHT_INBOX to a directory)', files: root ? listInbox() : [] });
+  app.get('/api/inbox', (req, res) => {
+    // accounts mode: the caller's client's own folder inside the inbox
+    const tenant = identityOf(req).tenant;
+    const root = inboxRoot(tenant);
+    res.json({ configured: !!root, mode: root ? 'manual: files in GRIDWRIGHT_INBOX are listed on request, never watched' : 'not configured (set GRIDWRIGHT_INBOX to a directory)', files: root ? listInbox(tenant) : [] });
   });
   app.get('/api/files/:id/intake', (req, res) => {
     if (!docPermission(req, res, 'view')) return;
@@ -75,7 +77,7 @@ export function registerIntakeRoutes(app: Express) {
     if (!b) return;
     try {
       const p = applyIntake(req.params.id, authorOf(req), req.params.key, { decisions: b.decisions, period: b.period }, (entries) => broadcastEntries(req.params.id, entries));
-      if (p.origin === 'inbox') inboxTaken(p.name, p.key);
+      if (p.origin === 'inbox') inboxTaken(p.name, p.key, req.params.id);
       notifyCompanion(req.params.id, { attention: companionBrief(req.params.id).health.attention });
       const readings = (p.applied?.tables ?? []).map((t) => readingOf(req.params.id, t.table)).filter(Boolean);
       res.json({ ...p, sets: p.sets.map((x) => ({ ...x, rows: [] })), readings });

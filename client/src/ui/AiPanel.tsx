@@ -122,6 +122,28 @@ export function AiPanel() {
       </PanelHeader>
       {showSettings && (
         <div className="ai-settings">
+          {settings?.scope && (
+            <div className="row small">
+              <span className={`pill ${settings.scope === 'client' ? 'ready' : ''}`}>{settings.scope === 'client' ? `${me.tenant?.name ?? 'this client'}'s own settings` : 'platform default'}</span>
+              <span className="muted grow">{settings.scope === 'client' ? 'this client uses its own endpoint, model or key' : 'saving here gives this client its own settings'}</span>
+              {settings.scope === 'client' && me.role === 'admin' && (
+                <button
+                  className="small"
+                  onClick={async () => {
+                    try {
+                      const s = await api.ai.saveSettings({ reset: true });
+                      setSettings(s);
+                      setDraft({ baseUrl: s.baseUrl, model: s.model, apiKey: '' });
+                    } catch (e) {
+                      setError((e as Error).message);
+                    }
+                  }}
+                >
+                  Use platform default
+                </button>
+              )}
+            </div>
+          )}
           <label className="field">
             <span>OpenAI-compatible base URL</span>
             <input value={draft.baseUrl} onKeyDown={stop} placeholder="http://100.78.161.2:8888/v1" onChange={(e) => setDraft({ ...draft, baseUrl: e.target.value })} />

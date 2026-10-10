@@ -11,7 +11,7 @@ import { cancelInvestigation, probeStack, runCodeForDocument, stackStatus, start
 import { cancelJob, getJob, listJobs, workerStatus } from '../jobs.js';
 import type { JobStatus } from '../store.js';
 import { notifyCompanion } from '../multiplayer.js';
-import { authorOf, body, docPermission, fail, noAgent, requireRole } from './common.js';
+import { authorOf, body, docPermission, fail, noAgent, requirePlatformAdmin, requireRole } from './common.js';
 
 export function registerInvestigationRoutes(app: Express, ctx: { token: string; selfUrl: () => string }) {
   app.post('/api/files/:id/companion/run', requireRole('editor'), async (req, res) => {
@@ -29,7 +29,7 @@ export function registerInvestigationRoutes(app: Express, ctx: { token: string; 
     }
   });
   app.get('/api/investigation', (_req, res) => res.json(stackStatus()));
-  app.post('/api/investigation/probe', requireRole('admin'), async (_req, res) => res.json(await probeStack(true)));
+  app.post('/api/investigation/probe', requirePlatformAdmin, async (_req, res) => res.json(await probeStack(true)));
   app.post('/api/files/:id/companion/investigate', requireRole('editor'), async (req, res) => {
     if (!docPermission(req, res, 'view') || !noAgent(req, res)) return;
     const b = body(InvestigateSchema, req, res);

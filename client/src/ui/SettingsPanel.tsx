@@ -68,7 +68,15 @@ export function SettingsPanel() {
           <option value="compact">compact (12 px) — more rows and columns on screen</option>
         </select>
       </label>
-      {me.identity ? (
+      {me.auth === 'accounts' ? (
+        <div className="muted small">
+          Signed in as <b>{me.name || me.login}</b> ({me.login}) · client: <b>{me.tenant?.name}</b> · role: {me.role}
+          {me.platformAdmin ? ' · platform administrator' : ''} ·{' '}
+          <button className="link" onClick={() => useStore.setState({ panel: 'admin', adminView: 'account' })}>
+            my account
+          </button>
+        </div>
+      ) : me.identity ? (
         <div className="muted small">
           Signed in through Tailscale as <b>{me.name || me.login}</b> ({me.login}) · role: {me.role}
         </div>
@@ -85,7 +93,7 @@ export function SettingsPanel() {
           : 'not available on this server (no python3, or the sandbox probe failed) — new Python cells run in the browser'}
       </div>
       <div className="row wrap">
-        <button disabled={probing || me.role !== 'admin'} onClick={() => void reprobe()} title={me.role === 'admin' ? 'Detect the interpreter, the sandbox and cuDF again (after installing python, bubblewrap or RAPIDS)' : 'administrators only'}>
+        <button disabled={probing || (me.auth === 'accounts' ? !me.platformAdmin : me.role !== 'admin')} onClick={() => void reprobe()} title={(me.auth === 'accounts' ? me.platformAdmin : me.role === 'admin') ? 'Detect the interpreter, the sandbox and cuDF again (after installing python, bubblewrap or RAPIDS)' : me.auth === 'accounts' ? 'platform administrators only' : 'administrators only'}>
           {probing ? 'Checking…' : 'Re-check server Python'}
         </button>
         {probeNote && <span className="muted small">{probeNote}</span>}
