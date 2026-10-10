@@ -185,13 +185,18 @@ async function runSqlCell(ref: CellRef, id: number, code: string, conn: string |
 // --- Python on the server -------------------------------------------------------------------
 // Same snapshot the browser worker gets, same `q` API, same output shape; the run record says
 // "python-server" with the sandbox level and the packages the host used.
-async function runServerPython(ref: CellRef, id: number, code: string, gpu: boolean, snapshot: Snapshot, startedAt: number) {
+async function runServerPython(ref: CellRef, id: number, code: string, gpu: boolean, snapshot: Snapshot, startedAt: number, agent = false) {
   const finish = (d: any) => handleResult({ data: { id, code, ...d } } as MessageEvent);
   try {
     // the server computes and logs the record itself (attested: server) when it knows which cell this is
     const st = getState();
     const cellRef = st.fileId ? { file: st.fileId, table: ref.table, row: ref.row, col: ref.col, kind: 'python', startedAt: new Date(startedAt).toISOString(), client: getClientId() } : undefined;
-    const res = await api.python.run(code, snapshot, gpu, cellRef);
+    if (agent && !st.fileId) {
+      finish({ ok: false, error: 'an agent cell needs a saved document: it works on the document\'s context (Save first)', deps: [], runtime: { name: 'python-agent', version: '', packages: {} } });
+      return;
+    }
+    const res: Awaited<ReturnType<typeof api.python.runAgent>> = agent ? await api.python.runAgent(st.fileId!, code, snapshot, cellRef && { table: cellRef.table, row: cellRef.row, col: cellRef.col, startedAt: cellRef.startedAt, client: cellRef.client }) : await api.python.run(code, snapshot, gpu, cellRef);
+    if (agent && res.agent && (res.agent.records.length || res.agent.proposals.length)) useStore.setState({ status: `The agent cell proposed ${res.agent.records.length} record${res.agent.records.length === 1 ? '' : 's'} and ${res.agent.proposals.length} proposal${res.agent.proposals.length === 1 ? '' : 's'} — confirm them in Ask and Review` });
     const runtime: RunRuntime = res.runtime ?? { name: 'python-server', version: '', packages: {} };
     if (res.ok) finish({ ok: true, output: res.output ?? null, std_out: res.std_out, deps: res.deps, runtime, record: res.record });
     else finish({ ok: false, error: res.error || 'error', std_out: res.std_out, deps: res.deps, runtime, record: res.record });
@@ -268,8 +273,8 @@ export function runCell(ref: CellRef) {
   }
   const snapshot = buildSnapshot(ref);
   snapshots.set(id, snapshot);
-  if (cell.k === 'python' && cell.runtime === 'server') {
-    void runServerPython(ref, id, cell.i, !!cell.gpu, snapshot, now);
+  if (cell.k === 'python' && (cell.runtime === 'server' || cell.runtime === 'agent')) {
+    void runServerPython(ref, id, cell.i, !!cell.gpu, snapshot, now, cell.runtime === 'agent');
     return;
   }
   const worker = cell.k === 'python' ? getPyWorker() : getJsWorker();

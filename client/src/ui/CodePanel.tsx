@@ -81,6 +81,7 @@ export function CodePanel() {
     });
   };
   const onServer = lang === 'python' && cell?.runtime === 'server';
+  const onAgent = lang === 'python' && cell?.runtime === 'agent';
 
   // (re)create the editor when the target cell changes
   useEffect(() => {
@@ -145,7 +146,8 @@ export function CodePanel() {
   return (
     <div className="panel code-panel">
       <PanelHeader title={title} subtitle={`${meta?.name}::${a1(codeCell.row, codeCell.col)}`}>
-        {lang === 'python' && !onServer && <span className={`pill ${pythonStatus}`}>{pythonStatus === 'ready' ? 'runtime ready' : pythonStatus === 'loading' ? 'loading Pyodide…' : pythonStatus === 'error' ? 'runtime error' : 'runtime idle'}</span>}
+        {onAgent && <span className={`pill ${serverPython?.agent ? 'ready' : 'error'}`} title="An agent cell: your code runs in the cell sandbox with no network; Gridwright and the model are reached only through the agent channel, as you, by a short-lived agent token — the companion's context, tools and model are in `companion`. Whatever it records is proposed, never ratified; no key is ever inside the cell.">{serverPython?.agent ? `agent · ${serverPython.sandbox === 'bwrap' ? 'sandboxed' : serverPython.sandbox === 'unshare' ? 'no network' : 'unsandboxed'} · proposes` : 'agent stack not installed'}</span>}
+        {lang === 'python' && !onServer && !onAgent && <span className={`pill ${pythonStatus}`}>{pythonStatus === 'ready' ? 'runtime ready' : pythonStatus === 'loading' ? 'loading Pyodide…' : pythonStatus === 'error' ? 'runtime error' : 'runtime idle'}</span>}
         {onServer && <span className={`pill ${serverPython ? 'ready' : 'error'}`} title={serverPython ? `CPython ${serverPython.version} on the server · sandbox: ${serverPython.sandbox} · ${serverPython.gpu?.startsWith('cudf') ? 'GPU: ' + serverPython.gpu : 'no GPU'}` : 'the server has no Python runtime'}>{serverPython ? `server · ${serverPython.sandbox === 'bwrap' ? 'sandboxed' : serverPython.sandbox === 'unshare' ? 'no network' : 'unsandboxed'}` : 'server runtime off'}</span>}
         <button className="primary" disabled={!!running} onClick={() => save(true)} title="Run (Ctrl+Enter)">
           {running ? 'Running…' : '▶ Run'}
@@ -170,13 +172,16 @@ export function CodePanel() {
         {lang === 'python' && (
           <select
             className="runtime-select"
-            value={onServer ? 'server' : 'browser'}
-            onChange={(e) => setMeta({ runtime: e.target.value === 'server' ? 'server' : null, gpu: e.target.value === 'server' ? (cell.gpu ?? false) : false })}
-            title={serverPython ? `Where this cell runs. Server: CPython ${serverPython.version} (${serverPython.memoryMb} MB, ${Math.round(serverPython.timeoutMs / 1000)} s per run)` : 'This server has no Python runtime; the browser runs the cell'}
+            value={onAgent ? 'agent' : onServer ? 'server' : 'browser'}
+            onChange={(e) => setMeta({ runtime: e.target.value === 'server' ? 'server' : e.target.value === 'agent' ? 'agent' : null, gpu: e.target.value === 'server' ? (cell.gpu ?? false) : false })}
+            title={serverPython ? `Where this cell runs. Server: CPython ${serverPython.version} (${serverPython.memoryMb} MB, ${Math.round(serverPython.timeoutMs / 1000)} s per run). Agent: the same sandbox, the companion in its namespace, Gridwright and the model through the agent channel` : 'This server has no Python runtime; the browser runs the cell'}
           >
             <option value="browser">run in the browser (Pyodide)</option>
             <option value="server" disabled={!serverPython || serverPython.can?.run === false}>
               {serverPython ? (serverPython.can?.run === false ? 'run on the server (not permitted for your login)' : `run on the server (CPython ${serverPython.version})`) : 'run on the server (not available)'}
+            </option>
+            <option value="agent" disabled={!serverPython?.agent || serverPython.can?.run === false}>
+              {serverPython?.agent ? (serverPython.can?.run === false ? 'agent cell (not permitted for your login)' : 'agent cell — LangChain · DeepAgents · LangGraph, the companion in `companion`, sandboxed') : 'agent cell (stack not installed: scripts/install.sh --companion)'}
             </option>
           </select>
         )}
@@ -222,8 +227,14 @@ export function CodePanel() {
       </div>
       <div className="muted small">
         Ctrl+Enter runs · Ctrl+S saves without running · results spill from this cell; the table grows to fit{lang === 'sql' ? ' · {{A1}} and {{Table::B2}} bind cell values as query parameters; a range becomes a list for IN (…)' : ''}
-        {onServer ? ' · on the server the code runs as a fresh process with no network and no access to the data directory; every run is logged with the sandbox level' : ''}.
+        {onServer ? ' · on the server the code runs as a fresh process with no network and no access to the data directory; every run is logged with the sandbox level' : ''}
+        {onAgent ? ' · an agent cell runs in the cell sandbox with no network: Gridwright and the model (through the server\'s proxy, so no key is inside) are reached only through the agent channel, as you, by a short-lived token — whatever it records is proposed, never ratified' : ''}.
       </div>
+      {onAgent && (
+        <div className="muted small agent-help">
+          <b>companion</b> — <code>companion.context()</code> · <code>companion.understanding()</code> · <code>companion.table("inventory")</code> → DataFrame · <code>companion.evaluate("=SUM(inventory[Landed cost (Kz)])")</code> · <code>companion.run_python(code)</code> (sandboxed, kept as evidence) · <code>companion.remember("hypothesis", "…")</code> / <code>propose_watch(…)</code> / <code>propose_edit(…)</code> (proposed) · <code>companion.tools</code> (LangChain) · <code>companion.model()</code> (ChatOpenAI) · <code>companion.agent(system_prompt=…)</code> (DeepAgents) · <code>companion.ask("…")</code> (on the document's LangGraph thread). <code>q</code> and pandas as in any cell; the last expression is the output.
+        </div>
+      )}
     </div>
   );
 }

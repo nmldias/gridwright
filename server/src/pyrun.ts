@@ -51,6 +51,8 @@ export interface RunResult {
   deps: { table: number; r0: number; c0: number; r1: number; c1: number }[];
   runtime: { name: string; version: string; packages: Record<string, string> };
   ms: number;
+  /** an agent cell: what the companion proposed on the cell's behalf */
+  agent?: { records: string[]; proposals: string[]; runs: string[]; steps: { tool: string; summary: string }[] };
 }
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -165,11 +167,11 @@ interface RawRun {
   ms: number;
 }
 
-function execute(argv: string[], request: unknown, timeoutMs: number): Promise<RawRun> {
+function execute(argv: string[], request: unknown, timeoutMs: number, extraEnv: NodeJS.ProcessEnv = {}): Promise<RawRun> {
   return new Promise((res) => {
     const t0 = Date.now();
     const cwd = mkdtempSync(join(tmpdir(), 'gw-py-'));
-    const child = spawn(argv[0], argv.slice(1), { cwd, env: childEnv(cwd), stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(argv[0], argv.slice(1), { cwd, env: { ...childEnv(cwd), ...extraEnv }, stdio: ['pipe', 'pipe', 'pipe'] });
     const out: Buffer[] = [];
     const err: Buffer[] = [];
     let outBytes = 0;
@@ -267,6 +269,83 @@ export function probePython(force = false): Promise<PythonStatus> {
     return status;
   })();
   return probing;
+}
+
+export interface AgentRunOptions {
+  /** the interpreter with the investigation stack (an absolute path) */
+  python: string;
+  /** the agent channel's Unix socket on the host, bound into the sandbox */
+  socket: string;
+  /** the document's own working directory (its cell threads), bound read-write */
+  workDir: string;
+  /** directories to re-expose read-only (the companion integration, the stack's site-packages) */
+  expose: string[];
+  /** site-packages that sit under a hidden directory (a user site, a venv in the data directory): on PYTHONPATH */
+  pythonPath: string[];
+  /** what the cell is given: the document, its agent token, the model name — never a key */
+  env: Record<string, string>;
+}
+
+const AGENT_IN = { socket: '/tmp/gridwright.sock', work: '/tmp/work' };
+/**
+ * argv and environment of an agent cell: the cell sandbox exactly (read-only root, data directory
+ * and homes hidden, every namespace unshared — no network), plus the agent channel's socket and
+ * the document's work directory bound under /tmp. Gridwright is the only thing the code can reach.
+ */
+export function wrapAgent(sandbox: Sandbox, opts: AgentRunOptions): { argv: string[]; env: NodeJS.ProcessEnv } {
+  const tail = [opts.python, RUNNER];
+  const pyPath: Record<string, string> = opts.pythonPath.length ? { PYTHONPATH: opts.pythonPath.join(':') } : {};
+  if (sandbox === 'bwrap') {
+    const args = ['--ro-bind', '/', '/', '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--unshare-all', '--die-with-parent', '--new-session', '--clearenv'];
+    for (const dir of hiddenDirs()) args.push('--tmpfs', dir);
+    const expose = new Set<string>([dirname(RUNNER), resolve(dirname(dirname(opts.python))), ...opts.expose]);
+    for (const dir of expose) if (existsSync(dir)) args.push('--ro-bind', dir, dir);
+    if (existsSync(CACHE_DIR)) args.push('--bind', CACHE_DIR, CACHE_IN_SANDBOX);
+    args.push('--bind', opts.workDir, AGENT_IN.work, '--bind', opts.socket, AGENT_IN.socket);
+    const env: Record<string, string> = { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: '/tmp', ...runtimeEnv(), ...cacheEnv(CACHE_IN_SANDBOX), ...opts.env, ...pyPath, GRIDWRIGHT_SOCKET: AGENT_IN.socket, GRIDWRIGHT_WORK: AGENT_IN.work, GRIDWRIGHT_THREADS_DB: `${AGENT_IN.work}/threads.sqlite` };
+    for (const [k, v] of Object.entries(env)) args.push('--setenv', k, v);
+    for (const k of ['LD_LIBRARY_PATH', 'VIRTUAL_ENV']) if (process.env[k]) args.push('--setenv', k, process.env[k] as string);
+    args.push('--chdir', '/tmp');
+    return { argv: ['bwrap', ...args, ...tail], env: {} };
+  }
+  // weaker levels are the administrator's explicit choice for every cell; the socket is still the only channel offered
+  const env = { ...opts.env, ...pyPath, GRIDWRIGHT_SOCKET: opts.socket, GRIDWRIGHT_WORK: opts.workDir, GRIDWRIGHT_THREADS_DB: join(opts.workDir, 'threads.sqlite') };
+  if (sandbox === 'unshare') return { argv: ['unshare', '-rn', '--kill-child', '--', ...tail], env };
+  return { argv: tail, env };
+}
+
+// agent cells mostly wait on the model: their own small budget, so they never hold the cells' CPU slots
+const AGENT_CONCURRENCY = num(process.env.GRIDWRIGHT_AGENT_CELL_CONCURRENCY, 2, 16);
+let agentActive = 0;
+
+/**
+ * One agent cell: the person's code with the companion in its namespace, in the cell sandbox with
+ * no network, Gridwright reachable only through the agent channel. Same `q`, limits and output as
+ * any cell; the run says which sandbox held it.
+ */
+export async function runAsAgentCell(code: string, snapshot: Snapshot, opts: AgentRunOptions, timeoutMs: number): Promise<RunResult> {
+  const st = status.available ? status : await probePython();
+  const base = { std_out: '', deps: [] as RunResult['deps'], runtime: { name: 'python-agent', version: '', packages: { sandbox: st.sandbox ?? 'none', network: 'none — Gridwright socket only' } }, ms: 0 };
+  if (!st.available || !st.sandbox) return { ...base, ok: false, error: `server-side Python is not available, so agent cells are not either: ${st.reason ?? 'unknown'}` };
+  if (agentActive >= AGENT_CONCURRENCY) return { ...base, ok: false, busy: true, error: `${agentActive} agent cell${agentActive === 1 ? ' is' : 's are'} running; try again when ${agentActive === 1 ? 'it finishes' : 'one finishes'} (GRIDWRIGHT_AGENT_CELL_CONCURRENCY)` };
+  agentActive++;
+  // the document's thread store grows with every checkpoint: a larger per-file cap than a cell's 64 MB
+  const limits = { cpuSeconds: Math.ceil(timeoutMs / 1000), memoryMb: Math.max(LIMITS.memoryMb, 4096), maxCells: LIMITS.maxCells, fileMb: 1024 };
+  try {
+    const { argv, env } = wrapAgent(st.sandbox, opts);
+    const r = await execute(argv, { code, snapshot, gpu: false, limits, agent: true }, timeoutMs + 2000, env);
+    if (r.result) {
+      const runtime = (r.result.runtime as RunResult['runtime']) ?? base.runtime;
+      runtime.name = 'python-agent';
+      runtime.packages = { ...(runtime.packages ?? {}), sandbox: st.sandbox, network: 'none — Gridwright socket only' };
+      return { ok: !!r.result.ok, output: r.result.output ?? null, error: r.result.error as string | undefined, std_out: String(r.result.std_out ?? ''), deps: (r.result.deps as RunResult['deps']) ?? [], runtime, ms: r.ms, agent: r.result.agent as RunResult['agent'] };
+    }
+    const tail = r.stderr.trim().split('\n').slice(-3).join('\n');
+    const error = r.timedOut ? `time limit of ${Math.round(timeoutMs / 1000)} s exceeded` : `python exited with ${r.code ?? r.signal}${tail ? `: ${tail}` : ''}`;
+    return { ...base, ok: false, error, ms: r.ms };
+  } finally {
+    agentActive--;
+  }
 }
 
 /** Does a GPU-requested run find RAPIDS cuDF? Slow (imports cudf), so it runs in the background. */

@@ -1,6 +1,6 @@
 # The companion — operator runbook
 
-Gridwright 0.11.0. This is the operational side of the companion (intake, the situation, monitoring, investigations). The user-facing description is in the [README](../../README.md); this page is for whoever runs the server.
+Gridwright 0.12.0. This is the operational side of the companion (intake, the situation, monitoring, investigations). The user-facing description is in the [README](../../README.md); this page is for whoever runs the server.
 
 ## 1. What runs where
 
@@ -10,6 +10,7 @@ Gridwright 0.11.0. This is the operational side of the companion (intake, the si
 | Server | `server/src/index.ts` (Node ≥ 22.13, Express + ws) — the bootstrap; `routes/` thin handlers; `contracts.ts` the input schemas REST and MCP share | **the operation log** (the authority on every document), documents, access, proposals, history, MCP | one process; documents and the log are files under the data directory; the store (below) is SQLite in the same directory |
 | Store and worker | `server/src/store.ts`, `jobs.ts` | jobs (identity, input versions, status, attempts, cancellation, limits, result reference), sources, recipe versions, dataset versions | `companion/store.sqlite` (node:sqlite, WAL); the worker is a loop in the server process, two jobs at once (`GRIDWRIGHT_WORKER_CONCURRENCY`); a restart marks what was running interrupted |
 | Sources | `server/src/sources.ts` | source definitions made by placed SQL snapshots, their recipes, refresh as a job: query → recipe applied → reconciled → placed or held | on request only; the requester's own permissions; no model |
+| Agent cells | `integrations/companion/cell.py` (the `companion` object), `server/src/investigate.ts` (`runAgentCell`), `server/src/pyrun.ts` (`wrapAgent`) | a person's own Python with the companion, the stack and the model in its namespace | the cell sandbox with **no network**; Gridwright reachable only over the **agent channel** (`data/agent.sock`, 0600, bound into the sandbox) where identity is a live agent token and nothing else; the model through the server's OpenAI-compatible proxy (`/api/ai/v1`), so the key stays on the server; two at a time |
 | Conversations | `server/src/conversations.ts` | the transcript per document and person | `conversations/<doc>/<login>.json`, replaced whole after each exchange, deleted with the document |
 | Companion | `server/src/companion/` (state · context · monitoring · relations · investigations; `companion.ts` is the barrel) | records (facts, objectives, constraints, exclusions, decisions, scenarios…), watches and their observations, issues, events, applied scope, investigations' records | state per document in `companion/<doc>.json`; deterministic — no model involved |
 | Intake | `server/src/intake.ts` | parse → profile → sanitise → relate → retain → place through the log → source record → checks → first reading | originals and profiles in `intake/<doc>/`; the inbox adapter reads one configured directory on request |
@@ -29,6 +30,8 @@ $GRIDWRIGHT_DATA/
   companion/threads.sqlite             LangGraph threads (one per document) of investigations
   companion/store.sqlite               the store: jobs, sources, recipe versions, dataset versions (WAL; -wal/-shm beside it)
   conversations/<doc>/<login>.json     the transcript of each person on each document
+  companion/cells/<doc>/threads.sqlite the durable LangGraph thread of a document's agent cells (bound read-write into them)
+  agent.sock                           the agent channel (a socket; recreated at every start)
   intake/<doc>/<hash>.<ext>, <hash>.json originals as they arrived, under their content hash, with the profile
   proposals/                           proposals and their decisions
   connections.json, ai.json, secret.key SQL connections and the model endpoint (passwords and keys encrypted with the secret)
@@ -39,6 +42,8 @@ $GRIDWRIGHT_DATA/
 Back up the whole directory: `~/gridwright-data/backup.sh` (the installer's nightly timer runs it, 14 kept, optional rsync target) or *Settings → Backup* / `GET /api/backup` (administrators). The store is in WAL mode: a backup taken while the server runs carries the main file and its `-wal`, which SQLite replays on open; restoring such a backup and starting a server on it was exercised (with an empty job table — a restore mid-job is not separately verified). Deleting a document deletes its companion state, intake store, conversations, sources, versions and jobs with it; nothing else removes evidence. `threads.sqlite` can be deleted — investigations then start new threads; their results stay on the companion state.
 
 ## 3. Behaviour policies
+
+**Agent cells.** An editor who may run server-side code may run an agent cell. It is that person's code with the companion — the same authority as an investigation they start: it reads what they may read and proposes, never ratifies. It runs in the cell sandbox with no network; its only way out is the agent channel, a Unix socket on which the server identifies a request by a live agent token and by nothing else (no Tailscale headers, so a cell cannot forge an identity; no token → 401; no backups, no static client, no WebSocket). The model is reached through the server's proxy, which adds the key itself. The token is issued for the run and revoked when it ends.
 
 **Who may do what.** Viewers read. Sign-off shares sign off and checkpoint, nothing else. Editors change documents, place intake, state records, approve watches, apply exclusions, start and stop investigations, decide proposals. Administrators also manage connections, the model endpoint and backups. Agents (investigations, agent MCP clients): read, run sandboxed code, propose records, propose watches, propose edits — never ratify, approve, decide, place or apply (`403` on those routes). The agent token an investigation carries is valid from the loopback interface only, for the requesting person's permissions, for the investigation's lifetime; it is revoked when the process ends and does not survive a restart.
 
@@ -68,6 +73,8 @@ GRIDWRIGHT_INBOX=$HOME/gridwright-inbox    # the one directory intake may list, 
 GRIDWRIGHT_INTAKE_MAX_MB=25
 GRIDWRIGHT_AGENT_PYTHON=                   # unset: the data-directory venv when it has the stack, else python3
 GRIDWRIGHT_WORKER_CONCURRENCY=2            # jobs at once (investigations, refreshes)
+GRIDWRIGHT_AGENT_CELL_TIMEOUT_MS=300000     # an agent cell's wall clock
+GRIDWRIGHT_AGENT_CELL_CONCURRENCY=2        # agent cells at once (their own budget)
 GRIDWRIGHT_STORE=                          # unset: data/companion/store.sqlite
 GRIDWRIGHT_INVESTIGATION_TIMEOUT_MS=600000
 AI_BASE_URL=http://127.0.0.1:8888/v1       # an OpenAI-compatible endpoint; the key, if any, is set in Settings and stored encrypted
@@ -115,6 +122,7 @@ Fixtures: `e2e/fixtures/vehicles/` (synthetic; expected figures in `expected.jso
 6. `invoices-2026-10-15.xml` → a table; the cross-check finds the freight desk's Creta cost disagreeing with the inventory: a conflict with both figures, in the situation's lead.
 7. `inventory-2026-10-20-partial.csv` → the next snapshot, 4 vehicles gone; the trend comparison is suspended (*coverage changed (6 → 2 rows)*).
 8. With the stack installed and a model configured: *Investigate* on the next move; *Stop* it; or type *Before discounts, see whether another branch could use them* while one runs and watch it being superseded.
+8c. Select an empty cell → *Python ▾ → Agent cell* (phone: *More → Agent cell*) → ▶: the starter asks the companion what stands out and spills the answer; change it to `companion.table("inventory").describe()` or build an agent with `companion.agent(system_prompt=…)`. Anything it records appears as *proposed* in *Ask*.
 8b. With a SQL connection: *Files → SQL*, `SELECT * FROM <your stock table>` → the card → place it; *Context → Connected sources* shows the source with recipe v1; change a row in the database and *Refresh* — version 2 is placed and the activity says what moved; drop a column and *Refresh* — the version is held, the card says which check failed, the table is untouched.
 9. `notes-hostile.csv` and `ragged.csv`: instruction-like cells counted and inert; the row wider than the header quarantined and listed.
 10. With `GRIDWRIGHT_INBOX` set: copy `inventory-2026-10-27.csv` (make one from the 20 Oct file) into it; *Files → inbox* lists it; take it; it moves to `taken/`.

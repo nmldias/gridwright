@@ -526,6 +526,8 @@ export interface ServerPython {
   memoryMb: number;
   /** what the signed-in person may do: run on the server, ask for the GPU */
   can?: { run: boolean; gpu: boolean };
+  /** the investigation stack is installed: agent cells (the companion's context, tools and model in a cell) are available */
+  agent?: boolean;
 }
 export interface ServerPythonResult {
   ok: boolean;
@@ -555,6 +557,10 @@ export const api = {
   python: {
     async run(code: string, snapshot: unknown, gpu: boolean, cell?: { file: string; table: number; row: number; col: number; kind: string; startedAt: string; client: string }): Promise<ServerPythonResult> {
       return j(await fetch('/api/python/run', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code, snapshot, gpu, cell }) }));
+    },
+    /** an agent cell: the person's code with the companion's context, tools and model, acting for them through an agent token */
+    async runAgent(file: string, code: string, snapshot: unknown, cell?: { table: number; row: number; col: number; startedAt: string; client: string }): Promise<ServerPythonResult & { agent?: { records: string[]; proposals: string[]; runs: string[] } }> {
+      return j(await fetch(`/api/files/${encodeURIComponent(file)}/agent-cell`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code, snapshot, cell }) }));
     },
     async status(): Promise<ServerPython & { available: boolean; reason?: string }> {
       return j(await fetch('/api/python'));

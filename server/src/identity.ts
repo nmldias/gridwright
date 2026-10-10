@@ -25,6 +25,25 @@ const READONLY = (process.env.GRIDWRIGHT_READONLY ?? '').split(',').map((s) => s
 const agentTokens = new Map<string, { identity: Identity; expires: number }>();
 const isLoopback = (addr?: string) => !!addr && (addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1');
 
+/**
+ * The agent channel: a Unix socket the server listens on and binds into a sandbox (an agent cell).
+ * A request on it is identified by an agent token and nothing else — never by Tailscale headers,
+ * which any client of a socket could write — and without a valid token it is refused outright.
+ */
+const AGENT_CHANNEL = Symbol.for('gridwright.agentChannel');
+export function markAgentChannel(socket: object) {
+  (socket as Record<symbol, boolean>)[AGENT_CHANNEL] = true;
+}
+export function onAgentChannel(req: IncomingMessage): boolean {
+  return !!(req.socket as unknown as Record<symbol, boolean> | undefined)?.[AGENT_CHANNEL];
+}
+/** A token that would identify a request (live, not expired). */
+export function agentTokenValid(token: unknown): boolean {
+  if (typeof token !== 'string' || !token) return false;
+  const t = agentTokens.get(token);
+  return !!t && t.expires > Date.now();
+}
+
 /** A token an agent process presents in `x-gridwright-agent`; valid from the loopback interface only, for `ttlMs`. */
 export function issueAgentToken(identity: Identity, label: string, ttlMs = 20 * 60_000): string {
   const token = randomBytes(24).toString('hex');
@@ -37,10 +56,13 @@ export function revokeAgentToken(token: string) {
 
 export function identityOf(req: IncomingMessage): Identity {
   const agent = req.headers['x-gridwright-agent'];
-  if (typeof agent === 'string' && agent && isLoopback(req.socket?.remoteAddress)) {
+  const channel = onAgentChannel(req);
+  if (typeof agent === 'string' && agent && (channel || isLoopback(req.socket?.remoteAddress))) {
     const t = agentTokens.get(agent);
     if (t && t.expires > Date.now()) return { ...t.identity };
   }
+  // on the agent channel nothing but a token identifies a request: no headers are trusted there
+  if (channel) return { login: '', name: '', role: 'viewer', agent: 'unauthenticated' };
   let login = '';
   let name = '';
   if (TRUST) {

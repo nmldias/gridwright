@@ -182,6 +182,69 @@ def main():
         rec = runs[0] if runs else {}
         check("the run record names the server runtime, the sandbox and the packages used", rec.get("runtime", {}).get("name") == "python-server" and rec["runtime"]["packages"].get("sandbox") == sandbox and "pandas" in rec["runtime"]["packages"], json.dumps(rec.get("runtime"))[:160])
         check("the server wrote that record itself (attested: server) with the hashes it computed", rec.get("attested") == "server" and len(rec.get("codeHash", "")) == 16 and len(rec.get("outputHash", "")) == 16, f"attested={rec.get('attested')} code={rec.get('codeHash')}")
+        # an agent cell: the companion's context, tools and model in the cell — sandboxed, no network, the agent channel only; proposes, never ratifies
+        stack = rest("GET", "/api/investigation")
+        if stack.get("available"):
+            rest("PUT", "/api/ai/settings", {"baseUrl": "http://127.0.0.1:8899/v1", "model": "mock"})
+            page.evaluate("([t,r,c]) => window.__gw.getState().set({ selection: { table: t, r0: r, c0: c, r1: r, c1: c, ar: r, ac: c }, selectedTable: null })", [T, 12, 6])
+            page.click(".topbar .menu-trigger[data-menu='code']")
+            page.wait_for_selector(".menu .menu-item:has-text('Agent cell')", timeout=5000)
+            page.locator(".menu .menu-item:has-text('Agent cell')").first.click()
+            page.wait_for_selector(".code-panel .runtime-select", timeout=5000)
+            made = cell(T, 12, 6)
+            pill = page.text_content(".code-panel .panel-title .pill") or ""
+            help_text = page.text_content(".code-panel .agent-help") or ""
+            check("Python → Agent cell makes a Python cell whose runtime is the agent, with a starter that uses companion.ask; the panel says what it is and lists the companion's API", made is not None and made.get("runtime") == "agent" and "companion.ask" in (made.get("i") or "") and page.input_value(".code-panel .runtime-select") == "agent" and pill.startswith("agent") and "proposes" in pill and "companion.table" in help_text, f"{made and made.get('runtime')} | {pill}")
+            code = "\n".join([
+                "import os, socket",
+                "df = companion.table('Table 1')",
+                "r = companion.remember('hypothesis', 'From an agent cell: the amounts are small')",
+                "answer = companion.ask('What stands out?')",
+                "try:",
+                f"    open('{DATA}/secret.key').read(); secret = 'READ'" if DATA else "    secret = 'n/a'",
+                "except Exception as e:",
+                "    secret = 'hidden'",
+                "try:",
+                "    socket.create_connection(('127.0.0.1', 8787), timeout=2); net = 'open'",
+                "except Exception:",
+                "    net = 'none'",
+                "[['rows', len(df)], ['proposed', r.get('status')], ['answer', answer[:40]], ['tools', len(companion.tools)], ['data dir', secret], ['network', net], ['key', 'OPENAI_API_KEY' in os.environ]]",
+            ])
+            ch = apply({"type": "set_cell", "table": T, "row": 12, "col": 6, "input": code, "kind": "python", "runtime": "agent"})
+            v = wait_result(T, 12, 6, timeout=120)
+            out = {cell(T, 12 + i, 6)["v"].get("s"): cell(T, 12 + i, 7)["v"] for i in range(7)} if v and v.get("ss") else {}
+            check("an agent cell runs with the companion in its namespace: a table as a DataFrame, a record proposed as the agent, DeepAgents answering on the document's thread through the model proxy, the LangChain tools listed — and the result spills like any cell", v is not None and v.get("ss") == [7, 2] and (out.get("rows") or {}).get("n", 0) >= 4 and out.get("proposed") == {"s": "proposed"} and out.get("answer") == {"s": "Mock answer."} and out.get("tools") == {"n": 10}, f"{ch.get('error')} {v and v.get('err')} {out}")
+            check("…inside the cell sandbox: the data directory is hidden, there is no network (not even to the server's port), and no model key is in its environment", out.get("data dir") == {"s": "hidden"} and out.get("network") == {"s": "none"} and out.get("key") == {"b": False}, str({k: out.get(k) for k in ("data dir", "network", "key")}))
+            comp = rest("GET", f"/api/files/{fid}/companion")
+            prop = [r for r in comp["records"] if r["status"] == "proposed" and "agent cell" in r["text"]]
+            runs2 = [r for r in comp.get("runs", []) if r.get("purpose") == "agent cell"]
+            check("what the cell recorded is proposed (its agent token), and the run is kept as evidence with the sandbox that held it", len(prop) == 1 and runs2 and runs2[-1]["sandbox"] == sandbox and runs2[-1]["ok"], f"{len(prop)} proposed, runs={[(r['sandbox'], r['ok']) for r in runs2]}")
+            h = rest("GET", f"/api/files/{fid}/history?limit=50")
+            arec = [e["run"] for e in h["entries"] if e.get("run") and e["run"].get("row") == 12]
+            check("the audit log carries the run as python-agent, its sandbox and 'no network — Gridwright socket only', attested by the server", arec and arec[0]["runtime"]["name"] == "python-agent" and arec[0]["runtime"]["packages"].get("sandbox") == sandbox and arec[0]["runtime"]["packages"].get("network", "").startswith("none") and arec[0].get("attested") == "server", str(arec and arec[0].get("runtime"))[:200])
+            if DATA and os.path.exists(os.path.join(DATA, "agent.sock")):
+                import http.client
+                import socket as _s
+
+                class _U(http.client.HTTPConnection):
+                    def __init__(self, path):
+                        super().__init__("gridwright")
+                        self._p = path
+
+                    def connect(self):
+                        self.sock = _s.socket(_s.AF_UNIX)
+                        self.sock.connect(self._p)
+
+                c = _U(os.path.join(DATA, "agent.sock"))
+                c.request("GET", "/api/files", headers={"tailscale-user-login": "boss@example.com"})
+                code_no_token = c.getresponse().status
+                c = _U(os.path.join(DATA, "agent.sock"))
+                c.request("GET", "/api/backup", headers={"x-gridwright-agent": "forged"})
+                code_backup = c.getresponse().status
+                check("the agent channel answers nobody without a live agent token, ignores identity headers, and offers no backup", code_no_token == 401 and code_backup == 404, f"{code_no_token} {code_backup}")
+            page.screenshot(path=f"{OUT}/f4-02-agent-cell.png")
+        else:
+            print("SKIP agent cell (stack not installed)")
         status = page.evaluate("([t,r,c]) => window.__gw.runStatus({ table: t, row: r, col: c })", [T, 6, 6])
         check("execution integrity: the displayed output matches the recorded run", status == "matches", str(status))
         # a forged result (an op that only a client could send) no longer counts as the recorded run

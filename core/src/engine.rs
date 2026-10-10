@@ -841,7 +841,7 @@ impl Engine {
                             entry.refresh = refresh.filter(|s| *s > 0);
                         }
                         if kind == CellKind::Python {
-                            entry.runtime = runtime.filter(|r| r == "server");
+                            entry.runtime = runtime.filter(|r| r == "server" || r == "agent");
                             entry.gpu = gpu.filter(|g| *g);
                         }
                     }
@@ -2473,6 +2473,11 @@ mod tests {
         e.apply(Op::SetCell { table: 1, row: 0, col: 0, input: "=1".into(), kind: None, conn: None, refresh: None, runtime: Some("server".into()), gpu: Some(true) });
         let c = e.wb.cell(CellRef::new(1, 0, 0)).unwrap();
         assert_eq!((c.runtime.clone(), c.gpu), (None, None));
+        // the agent runtime is kept too; anything else is dropped (the browser runs the cell)
+        e.apply(Op::SetCell { table: 1, row: 0, col: 0, input: "1".into(), kind: Some(CellKind::Python), conn: None, refresh: None, runtime: Some("agent".into()), gpu: None });
+        assert_eq!(e.wb.cell(CellRef::new(1, 0, 0)).unwrap().runtime.as_deref(), Some("agent"));
+        e.apply(Op::SetCell { table: 1, row: 0, col: 0, input: "1".into(), kind: Some(CellKind::Python), conn: None, refresh: None, runtime: Some("cloud".into()), gpu: None });
+        assert_eq!(e.wb.cell(CellRef::new(1, 0, 0)).unwrap().runtime, None);
     }
 
     #[test]

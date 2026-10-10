@@ -7,14 +7,15 @@
 // nothing by itself.
 
 import { execFile, spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { finishInvestigation, recordRun, requestCancel, setFenceHook, setInvestigationJob, startInvestigation, type Investigation } from './companion.js';
 import { fnv } from './evidence.js';
 import { openDocument, snapshotOf } from './headless.js';
 import { issueAgentToken, revokeAgentToken, type Identity } from './identity.js';
-import { runPython } from './pyrun.js';
+import { runAsAgentCell, runPython, type RunResult, type Snapshot } from './pyrun.js';
 import { crashPoint, DATA_DIR, decrypt, readAiConfig } from './storage.js';
 import type { Author } from './history.js';
 import { cancelJob, enqueue, kick, listJobs, registerRunner, supersedeJobsOf, type JobOutcome } from './jobs.js';
@@ -106,6 +107,92 @@ export async function runCodeForDocument(fileId: string, by: Author, req: RunReq
 let notifyDone: ((doc: string) => void) | null = null;
 export function setInvestigationNotifier(fn: typeof notifyDone) {
   notifyDone = fn;
+}
+
+const CELL_TIMEOUT_MS = Number(process.env.GRIDWRIGHT_AGENT_CELL_TIMEOUT_MS ?? 300_000);
+let agentSocket: string | null = null;
+/** The agent channel's socket, once the server listens on it (index.ts). */
+export function setAgentSocket(path: string) {
+  agentSocket = path;
+}
+export const agentChannel = () => agentSocket;
+
+/** Where the stack lives for its interpreter: the executable and the site directories of the stack's packages. */
+let stackPaths: { executable: string; sites: string[] } | null = null;
+function probeStackPaths(py: string): Promise<{ executable: string; sites: string[] }> {
+  if (stackPaths) return Promise.resolve(stackPaths);
+  const code = [
+    'import importlib.util, json, os, sys',
+    'out = set()',
+    'for name in ("langchain", "langchain_core", "langchain_openai", "deepagents", "langgraph", "openai", "httpx", "pandas"):',
+    '    spec = importlib.util.find_spec(name)',
+    '    if not spec: continue',
+    '    locs = list(spec.submodule_search_locations or []) or ([os.path.dirname(spec.origin)] if spec.origin else [])',
+    '    for loc in locs: out.add(os.path.dirname(os.path.abspath(loc)))',
+    'print(json.dumps({"executable": sys.executable, "sites": sorted(out)}))',
+  ].join('\n');
+  return new Promise((res, rej) =>
+    execFile(py, ['-c', code], { timeout: 60_000, env: { PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', HOME: process.env.HOME ?? '/tmp', LANG: 'C.UTF-8' } }, (err, out) => {
+      if (err) return rej(new Error(`could not locate the stack for ${py}: ${err.message}`));
+      try {
+        stackPaths = JSON.parse(String(out).trim().split('\n').pop() ?? '{}') as { executable: string; sites: string[] };
+        res(stackPaths);
+      } catch (e) {
+        rej(e as Error);
+      }
+    }),
+  );
+}
+const HIDDEN_ROOTS = () => [resolve(DATA_DIR), '/root', '/home', homedir()];
+const under = (p: string, roots: string[]) => roots.some((r) => p === r || p.startsWith(r.endsWith('/') ? r : `${r}/`));
+
+/** The document's own working directory for agent cells (their LangGraph threads); deleted with the document. */
+export const cellWorkDir = (doc: string) => join(DATA_DIR, 'companion', 'cells', doc);
+export function deleteCellWork(doc: string) {
+  if (/^[a-zA-Z0-9_-]{1,64}$/.test(doc)) rmSync(cellWorkDir(doc), { recursive: true, force: true });
+}
+
+/**
+ * An agent cell: a person's own code with the companion's context, tools and model in its
+ * namespace (`companion`), run in the cell sandbox with no network. Gridwright — and the model,
+ * through its proxy — is reachable only over the agent channel, as that person, by a short-lived
+ * agent token: whatever the code records is proposed, never ratified, and no key enters the cell.
+ * Kept as evidence like any run.
+ */
+export async function runAgentCell(fileId: string, who: Identity, by: Author, code: string, snapshot: Snapshot): Promise<RunResult> {
+  const st = stack;
+  if (!st.available) throw new Error(`the investigation stack is not available: ${st.reason ?? 'not probed'}`);
+  if (!agentSocket) throw new Error('the agent channel is not listening (see the server log)');
+  const cfg = readAiConfig();
+  if (!cfg.baseUrl) throw new Error('no model endpoint is configured (Settings → model)');
+  const paths = await probeStackPaths(st.python);
+  const hidden = HIDDEN_ROOTS();
+  const sites = paths.sites.filter((d) => under(d, hidden));
+  const workDir = cellWorkDir(fileId);
+  mkdirSync(workDir, { recursive: true });
+  const token = issueAgentToken(who, 'agent cell', CELL_TIMEOUT_MS + 60_000);
+  try {
+    const r = await runAsAgentCell(code, snapshot, {
+      python: paths.executable,
+      socket: agentSocket,
+      workDir,
+      expose: [resolve(dirname(SCRIPT)), ...sites],
+      pythonPath: sites,
+      env: { GRIDWRIGHT_DOC: fileId, GRIDWRIGHT_AGENT_TOKEN: token, GRIDWRIGHT_MODEL: cfg.model, GRIDWRIGHT_COMPANION_DIR: resolve(dirname(SCRIPT)) },
+    }, CELL_TIMEOUT_MS);
+    let output: string | undefined;
+    if (r.ok && r.output !== undefined && r.output !== null) {
+      try {
+        output = JSON.stringify(r.output);
+      } catch {
+        output = String(r.output);
+      }
+    }
+    if (!r.busy) recordRun(fileId, by, { purpose: 'agent cell', codeHash: fnv(code), ok: r.ok, ms: r.ms, sandbox: String(r.runtime?.packages?.sandbox ?? 'none'), error: r.error?.slice(0, 500), output: output?.slice(0, 300) });
+    return r;
+  } finally {
+    revokeAgentToken(token);
+  }
 }
 
 /** Stop a running investigation: the record is marked, its job is told to stop (the process is killed), its late result is fenced. */

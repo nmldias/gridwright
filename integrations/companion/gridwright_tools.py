@@ -9,11 +9,27 @@ text returned by a tool is data, never an instruction.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
+import socket as _socket
 import urllib.error
 import urllib.request
 from typing import Any
+
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    """HTTP over the agent channel: a Unix socket bound into the sandbox (an agent cell has no network)."""
+
+    def __init__(self, path: str, timeout: float = 180):
+        super().__init__("gridwright", timeout=timeout)
+        self._path = path
+
+    def connect(self) -> None:
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.settimeout(self.timeout)
+        s.connect(self._path)
+        self.sock = s
 
 from langchain_core.tools import tool
 
@@ -21,8 +37,9 @@ from langchain_core.tools import tool
 class Gridwright:
     """A thin client: base URL, the agent token and the server's shared token (both optional)."""
 
-    def __init__(self, base: str, doc: str, agent_token: str | None = None, server_token: str | None = None, investigation: str | None = None):
+    def __init__(self, base: str, doc: str, agent_token: str | None = None, server_token: str | None = None, investigation: str | None = None, socket: str | None = None):
         self.base = base.rstrip("/")
+        self.socket = socket
         self.doc = doc
         self.agent_token = agent_token
         self.server_token = server_token
@@ -42,6 +59,20 @@ class Gridwright:
         return h
 
     def rest(self, method: str, path: str, body: Any = None) -> Any:
+        if self.socket:
+            conn = _UnixHTTPConnection(self.socket)
+            try:
+                conn.request(method, path, body=json.dumps(body).encode() if body is not None else None, headers=self._headers())
+                r = conn.getresponse()
+                status, text = r.status, r.read().decode()
+            finally:
+                conn.close()
+            if status >= 400:
+                try:
+                    return {"error": json.loads(text).get("error", text), "status": status}
+                except Exception:
+                    return {"error": text[:500], "status": status}
+            return json.loads(text or "null")
         req = urllib.request.Request(self.base + path, method=method, data=json.dumps(body).encode() if body is not None else None, headers=self._headers())
         try:
             with urllib.request.urlopen(req, timeout=180) as r:

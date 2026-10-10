@@ -279,6 +279,41 @@ export function toggleBold() {
   applyFormat({ bold: !cell?.f?.bold });
 }
 
+const AGENT_TEMPLATE = `# Agent cell — your code, with the companion's context, tools and model in \`companion\`
+# (LangChain · DeepAgents · LangGraph). It runs in the cell sandbox with no network: Gridwright and the
+# model are reached as you, through an agent token; whatever it records is proposed, never ratified.
+#
+#   companion.table("inventory")      a table as a pandas DataFrame
+#   companion.evaluate("=SUM(...)")   a formula against the live document
+#   companion.context()               what the companion knows (objective, sources, decisions…)
+#   companion.ask("…")                a DeepAgents agent on this document's durable LangGraph thread
+#   companion.agent(system_prompt=…)  build your own agent over companion.tools and companion.model()
+#   companion.remember("hypothesis", "…")   a proposed record — confirm it in Ask
+#
+# The last expression is written to the sheet.
+answer = companion.ask("What stands out in this document, and what would you check first?")
+[["answer"], [answer]]
+`;
+
+/** Turn the active cell into an agent cell (a Python cell whose runtime is "agent") with a starter, and open the editor. */
+export function makeAgentCell() {
+  const sel = getState().selection;
+  if (!sel) return;
+  const sp = getState().serverPython;
+  if (!sp?.agent) {
+    setStatus('Agent cells need the investigation stack on the server (scripts/install.sh --companion) and a model endpoint', 8000);
+    return;
+  }
+  const cell = cellAt(sel.table, sel.ar, sel.ac);
+  if (cell?.s) {
+    setStatus('This cell shows spilled output — pick another cell.');
+    return;
+  }
+  const keep = cell?.k === 'python' && cell.i.trim() && !cell.i.startsWith('# Python cell');
+  book.apply({ type: 'set_cell', table: sel.table, row: sel.ar, col: sel.ac, input: keep ? cell!.i : AGENT_TEMPLATE, kind: 'python', runtime: 'agent' });
+  openCodeCell(sel.table, sel.ar, sel.ac);
+}
+
 /** Turn the active cell into a code cell of the given language and open the editor. */
 export function makeCodeCell(kind: CellKind, conn?: string) {
   const sel = getState().selection;

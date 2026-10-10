@@ -8,7 +8,8 @@ import { errorMessage } from '../headless.js';
 import { identityOf } from '../identity.js';
 import { runQuery, testConnection, type Param } from '../sql.js';
 import { authorizeQuery, canSeeConnection, SqlRefused } from '../sqlpolicy.js';
-import { encrypt, listConnections, newId, readAiConfig, saveConnections, writeAiConfig, type StoredConnection } from '../storage.js';
+import { Readable } from 'node:stream';
+import { decrypt, encrypt, listConnections, newId, readAiConfig, saveConnections, writeAiConfig, type StoredConnection } from '../storage.js';
 import { requireRole } from './common.js';
 
 export function registerConnectionRoutes(app: Express) {
@@ -146,4 +147,43 @@ export function registerConnectionRoutes(app: Express) {
     }
   });
   app.post('/api/ai/chat', chat);
+
+  // An OpenAI-compatible pass-through to the configured model endpoint, for agent cells and agents:
+  // the caller is identified as usual (an agent cell by its token on the agent channel), the key is
+  // added here and never leaves the server, the body and the answer (streamed or not) pass unchanged.
+  const upstreamOf = () => {
+    const cfg = readAiConfig();
+    const key = cfg.apiKeyEnc ? decrypt(cfg.apiKeyEnc) : process.env.AI_API_KEY ?? '';
+    return { base: (cfg.baseUrl || '').replace(/\/+$/, ''), model: cfg.model, headers: { 'content-type': 'application/json', ...(key ? { authorization: `Bearer ${key}` } : {}) } as Record<string, string> };
+  };
+  app.post('/api/ai/v1/chat/completions', requireRole('editor'), async (req, res) => {
+    const up = upstreamOf();
+    if (!up.base) return res.status(503).json({ error: { message: 'no model endpoint is configured (Settings → model)', type: 'gridwright' } });
+    const body = { ...(req.body ?? {}) } as Record<string, unknown>;
+    if (!body.model || body.model === 'default') body.model = up.model;
+    const ac = new AbortController();
+    res.on('close', () => {
+      if (!res.writableFinished) ac.abort();
+    });
+    try {
+      const r = await fetch(`${up.base}/chat/completions`, { method: 'POST', headers: up.headers, body: JSON.stringify(body), signal: AbortSignal.any([ac.signal, AbortSignal.timeout(600_000)]) });
+      res.status(r.status);
+      res.setHeader('content-type', r.headers.get('content-type') ?? 'application/json');
+      if (!r.body) return res.end();
+      Readable.fromWeb(r.body as import('node:stream/web').ReadableStream).pipe(res);
+    } catch (e) {
+      if (!res.headersSent) res.status(502).json({ error: { message: `the model endpoint did not answer: ${errorMessage(e)}`, type: 'gridwright' } });
+      else res.end();
+    }
+  });
+  app.get('/api/ai/v1/models', requireRole('editor'), async (_req, res) => {
+    const up = upstreamOf();
+    if (!up.base) return res.json({ object: 'list', data: [] });
+    try {
+      const r = await fetch(`${up.base}/models`, { headers: up.headers, signal: AbortSignal.timeout(8000) });
+      res.status(r.status).json(await r.json());
+    } catch (e) {
+      res.status(502).json({ error: { message: errorMessage(e), type: 'gridwright' } });
+    }
+  });
 }

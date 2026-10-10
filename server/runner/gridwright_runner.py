@@ -311,10 +311,18 @@ def convert(obj, max_cells):
 
 def runtime_info(gpu_state):
     packages = {}
-    for name in ("pandas", "numpy", "matplotlib", "cudf", "cupy", "polars", "pyarrow"):
+    for name in ("pandas", "numpy", "matplotlib", "cudf", "cupy", "polars", "pyarrow", "langchain", "deepagents", "langgraph"):
         m = sys.modules.get(name)
         if m is not None:
-            packages[name] = str(getattr(m, "__version__", ""))
+            v = getattr(m, "__version__", None)
+            if v is None:
+                try:
+                    from importlib.metadata import version as _v
+
+                    v = _v(name)
+                except Exception:
+                    v = ""
+            packages[name] = str(v)
     packages["gpu"] = gpu_state
     return {"name": "python-server", "version": sys.version.split()[0], "packages": packages}
 
@@ -350,6 +358,19 @@ def run_cell(req):
     set_limits(limits, gpu_state.startswith("cudf"))
 
     q = _Q(snapshot)
+    # an agent cell: the companion's context, tools and model from the environment the server set
+    companion = None
+    agent_error = None
+    if req.get("agent"):
+        try:
+            cdir = os.environ.get("GRIDWRIGHT_COMPANION_DIR") or req.get("companionDir")
+            if cdir and cdir not in sys.path:
+                sys.path.insert(0, cdir)
+            from cell import from_env
+
+            companion = from_env()
+        except Exception as e:  # the cell still runs; `companion` says why it is not there
+            agent_error = "%s: %s" % (type(e).__name__, e)
     real_stdout = sys.stdout
     out = io.StringIO()
     err = io.StringIO()
@@ -361,6 +382,10 @@ def run_cell(req):
         tree = ast.parse(code, mode="exec")
         last = tree.body[-1] if tree.body and isinstance(tree.body[-1], ast.Expr) else None
         g = {"__name__": "__main__", "q": q}
+        if req.get("agent"):
+            if companion is None:
+                raise RuntimeError("the companion is not available to this cell: " + (agent_error or "unknown"))
+            g["companion"] = companion
         if last is not None:
             body = ast.Module(body=tree.body[:-1], type_ignores=[])
             exec(compile(body, "<cell>", "exec"), g)
@@ -373,6 +398,8 @@ def run_cell(req):
         if note:
             std = (std + "\n" if std else "") + note
         result = {"ok": True, "output": output, "std_out": std, "deps": q.deps, "runtime": runtime_info(gpu_state)}
+        if companion is not None:
+            result["agent"] = {"records": companion.gw.records, "proposals": companion.gw.proposals, "runs": companion.gw.runs, "steps": companion.gw.steps}
     except BaseException as e:  # SystemExit, MemoryError and KeyboardInterrupt included
         tb = traceback.format_exc()
         # keep the user's frames only: from the first <cell> frame, minus this runner's own frames

@@ -14,6 +14,7 @@ import { accessChanged, broadcastEntries, notifyCompanion, notifyProposal as not
 import { createProposal, decideProposal, getProposal, listProposals, ProposalConflict, refreshProposal } from '../proposals.js';
 import { deleteFile, listFiles, readFile, writeFile } from '../storage.js';
 import { theStore } from '../store.js';
+import { deleteCellWork } from '../investigate.js';
 import { clearConversation, deleteConversationsOf, readConversation, writeConversation } from '../conversations.js';
 import { ConversationSchema } from '../contracts.js';
 import { body, docPermission, fail, noAgent, requireRole } from './common.js';
@@ -109,6 +110,7 @@ export function registerDocumentRoutes(app: Express, ctx: { defaultSharing: 'edi
     deleteIntake(req.params.id);
     deleteConversationsOf(req.params.id);
     theStore().deleteSourcesOf(req.params.id);
+    deleteCellWork(req.params.id);
     res.json({ ok: true });
   });
   // the conversation with the assistant: the caller's own transcript on this document, owned by the server

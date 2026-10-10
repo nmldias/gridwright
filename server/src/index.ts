@@ -4,12 +4,13 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
-import { existsSync } from 'node:fs';
+import { chmodSync, existsSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { brief as companionBrief, interruptRunningInvestigations, setCompanionNotifier, startCompanion } from './companion.js';
-import { probeStack, setInvestigationNotifier, stackStatus } from './investigate.js';
+import { probeStack, setAgentSocket, setInvestigationNotifier, stackStatus } from './investigate.js';
 import { onJobChange, reconcileAfterRestart, startWorker, workerStatus } from './jobs.js';
 import { openStore } from './store.js';
 import { CONTRACT_VERSION } from './contracts.js';
@@ -21,15 +22,15 @@ import { registerInvestigationRoutes } from './routes/investigation.js';
 import { registerPythonRoutes } from './routes/python.js';
 import { registerSourceRoutes } from './routes/sources.js';
 import { requireRole } from './routes/common.js';
-import { identityEnabled, identityOf } from './identity.js';
+import { agentTokenValid, identityEnabled, identityOf, markAgentChannel, onAgentChannel } from './identity.js';
 import { attachMultiplayer, notifyCompanion, notifyJob, notifyProposal as notifyProposalRoom } from './multiplayer.js';
 import { handleMcp, setProposalNotifier } from './mcp.js';
-import { engineAvailable } from './headless.js';
+import { engineAvailable, errorMessage } from './headless.js';
 import { probePython, pythonStatus } from './pyrun.js';
 import { canRunPython, canUseGpu } from './execpolicy.js';
 import { DATA_DIR, ensureDirs, pyodideDir } from './storage.js';
 
-const VERSION = '0.11.0';
+const VERSION = '0.12.0';
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? '0.0.0.0';
 const TOKEN = process.env.GRIDWRIGHT_TOKEN ?? '';
@@ -51,10 +52,25 @@ const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '64mb' }));
 
+// The agent channel (a Unix socket bound into agent-cell sandboxes): the API and MCP only, and only
+// with a live agent token — which then stands in for the shared token below.
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (!onAgentChannel(req)) return next();
+  if (!(req.path.startsWith('/api/') || req.path === '/mcp') || req.path === '/api/backup') {
+    res.status(404).json({ error: 'not available on the agent channel' });
+    return;
+  }
+  if (!agentTokenValid(req.headers['x-gridwright-agent'])) {
+    res.status(401).json({ error: 'the agent channel needs a live agent token' });
+    return;
+  }
+  next();
+});
+
 // Optional shared-token gate: GRIDWRIGHT_TOKEN=... then open /?token=... once.
 const COOKIE = 'gridwright_token';
 app.use((req: Request, res: Response, next: NextFunction) => {
-  if (!TOKEN) return next();
+  if (!TOKEN || onAgentChannel(req)) return next();
   if (req.path === '/api/health') return next(); // liveness probe stays reachable (it reveals nothing private)
   const q = typeof req.query.token === 'string' ? req.query.token : '';
   if (q === TOKEN) {
@@ -177,6 +193,29 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 void probePython().then((p) => console.log(p.available ? `server-side Python: ${p.interpreter} ${p.version}, sandbox ${p.sandbox}${p.fallbacks ? ` (stronger sandboxes unavailable — ${p.fallbacks})` : ''}` : `server-side Python off: ${p.reason}`));
+// the agent channel: the same app on a Unix socket that agent-cell sandboxes reach through a bind mount
+// (no network inside them); only the service user may connect, and only with a live agent token
+{
+  const wanted = process.env.GRIDWRIGHT_AGENT_SOCKET ?? join(DATA_DIR, 'agent.sock');
+  const sock = wanted.length <= 100 ? wanted : join(tmpdir(), `gridwright-agent-${process.pid}.sock`);
+  try {
+    rmSync(sock, { force: true });
+  } catch {
+    /* not there */
+  }
+  const agentServer = createServer(app);
+  agentServer.on('connection', (s) => markAgentChannel(s));
+  agentServer.on('error', (e) => console.error(`agent channel off (${sock}): ${errorMessage(e)} — agent cells are unavailable`));
+  agentServer.listen(sock, () => {
+    try {
+      chmodSync(sock, 0o600);
+    } catch {
+      /* best effort */
+    }
+    setAgentSocket(sock);
+  });
+}
+
 server.listen(PORT, HOST, () => {
   console.log(
     `gridwright ${VERSION} listening on http://${HOST}:${PORT}  data=${DATA_DIR}  client=${CLIENT_DIR}${TOKEN ? '  (token required)' : ''}${identityEnabled ? '  (trusting Tailscale identity headers)' : ''}${pyDir ? `  pyodide=${pyDir}` : ''}`,

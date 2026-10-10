@@ -72,7 +72,7 @@ export function App() {
         try {
           const h = await api.health();
           setLocalPyodide(!!h.pyodide);
-          useStore.setState({ serverPython: h.python ?? null });
+          useStore.setState({ serverPython: h.python ? { ...h.python, agent: !!h.investigation } : null });
           if (h.identity) {
             const me = await api.me();
             useStore.setState({ me });

@@ -1,8 +1,8 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { type ReactNode, useEffect, useState } from 'react';
 import { api, type FileInfo } from '../api/client';
 import * as book from '../engine/book';
 import { isCodeKind, type CellKind } from '../engine/types';
-import { addTable, applyFormat, autoFitColumns, makeCodeCell, toggleBold } from '../grid/actions';
+import { addTable, applyFormat, autoFitColumns, makeAgentCell, makeCodeCell, toggleBold } from '../grid/actions';
 import { NUMBER_FORMATS } from '../grid/format';
 import { useStore, type Panel } from '../state/store';
 import { downloadJson, newFile, openFile, saveCurrentFile } from './files';
@@ -33,7 +33,18 @@ export function TopBar() {
   const canRedo = useStore((s) => s.canRedo);
   const panel = useStore((s) => s.panel);
   const me = useStore((s) => s.me);
-  const touch = useStore((s) => s.touch);
+  const touchDevice = useStore((s) => s.touch);
+  // the bar hides Add, Python, Share, Undo and Redo under the same query as the stylesheet (phones, narrow windows): More carries them then
+  const compactQuery = '(max-width: 760px), (pointer: coarse)';
+  const [compact, setCompact] = useState(() => typeof window !== 'undefined' && window.matchMedia(compactQuery).matches);
+  useEffect(() => {
+    const mq = window.matchMedia(compactQuery);
+    const on = () => setCompact(mq.matches);
+    mq.addEventListener('change', on);
+    return () => mq.removeEventListener('change', on);
+  }, []);
+  const touch = touchDevice || compact;
+  const serverPython = useStore((s) => s.serverPython);
   const permission = useStore((s) => s.permission);
   const selection = useStore((s) => s.selection);
   const selectedChart = useStore((s) => s.selectedChart);
@@ -102,6 +113,7 @@ export function TopBar() {
   const codeItems: MenuEntry[] = [
     { head: 'Turn the selected cell into' },
     { label: 'Python cell', title: 'Turn the selected cell into a Python cell', hint: 'runs on the server or in the browser', onClick: () => makeCodeCell('python'), disabled: !selection },
+    { label: 'Agent cell', title: 'A Python cell with the companion: LangChain, DeepAgents, LangGraph, the model and the document\'s context — sandboxed, proposes only', hint: serverPython?.agent ? 'LangChain · DeepAgents · LangGraph, sandboxed' : 'needs the stack on the server', onClick: () => makeAgentCell(), disabled: !selection || !serverPython?.agent },
     { label: 'JavaScript cell', title: 'Turn the selected cell into a JavaScript cell', onClick: () => makeCodeCell('javascript'), disabled: !selection },
     { label: 'SQL cell', title: 'Turn the selected cell into a SQL cell (query result spills from it)', hint: 'needs a database connection', onClick: () => makeCodeCell('sql'), disabled: !selection },
     'sep',
@@ -114,6 +126,14 @@ export function TopBar() {
           { label: 'Redo', onClick: () => book.redo(), disabled: !canRedo },
           'sep',
           { label: 'Share', title: 'Who can open this document, and copies to send', onClick: () => toggle('share'), active: panel === 'share' },
+          ...(readOnly
+            ? []
+            : ([
+                'sep',
+                { label: selKind ? `${KIND_LABEL[selKind]} cell` : 'Python cell', title: selKind ? `Open the code of the selected ${KIND_LABEL[selKind]} cell` : 'Turn the selected cell into a Python cell', hint: selection ? undefined : 'select a cell first', onClick: () => makeCodeCell(selKind ?? 'python'), disabled: !selection },
+                { label: 'Agent cell', title: 'A Python cell with the companion: LangChain, DeepAgents, LangGraph, the model and the context — sandboxed, proposes only', hint: !serverPython?.agent ? 'needs the stack on the server' : selection ? 'LangChain · DeepAgents · LangGraph' : 'select a cell first', onClick: () => makeAgentCell(), disabled: !selection || !serverPython?.agent },
+                { label: 'Code panel', title: 'Code editor for Python / JavaScript / SQL cells: edit, run, runtime', onClick: () => toggle('code'), active: panel === 'code' },
+              ] as MenuEntry[])),
         ] as MenuEntry[])
       : []),
     { label: 'Tables and charts', title: 'Jump to a table or chart; fit the view', onClick: () => toggle('navigate'), active: panel === 'navigate' },
