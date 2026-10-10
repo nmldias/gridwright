@@ -5,6 +5,7 @@ import * as book from './engine/book';
 import { GridCanvas } from './grid/GridCanvas';
 import { useStore } from './state/store';
 import { AiPanel } from './ui/AiPanel';
+import { AdminPanel } from './ui/AdminPanel';
 import { ChartPanel } from './ui/ChartPanel';
 import { CodePanel } from './ui/CodePanel';
 import { ReviewPanel } from './ui/ReviewPanel';
@@ -163,7 +164,7 @@ export function App() {
       <FormulaBar />
       <div className="main">
         <GridCanvas />
-        {start && <StartCard />}
+        {start && panel !== 'admin' && <StartCard />}
         {panel !== 'none' && (
           <SidePanel>
             {panel === 'code' && <CodePanel />}
@@ -178,6 +179,7 @@ export function App() {
             {panel === 'chart' && <ChartPanel />}
             {panel === 'review' && <ReviewPanel />}
             {panel === 'settings' && <SettingsPanel />}
+            {panel === 'admin' && <AdminPanel />}
           </SidePanel>
         )}
       </div>

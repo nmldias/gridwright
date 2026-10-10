@@ -10,6 +10,7 @@ import * as book from '../engine/book';
 import { SHIFT_OPS, STRUCTURAL_OPS, type Op } from '../engine/types';
 import { getState, setStatus, useStore, type Presence } from '../state/store';
 import { lastRecord, onRecord } from '../workers/runs';
+import { currentTenant } from './tenant';
 
 let ws: WebSocket | null = null;
 let fileId: string | null = null;
@@ -66,7 +67,8 @@ function send(obj: unknown) {
 function connect() {
   if (!fileId) return;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const url = `${proto}://${location.host}/ws?file=${encodeURIComponent(fileId)}&client=${clientId}`;
+  const tenant = currentTenant();
+  const url = `${proto}://${location.host}/ws?file=${encodeURIComponent(fileId)}&client=${clientId}${tenant ? `&tenant=${encodeURIComponent(tenant)}` : ''}`;
   const sock = new WebSocket(url);
   ws = sock;
   sock.onopen = () => {

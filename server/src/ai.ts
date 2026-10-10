@@ -5,7 +5,8 @@
 
 import type { Request, Response } from 'express';
 import { identityOf } from './identity.js';
-import { decrypt, readAiConfig } from './storage.js';
+import { aiKeyOf, readAiConfig } from './storage.js';
+import { ACCOUNTS } from './tenancy.js';
 import { runTool, TOOL_DEFS } from './tools.js';
 
 const MAX_ROUNDS = 6;
@@ -23,7 +24,8 @@ interface Round {
 }
 
 export async function chat(req: Request, res: Response) {
-  const cfg = readAiConfig();
+  // the settings of the caller's client (accounts mode), else the server's
+  const cfg = readAiConfig(ACCOUNTS ? identityOf(req).tenant : undefined);
   const baseUrl = (cfg.baseUrl || '').replace(/\/+$/, '');
   if (!baseUrl || !cfg.model) {
     res.status(400).json({ error: 'AI endpoint not configured — open the assistant settings (⚙) and set the base URL and model.' });
@@ -38,7 +40,7 @@ export async function chat(req: Request, res: Response) {
   // viewers may chat, but the tools reach databases and the audit log: editors only
   let useTools = !!req.body?.tools && identity.role !== 'viewer';
   const fileId = typeof req.body?.file === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(req.body.file) ? req.body.file : undefined;
-  const apiKey = cfg.apiKeyEnc ? decrypt(cfg.apiKeyEnc) : process.env.AI_API_KEY ?? '';
+  const apiKey = aiKeyOf(cfg);
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   if (apiKey) headers.authorization = `Bearer ${apiKey}`;
   if (/anthropic\.com/.test(baseUrl)) {
@@ -145,11 +147,11 @@ export async function chat(req: Request, res: Response) {
 }
 
 /** One non-interactive completion (the companion's interpretation of an issue): text and model id, or an error. */
-export async function completeOnce(messages: { role: string; content: string }[], maxTokens = 1200): Promise<{ text: string; model: string }> {
-  const cfg = readAiConfig();
+export async function completeOnce(messages: { role: string; content: string }[], maxTokens = 1200, tenant?: string): Promise<{ text: string; model: string }> {
+  const cfg = readAiConfig(ACCOUNTS ? tenant : undefined);
   const baseUrl = (cfg.baseUrl || '').replace(/\/+$/, '');
   if (!baseUrl || !cfg.model) throw new Error('AI endpoint not configured — open the assistant settings (⚙) and set the base URL and model');
-  const apiKey = cfg.apiKeyEnc ? decrypt(cfg.apiKeyEnc) : process.env.AI_API_KEY ?? '';
+  const apiKey = aiKeyOf(cfg);
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   if (apiKey) headers.authorization = `Bearer ${apiKey}`;
   if (/anthropic\.com/.test(baseUrl)) {

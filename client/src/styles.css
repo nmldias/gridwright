@@ -1818,3 +1818,191 @@ details.evidence > div {
 /* ---- agent cells: the companion's API, in the panel ---- */
 .code-panel .agent-help { margin-top: 4px; line-height: 1.5; }
 .code-panel .agent-help code { font-family: var(--mono); font-size: 11px; background: #f3f4f6; padding: 0 3px; border-radius: 3px; }
+/* accounts: sign-in, the client switcher, Clients & people */
+.auth-screen,
+.auth-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 8vh 16px 16px;
+  overflow: auto;
+  background: var(--bg);
+  z-index: 1000;
+}
+.auth-overlay {
+  background: rgba(17, 24, 39, 0.45);
+}
+.auth-card {
+  width: 100%;
+  max-width: 380px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(17, 24, 39, 0.12);
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.auth-card.wide {
+  max-width: 640px;
+}
+.auth-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+.auth-brand .logo.big {
+  font-size: 36px;
+}
+.auth-title {
+  font-size: 20px;
+  font-weight: 600;
+}
+.auth-note {
+  background: var(--amber-soft);
+  color: var(--amber);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: var(--ui-small);
+}
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.auth-clients {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.auth-clients button {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  text-align: left;
+}
+.topbar .client-menu .menu-trigger {
+  max-width: 200px;
+}
+.client-chip {
+  display: inline-block;
+  max-width: 170px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+  font-weight: 600;
+  color: var(--accent);
+}
+.admin-panel .admin-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: auto;
+  min-height: 0;
+  flex: 1;
+}
+.admin-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.admin-form .row > input {
+  min-width: 0;
+}
+.client-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.client-card .client-name {
+  font-size: 15px;
+}
+.member-list,
+.client-list,
+.audit-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+.member-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+.member-who {
+  flex: 1 1 200px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.member-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+.member-actions select {
+  min-height: 26px;
+  padding: 2px 6px;
+}
+.admin-panel .row.tabs {
+  gap: 4px;
+}
+.admin-panel .row.tabs button {
+  flex: 1 1 auto;
+  white-space: nowrap;
+  padding: 5px 8px;
+}
+.client-row {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.client-manage {
+  background: var(--bg);
+  border-radius: 8px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.audit-list li {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: var(--ui-small);
+}
+.secret-box {
+  border: 1px solid var(--green);
+  background: var(--green-soft);
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.secret-value {
+  user-select: all;
+  overflow-wrap: anywhere;
+  padding: 4px 6px;
+  background: white;
+}
+.platform-console {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}

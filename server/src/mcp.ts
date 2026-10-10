@@ -75,13 +75,15 @@ export function buildServer(who: Identity): McpServer {
     'list_documents',
     { title: 'List documents', description: 'Documents on this Gridwright server that you may read: id, name, folder, your permission, last update.', inputSchema: {} },
     async () => {
-      const out = listFiles()
-        .map((f) => {
-          const access = readAccess(f.id);
-          const permission = permissionFor(access, who);
-          return { id: f.id, name: f.name, folder: access.folder, permission, updatedAt: f.updatedAt };
-        })
-        .filter((f) => f.permission !== 'none');
+      // access first: a document outside the caller's reach (another client's) is never read
+      const seen = new Map<string, { folder: string; permission: ReturnType<typeof permissionFor> }>();
+      const out = listFiles((fid) => {
+        const access = readAccess(fid);
+        const permission = permissionFor(access, who);
+        if (permission === 'none') return false;
+        seen.set(fid, { folder: access.folder, permission });
+        return true;
+      }).map((f) => ({ id: f.id, name: f.name, folder: seen.get(f.id)!.folder, permission: seen.get(f.id)!.permission, updatedAt: f.updatedAt }));
       return text(out);
     },
   );

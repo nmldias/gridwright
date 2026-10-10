@@ -1,4 +1,6 @@
 // REST client for the Gridwright server.
+// Every call goes through tenantFetch: with accounts on, the tab's client is named on each request.
+import { tenantFetch as fetch } from './tenant';
 
 export interface FileInfo {
   id: string;
@@ -21,6 +23,8 @@ export interface FileAccess {
   folder: string;
   permission: 'none' | 'view' | 'sign' | 'edit' | 'own';
   identity: boolean;
+  /** accounts mode: the client the document belongs to */
+  client?: { id: string; name: string; slug: string };
 }
 
 export interface ConnectionInfo {
@@ -54,6 +58,8 @@ export interface AiSettings {
   model: string;
   hasKey: boolean;
   configured: boolean;
+  /** accounts mode: the platform default, or the client's own settings */
+  scope?: 'platform' | 'client';
 }
 
 export interface HistoryEntry {
@@ -551,7 +557,7 @@ export class ProposalConflictError extends Error {
 }
 
 export const api = {
-  async health(): Promise<{ ok: boolean; version: string; multiplayer: boolean; pyodide?: boolean; identity?: boolean; python?: ServerPython | null; investigation?: boolean }> {
+  async health(): Promise<{ ok: boolean; version: string; multiplayer: boolean; pyodide?: boolean; identity?: boolean; auth?: 'accounts' | 'tailscale' | 'none'; python?: ServerPython | null; investigation?: boolean }> {
     return j(await fetch('/api/health'));
   },
   python: {
@@ -570,7 +576,7 @@ export const api = {
       return j(await fetch('/api/python/probe', { method: 'POST' }));
     },
   },
-  async me(): Promise<{ login: string; name: string; role: 'admin' | 'editor' | 'viewer'; identity: boolean }> {
+  async me(): Promise<import('../state/store').Me> {
     return j(await fetch('/api/me'));
   },
   async investigationStack(): Promise<{ available: boolean; python: string; reason?: string; versions?: Record<string, string> }> {
@@ -776,7 +782,7 @@ export const api = {
     async settings(): Promise<AiSettings> {
       return j(await fetch('/api/ai/settings'));
     },
-    async saveSettings(s: { baseUrl?: string; model?: string; apiKey?: string }): Promise<AiSettings> {
+    async saveSettings(s: { baseUrl?: string; model?: string; apiKey?: string; reset?: boolean }): Promise<AiSettings> {
       return j(await fetch('/api/ai/settings', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(s) }));
     },
     async models(): Promise<{ models: string[]; error?: string }> {

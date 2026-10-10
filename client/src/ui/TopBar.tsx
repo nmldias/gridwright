@@ -1,5 +1,7 @@
 import { type ReactNode, useEffect, useState } from 'react';
 import { api, type FileInfo } from '../api/client';
+import { accounts } from '../api/accounts';
+import { setCurrentTenant, switchTenant } from '../api/tenant';
 import * as book from '../engine/book';
 import { isCodeKind, type CellKind } from '../engine/types';
 import { addTable, applyFormat, autoFitColumns, makeAgentCell, makeCodeCell, toggleBold } from '../grid/actions';
@@ -149,6 +151,21 @@ export function TopBar() {
     { label: 'Settings', title: 'Settings', onClick: () => toggle('settings'), active: panel === 'settings' },
   ];
 
+  // accounts mode: the client this tab works in, the others, and the way to people and one's account
+  const openAdmin = (v: 'members' | 'account' | 'clients') => useStore.setState({ panel: 'admin', adminView: v });
+  const clientItems: MenuEntry[] = me.auth === 'accounts'
+    ? [
+        { head: `${me.name || me.login} · ${me.login}` },
+        ...(me.tenants ?? []).map((t): MenuEntry => ({ label: t.name, hint: `${t.role}${t.status === 'suspended' ? ' · suspended' : ''}`, active: t.id === me.tenant?.id, disabled: t.status === 'suspended' && !me.platformAdmin, title: t.id === me.tenant?.id ? 'the client this tab works in' : `Work in ${t.name} in this tab (each tab can be in its own client)`, onClick: () => t.id !== me.tenant?.id && switchTenant(t) })),
+        'sep',
+        { label: me.role === 'admin' ? 'Members & access…' : 'Members…', title: 'Who is in this client and with which role', onClick: () => openAdmin('members') },
+        ...(me.platformAdmin ? [{ label: 'Platform console…', title: 'Every client and person on this server', onClick: () => openAdmin('clients') } as MenuEntry] : []),
+        { label: 'My account…', title: 'Name, password, API tokens', onClick: () => openAdmin('account') },
+        'sep',
+        { label: 'Sign out', onClick: () => void accounts.logout().finally(() => (setCurrentTenant(''), location.assign(location.origin + location.pathname))) },
+      ]
+    : [];
+
   const saveState = saving ? 'saving' : !fileId ? 'new' : dirty ? 'needed' : 'done';
   const saveLabel = saving ? 'Saving…' : saveState === 'done' ? 'Saved' : 'Save';
   const saveTitle =
@@ -297,6 +314,7 @@ export function TopBar() {
         </Menu>
       )}
       {selectedChart !== null && btn('chart', 'Chart', 'The selected chart: title, series, highlight, benchmark, export')}
+      {me.auth === 'accounts' && <Menu label={<span className="client-chip">{me.tenant?.name ?? 'No client'}</span>} title={`Client: ${me.tenant?.name ?? '—'} (your role: ${me.role}) — switch client, members, your account`} className="client-menu" items={clientItems} testId="client" active={panel === 'admin'} />}
       <Menu label="More" title="Everything else: navigation, tables, rules, charts, database, history, files, print, settings" items={moreItems} testId="more" active={['navigate', 'table', 'format', 'sql', 'history', 'files', 'settings'].includes(panel)} />
     </div>
   );

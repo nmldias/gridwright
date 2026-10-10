@@ -9,6 +9,7 @@ import { canEdit, canManage, canSign, canView, permissionFor, readAccess, type F
 import { errorMessage } from '../headless.js';
 import { identityOf } from '../identity.js';
 import { readFile } from '../storage.js';
+import { ACCOUNTS } from '../tenancy.js';
 
 export type Permission = ReturnType<typeof permissionFor>;
 
@@ -18,6 +19,21 @@ export const requireRole = (min: 'editor' | 'admin') => (req: Request, res: Resp
   const ok = min === 'editor' ? id.role !== 'viewer' : id.role === 'admin';
   if (!ok) {
     res.status(403).json({ error: min === 'editor' ? 'read-only access' : 'administrator access required' });
+    return;
+  }
+  next();
+};
+
+/**
+ * What concerns the whole server rather than one client — the backup of every client's data,
+ * re-probing the host, the platform's model default, clients and people: the platform administrator
+ * in accounts mode (never an agent acting for them); an administrator otherwise.
+ */
+export const requirePlatformAdmin = (req: Request, res: Response, next: NextFunction) => {
+  const id = identityOf(req);
+  const ok = ACCOUNTS ? !!id.platformAdmin && !id.agent : id.role === 'admin';
+  if (!ok) {
+    res.status(403).json({ error: ACCOUNTS ? 'platform administrator access required' : 'administrator access required' });
     return;
   }
   next();

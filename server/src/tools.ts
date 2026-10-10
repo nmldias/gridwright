@@ -170,7 +170,7 @@ export async function runTool(name: string, args: Record<string, unknown>, ctx: 
       return { result: list, summary: `${list.length} connection(s)` };
     }
     case 'list_tables': {
-      const kind = listConnections().find((x) => x.id === String(args.connection ?? ''))?.kind ?? 'postgres';
+      const kind = listConnections().find((x) => x.id === String(args.connection ?? '') && canSeeConnection(x, ctx.who))?.kind ?? 'postgres';
       const sql =
         kind === 'postgres'
           ? "SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema') ORDER BY 1, 2"

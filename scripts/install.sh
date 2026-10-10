@@ -27,12 +27,19 @@
 #                      Ubuntu ≥ 23.10 (DGX OS included), an AppArmor profile that lets it create user
 #                      namespaces — without it those kernels confine the namespace and cells run as a
 #                      plain process. Uses sudo once; re-run the installer afterwards is not needed.
+#   --accounts         multi-tenant: people sign in with e-mail and password, and the server hosts
+#                      many clients, each with its own members, documents, connections, model
+#                      settings and inbox (GRIDWRIGHT_AUTH=accounts; see docs/multi-tenancy.md).
+#                      The first platform administrator is GW_ADMIN_EMAIL; a temporary password is
+#                      written to <data>/initial-admin.txt on the first start. GW_TOKEN is not used.
+#                      Combined with --tailscale, Tailscale only provides HTTPS; identity is the accounts'.
 #   --no-backup        do not install the nightly backup timer.
 #
 # Environment:
 #   GW_PORT      listen port (default 8787)
 #   GW_DATA      data directory (default ~/gridwright-data)
 #   GW_TOKEN     optional shared access token (empty = open to anyone who can reach the port)
+#   GW_ADMIN_EMAIL  the first platform administrator (with --accounts; default admin@gridwright.local)
 #   GW_ADMINS    comma-separated Tailscale logins allowed to manage connections/AI/backups (with --tailscale)
 #   GW_READONLY  comma-separated Tailscale logins that may only view (with --tailscale)
 #   GW_DEFAULT_SHARING  sharing level of new documents: none (private, default with --tailscale), view or edit
@@ -63,6 +70,7 @@ PYVENV=0
 SANDBOX=0
 COMPANION=0
 BACKUP=1
+ACCOUNTS=0
 for a in "$@"; do
   case "$a" in
     --tailscale) TAILSCALE=1 ;;
@@ -71,7 +79,8 @@ for a in "$@"; do
     --companion) PYVENV=1; COMPANION=1 ;;
     --sandbox) SANDBOX=1 ;;
     --no-backup) BACKUP=0 ;;
-    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+    --accounts) ACCOUNTS=1 ;;
+    -h|--help) sed -n '2,/^# Re-running/p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
@@ -134,6 +143,14 @@ if [ "$TAILSCALE" = 1 ]; then
   command -v tailscale >/dev/null 2>&1 || die "tailscale is not installed on this host"
   HOST_BIND=127.0.0.1
   TRUST=1
+fi
+GW_AUTH=""
+if [ "$ACCOUNTS" = 1 ]; then
+  # identity comes from the accounts: Tailscale (if any) only terminates HTTPS, and the shared token is unused
+  GW_AUTH=accounts
+  TRUST=0
+  [ -n "${GW_TOKEN:-}" ] && echo "note: GW_TOKEN is not used with --accounts (people sign in instead)" >&2
+  GW_TOKEN=""
 fi
 
 # --- Python for server-side cells -----------------------------------------------------------
@@ -201,6 +218,8 @@ Environment=HOST=$HOST_BIND
 Environment=GRIDWRIGHT_DATA=$DATA
 Environment=CLIENT_DIR=$ROOT/client/dist
 Environment=GRIDWRIGHT_TOKEN=${GW_TOKEN:-}
+Environment=GRIDWRIGHT_AUTH=$GW_AUTH
+Environment=GRIDWRIGHT_ADMIN_EMAIL=${GW_ADMIN_EMAIL:-}
 Environment=GRIDWRIGHT_TRUST_TAILSCALE=$TRUST
 Environment=GRIDWRIGHT_ADMINS=${GW_ADMINS:-}
 Environment=GRIDWRIGHT_READONLY=${GW_READONLY:-}
@@ -222,7 +241,7 @@ EOF
 start_nohup() {
   pkill -f "$ROOT/server/dist/index.js" 2>/dev/null || true
   (cd server && PORT="$PORT" HOST="$HOST_BIND" GRIDWRIGHT_DATA="$DATA" CLIENT_DIR="$ROOT/client/dist" \
-    GRIDWRIGHT_TOKEN="${GW_TOKEN:-}" GRIDWRIGHT_TRUST_TAILSCALE="$TRUST" GRIDWRIGHT_ADMINS="${GW_ADMINS:-}" GRIDWRIGHT_READONLY="${GW_READONLY:-}" GRIDWRIGHT_DEFAULT_SHARING="${GW_DEFAULT_SHARING:-}" \
+    GRIDWRIGHT_TOKEN="${GW_TOKEN:-}" GRIDWRIGHT_AUTH="$GW_AUTH" GRIDWRIGHT_ADMIN_EMAIL="${GW_ADMIN_EMAIL:-}" GRIDWRIGHT_TRUST_TAILSCALE="$TRUST" GRIDWRIGHT_ADMINS="${GW_ADMINS:-}" GRIDWRIGHT_READONLY="${GW_READONLY:-}" GRIDWRIGHT_DEFAULT_SHARING="${GW_DEFAULT_SHARING:-}" \
     GRIDWRIGHT_PYTHON="${GW_PYTHON:-}" GRIDWRIGHT_PYTHON_SANDBOX="${GW_PYTHON_SANDBOX:-}" GRIDWRIGHT_PYTHON_TIMEOUT_MS="${GW_PYTHON_TIMEOUT_MS:-}" GRIDWRIGHT_PYTHON_MEMORY_MB="${GW_PYTHON_MEMORY_MB:-}" GRIDWRIGHT_PYTHON_CONCURRENCY="${GW_PYTHON_CONCURRENCY:-}" GRIDWRIGHT_PYTHON_THREADS="${GW_PYTHON_THREADS:-}" \
     GRIDWRIGHT_INBOX="${GW_INBOX:-}" GRIDWRIGHT_INTAKE_MAX_MB="${GW_INTAKE_MAX_MB:-}" \
     AI_BASE_URL="${AI_BASE_URL:-}" AI_MODEL="${AI_MODEL:-}" AI_API_KEY="${AI_API_KEY:-}" \
@@ -318,6 +337,7 @@ if "$DATA/pyenv/bin/python" -c 'import importlib.util, sys; sys.exit(0 if import
   done
 fi
 py_line="$(curl -fsS -H "Authorization: Bearer ${GW_TOKEN:-}" "http://127.0.0.1:$PORT/api/python" 2>/dev/null | "$NODE_BIN" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const p=JSON.parse(s);process.stdout.write(p.available?`CPython ${p.version}, sandbox: ${p.sandbox}${p.sandbox!=="bwrap"&&p.fallbacks?" ("+p.fallbacks+" — run the installer with --sandbox)":""}${p.gpu===null?", GPU: still probing (see Settings → Re-check server Python)":p.gpu.startsWith("cudf")?", GPU: "+p.gpu:", GPU: "+p.gpu}`:"off — "+(p.reason||"no python3 found (run with --python or set GW_PYTHON)"))}catch{process.stdout.write("unknown")}})')"
+[ "$ACCOUNTS" = 1 ] && py_line="see Settings after signing in (with accounts on, only bubblewrap is accepted unless GRIDWRIGHT_ALLOW_WEAK_SANDBOX=1)"
 say "server-side Python cells: $py_line"
 
 if [ "$TAILSCALE" = 1 ]; then
@@ -333,5 +353,10 @@ else
   ts="$(command -v tailscale >/dev/null 2>&1 && tailscale ip -4 2>/dev/null | head -1 || true)"
   say "Gridwright is up: http://${ts:-${ip:-localhost}}:$PORT${GW_TOKEN:+/?token=$GW_TOKEN}"
   [ -n "$ts" ] && [ -n "$ip" ] && [ "$ts" != "$ip" ] && say "also on the LAN: http://$ip:$PORT"
+fi
+if [ "$ACCOUNTS" = 1 ]; then
+  say "accounts on: sign in as ${GW_ADMIN_EMAIL:-admin@gridwright.local} (platform administrator)"
+  if [ -f "$DATA/initial-admin.txt" ]; then say "  its temporary password is in $DATA/initial-admin.txt — change it at first sign-in, then delete the file"; fi
+  say "  existing documents and connections belong to the Default client; create clients in Clients & people → Clients"
 fi
 say "data: $DATA   (documents, history, connections, AI settings, secret.key — back this up)"

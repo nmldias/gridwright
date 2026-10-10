@@ -11,6 +11,7 @@ import { cpus, freemem, homedir, tmpdir, totalmem } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DATA_DIR } from './storage.js';
+import { ACCOUNTS } from './tenancy.js';
 
 export type Sandbox = 'bwrap' | 'unshare' | 'none';
 
@@ -248,6 +249,12 @@ export function probePython(force = false): Promise<PythonStatus> {
     // `auto` and `require` therefore mean bubblewrap or nothing; the weaker modes (a user+network
     // namespace with the filesystem visible, or a plain process) must be chosen by name.
     const want = (process.env.GRIDWRIGHT_PYTHON_SANDBOX ?? 'auto').toLowerCase();
+    // with several clients on one host a weaker sandbox would let one client's code read another's
+    // data: accounts mode takes bubblewrap or nothing unless the operator says otherwise in so many words
+    if (ACCOUNTS && (want === 'unshare' || want === 'none') && !['1', 'true', 'yes'].includes((process.env.GRIDWRIGHT_ALLOW_WEAK_SANDBOX ?? '').toLowerCase())) {
+      status = { ...status, available: false, interpreter: py, version: '', sandbox: null, gpu: null, reason: `GRIDWRIGHT_PYTHON_SANDBOX=${want} is refused with accounts (multi-tenant): code of one client could read another's data — use bubblewrap, or set GRIDWRIGHT_ALLOW_WEAK_SANDBOX=1 if every client is trusted`, limits: LIMITS };
+      return status;
+    }
     const order: Sandbox[] = want === 'unshare' ? ['unshare'] : want === 'none' ? ['none'] : ['bwrap'];
     const reasons: string[] = [];
     for (const sb of order) {

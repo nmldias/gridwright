@@ -9,8 +9,9 @@ import { identityOf } from '../identity.js';
 import { runQuery, testConnection, type Param } from '../sql.js';
 import { authorizeQuery, canSeeConnection, SqlRefused } from '../sqlpolicy.js';
 import { Readable } from 'node:stream';
-import { decrypt, encrypt, listConnections, newId, readAiConfig, saveConnections, writeAiConfig, type StoredConnection } from '../storage.js';
-import { requireRole } from './common.js';
+import { aiKeyOf, clearTenantAiConfig, encrypt, listConnections, newId, readAiConfig, readPlatformAiConfig, readTenantAiConfig, saveConnections, writeAiConfig, type AiConfig, type StoredConnection } from '../storage.js';
+import { ACCOUNTS, audit } from '../tenancy.js';
+import { requirePlatformAdmin, requireRole } from './common.js';
 
 export function registerConnectionRoutes(app: Express) {
   const publicConn = (c: StoredConnection) => ({
@@ -62,6 +63,12 @@ export function registerConnectionRoutes(app: Express) {
     try {
       const list = listConnections();
       const c = validateConn(req.body ?? {});
+      // accounts mode: the connection belongs to the client of the administrator who made it
+      if (ACCOUNTS) {
+        const who = identityOf(req);
+        if (!who.tenant) return res.status(403).json({ error: 'no client selected' });
+        c.tenant = who.tenant;
+      }
       list.push(c);
       saveConnections(list);
       res.json(publicConn(c));
@@ -72,9 +79,10 @@ export function registerConnectionRoutes(app: Express) {
   app.put('/api/connections/:id', requireRole('admin'), (req, res) => {
     try {
       const list = listConnections();
-      const idx = list.findIndex((c) => c.id === req.params.id);
+      const who = identityOf(req);
+      const idx = list.findIndex((c) => c.id === req.params.id && canSeeConnection(c, who));
       if (idx < 0) return res.status(404).json({ error: 'not found' });
-      list[idx] = validateConn(req.body ?? {}, list[idx]);
+      list[idx] = { ...validateConn(req.body ?? {}, list[idx]), tenant: list[idx].tenant };
       saveConnections(list);
       res.json(publicConn(list[idx]));
     } catch (e) {
@@ -83,7 +91,8 @@ export function registerConnectionRoutes(app: Express) {
   });
   app.delete('/api/connections/:id', requireRole('admin'), (req, res) => {
     const list = listConnections();
-    const next = list.filter((c) => c.id !== req.params.id);
+    const who = identityOf(req);
+    const next = list.filter((c) => !(c.id === req.params.id && canSeeConnection(c, who)));
     if (next.length === list.length) return res.status(404).json({ error: 'not found' });
     saveConnections(next);
     res.json({ ok: true });
@@ -116,27 +125,66 @@ export function registerConnectionRoutes(app: Express) {
   });
 
   // --- AI -------------------------------------------------------------------------------
-  app.get('/api/ai/settings', (_req, res) => {
-    const cfg = readAiConfig();
-    const hasKey = !!cfg.apiKeyEnc || !!process.env.AI_API_KEY;
-    res.json({ baseUrl: cfg.baseUrl, model: cfg.model, hasKey, configured: !!cfg.baseUrl && !!cfg.model });
-  });
-  app.put('/api/ai/settings', requireRole('admin'), (req, res) => {
-    const cfg = readAiConfig();
-    const b = req.body ?? {};
+  // accounts mode: the settings in force for the caller's client — its own override, or the
+  // platform default (the key is never shown; `scope` says which applies)
+  const tenantOfReq = (req: import('express').Request) => (ACCOUNTS ? identityOf(req).tenant : undefined);
+  const settingsView = (cfg: AiConfig) => ({ baseUrl: cfg.baseUrl, model: cfg.model, hasKey: !!aiKeyOf(cfg), configured: !!cfg.baseUrl && !!cfg.model, scope: ACCOUNTS ? cfg.scope ?? 'platform' : undefined });
+  const applySettings = (cfg: AiConfig, b: Record<string, unknown>) => {
     if (typeof b.baseUrl === 'string') cfg.baseUrl = b.baseUrl.trim().slice(0, 500);
     if (typeof b.model === 'string') cfg.model = b.model.trim().slice(0, 200);
     if (typeof b.apiKey === 'string') cfg.apiKeyEnc = b.apiKey ? encrypt(b.apiKey) : undefined;
-    writeAiConfig(cfg);
-    res.json({ baseUrl: cfg.baseUrl, model: cfg.model, hasKey: !!cfg.apiKeyEnc || !!process.env.AI_API_KEY, configured: !!cfg.baseUrl && !!cfg.model });
+    if (cfg.baseUrl && !/^https?:\/\//i.test(cfg.baseUrl)) throw new Error('the endpoint is an http(s) URL');
+    return cfg;
+  };
+  app.get('/api/ai/settings', (req, res) => {
+    res.json(settingsView(readAiConfig(tenantOfReq(req))));
   });
-  app.get('/api/ai/models', async (_req, res) => {
-    const cfg = readAiConfig();
+  // without accounts: the server's settings; with accounts: the client's own override (a client
+  // administrator decides for the client; `reset: true` returns it to the platform default)
+  app.put('/api/ai/settings', requireRole('admin'), (req, res) => {
+    const b = (req.body ?? {}) as Record<string, unknown>;
+    try {
+      if (!ACCOUNTS) {
+        const cfg = applySettings(readPlatformAiConfig(), b);
+        writeAiConfig(cfg);
+        return res.json(settingsView(readAiConfig()));
+      }
+      const who = identityOf(req);
+      if (!who.tenant) return res.status(403).json({ error: 'no client selected' });
+      if (b.reset === true) {
+        clearTenantAiConfig(who.tenant);
+        audit(who.login, 'client.ai-settings', { tenant: who.tenant, detail: 'back to the platform default' });
+        return res.json(settingsView(readAiConfig(who.tenant)));
+      }
+      // the override starts from what the client had (never from the platform's key)
+      const own = readTenantAiConfig(who.tenant) ?? { baseUrl: '', model: '' };
+      const cfg = applySettings({ baseUrl: own.baseUrl, model: own.model, apiKeyEnc: own.apiKeyEnc }, b);
+      writeAiConfig(cfg, who.tenant);
+      audit(who.login, 'client.ai-settings', { tenant: who.tenant, detail: `${cfg.baseUrl || '(platform endpoint)'} · ${cfg.model || '(platform model)'}${typeof b.apiKey === 'string' ? (b.apiKey ? ' · key set' : ' · key removed') : ''}` });
+      res.json(settingsView(readAiConfig(who.tenant)));
+    } catch (e) {
+      res.status(400).json({ error: errorMessage(e) });
+    }
+  });
+  // the platform default every client without an override uses (accounts mode)
+  app.get('/api/platform/ai', requirePlatformAdmin, (_req, res) => res.json(settingsView(readPlatformAiConfig())));
+  app.put('/api/platform/ai', requirePlatformAdmin, (req, res) => {
+    try {
+      const cfg = applySettings(readPlatformAiConfig(), (req.body ?? {}) as Record<string, unknown>);
+      writeAiConfig(cfg);
+      audit(identityOf(req).login, 'platform.ai-settings', { detail: `${cfg.baseUrl} · ${cfg.model}` });
+      res.json(settingsView(readPlatformAiConfig()));
+    } catch (e) {
+      res.status(400).json({ error: errorMessage(e) });
+    }
+  });
+  app.get('/api/ai/models', async (req, res) => {
+    const cfg = readAiConfig(tenantOfReq(req));
     const baseUrl = (cfg.baseUrl || '').replace(/\/+$/, '');
     if (!baseUrl) return res.json({ models: [] });
     try {
       const headers: Record<string, string> = {};
-      const key = process.env.AI_API_KEY ?? '';
+      const key = aiKeyOf(cfg);
       if (key) headers.authorization = `Bearer ${key}`;
       const r = await fetch(`${baseUrl}/models`, { headers, signal: AbortSignal.timeout(8000) });
       const body: any = await r.json();
@@ -151,13 +199,13 @@ export function registerConnectionRoutes(app: Express) {
   // An OpenAI-compatible pass-through to the configured model endpoint, for agent cells and agents:
   // the caller is identified as usual (an agent cell by its token on the agent channel), the key is
   // added here and never leaves the server, the body and the answer (streamed or not) pass unchanged.
-  const upstreamOf = () => {
-    const cfg = readAiConfig();
-    const key = cfg.apiKeyEnc ? decrypt(cfg.apiKeyEnc) : process.env.AI_API_KEY ?? '';
+  const upstreamOf = (req: import('express').Request) => {
+    const cfg = readAiConfig(tenantOfReq(req));
+    const key = aiKeyOf(cfg);
     return { base: (cfg.baseUrl || '').replace(/\/+$/, ''), model: cfg.model, headers: { 'content-type': 'application/json', ...(key ? { authorization: `Bearer ${key}` } : {}) } as Record<string, string> };
   };
   app.post('/api/ai/v1/chat/completions', requireRole('editor'), async (req, res) => {
-    const up = upstreamOf();
+    const up = upstreamOf(req);
     if (!up.base) return res.status(503).json({ error: { message: 'no model endpoint is configured (Settings → model)', type: 'gridwright' } });
     const body = { ...(req.body ?? {}) } as Record<string, unknown>;
     if (!body.model || body.model === 'default') body.model = up.model;
@@ -176,8 +224,8 @@ export function registerConnectionRoutes(app: Express) {
       else res.end();
     }
   });
-  app.get('/api/ai/v1/models', requireRole('editor'), async (_req, res) => {
-    const up = upstreamOf();
+  app.get('/api/ai/v1/models', requireRole('editor'), async (req, res) => {
+    const up = upstreamOf(req);
     if (!up.base) return res.json({ object: 'list', data: [] });
     try {
       const r = await fetch(`${up.base}/models`, { headers: up.headers, signal: AbortSignal.timeout(8000) });

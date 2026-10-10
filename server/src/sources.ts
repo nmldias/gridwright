@@ -13,14 +13,23 @@
 // result establishes current coverage and invents no change. No model is involved.
 
 import { createHash } from 'node:crypto';
-import { canEdit, permissionFor, readAccess } from './access.js';
+import { canEdit, permissionFor, readAccess, tenantOfDoc } from './access.js';
 import { comparePeriods, noteEvent } from './companion.js';
 import type { Author } from './history.js';
 import { identityForLogin } from './identity.js';
 import { applyIntake, intakeQuery, setDeclineHook, setPlacementHook, type IntakeProfile, type IntakeSet } from './intake.js';
 import { enqueue, kick, registerRunner, type JobOutcome } from './jobs.js';
 import { authorizeQuery, canSeeConnection } from './sqlpolicy.js';
-import { listConnections, newId, type StoredConnection } from './storage.js';
+import { connectionTenant, listConnections, newId, type StoredConnection } from './storage.js';
+import { ACCOUNTS } from './tenancy.js';
+
+/** The connections a document may draw on: its client's (accounts mode), or all. */
+const connectionsOf = (doc: string) => {
+  const all = listConnections();
+  if (!ACCOUNTS) return all;
+  const tenant = tenantOfDoc(doc);
+  return all.filter((c) => connectionTenant(c) === tenant);
+};
 import { theStore, type DatasetVersion, type RecipeVersion, type SourceDef } from './store.js';
 
 export interface RecipeColumn {
@@ -70,7 +79,8 @@ function environment(): Record<string, string> {
  */
 export function ensureSourceFromPlacement(p: IntakeProfile, by: Author, placed: { set: string; table: number; name: string; placed: 'new' | 'update' | 'history' }[]): SourceDef | null {
   if (p.origin !== 'sql' || !p.query) return null;
-  const connection = listConnections().find((c) => c.name === p.query!.connection);
+  // by name within the document's client: another client's connection of the same name is not this one
+  const connection = connectionsOf(p.doc).find((c) => c.name === p.query!.connection);
   if (!connection) return null;
   const first = placed.find((t) => t.placed !== 'history');
   if (!first) return null;
@@ -173,8 +183,8 @@ export function requestRefresh(doc: string, sourceId: string, by: Author, who: {
   if (!src || src.doc !== doc) throw new Error('source not found');
   if (!src.enabled) throw new Error('the source is disabled');
   if (src.kind !== 'sql' || !src.connection || !src.sql) throw new Error('only SQL sources refresh on request; files arrive through intake');
-  const c = listConnections().find((x) => x.id === src.connection);
-  const identity = identityForLogin(who.login, who.name);
+  const c = connectionsOf(doc).find((x) => x.id === src.connection);
+  const identity = identityForLogin(who.login, who.name, tenantOfDoc(doc));
   if (!c || !canSeeConnection(c, identity)) throw new Error('the connection is not available to you');
   authorizeQuery(c, identity, src.sql);
   const job = enqueue({ type: 'refresh', doc, by, maxAttempts: 2, timeoutMs: 300_000, input: { source: src.id, recipe: src.recipe, who: { login: who.login, name: who.name }, lastVersion: src.lastVersion } });
@@ -187,7 +197,7 @@ export function listSourcesOf(doc: string) {
   return store.listSources(doc).map((s) => {
     const versions = store.listDatasets(s.id, 5);
     const recipe = s.recipe ? store.getRecipe(s.recipe) : null;
-    const connection = s.connection ? listConnections().find((c) => c.id === s.connection) : undefined;
+    const connection = s.connection ? connectionsOf(doc).find((c) => c.id === s.connection) : undefined;
     return { ...s, connectionName: connection?.name, recipeVersion: recipe?.version, versions: versions.map((v) => ({ id: v.id, version: v.version, period: v.period, rows: v.rows, status: v.status, createdAt: v.createdAt, reconciliation: v.reconciliation, intake: v.intake })) };
   });
 }
@@ -226,7 +236,7 @@ registerRunner('refresh', async (ctl): Promise<JobOutcome> => {
   const src = store.getSource(String(job.input.source ?? ''));
   if (!src || src.doc !== job.doc) return { status: 'failed', error: 'source not found' };
   const whoIn = (job.input.who ?? {}) as { login?: string; name?: string };
-  const identity = identityForLogin(whoIn.login ?? '', whoIn.name ?? '');
+  const identity = identityForLogin(whoIn.login ?? '', whoIn.name ?? '', tenantOfDoc(src.doc));
   const by: Author = { id: job.by.id, name: job.by.name, login: job.by.login };
   const attemptAt = now();
   const recipeRow = src.recipe ? store.getRecipe(src.recipe) : null;
@@ -235,7 +245,7 @@ registerRunner('refresh', async (ctl): Promise<JobOutcome> => {
     return { status: 'failed', error: 'the source has no recipe' };
   }
   const recipe = recipeRow.recipe as unknown as Recipe;
-  const c = listConnections().find((x) => x.id === src.connection);
+  const c = connectionsOf(src.doc).find((x) => x.id === src.connection);
   if (!c) {
     store.upsertSource({ ...src, lastAttemptAt: attemptAt, lastResult: 'failed: connection gone', updatedAt: attemptAt });
     return { status: 'failed', error: 'the connection no longer exists' };

@@ -22,6 +22,8 @@ import { appendEntry, readAll, type Author, type LogEntry } from './history.js';
 import { validateActions, type Action } from './proposals.js';
 import { runQuery, type ColumnKind, type QueryResult } from './sql.js';
 import { crashPoint, DATA_DIR, listConnections, readFile } from './storage.js';
+import { tenantOfDoc } from './access.js';
+import { ACCOUNTS, getTenant } from './tenancy.js';
 
 export const MAX_INTAKE_BYTES = Number(process.env.GRIDWRIGHT_INTAKE_MAX_MB ?? 25) * 1024 * 1024;
 const MAX_CELLS = 1_000_000;
@@ -1032,10 +1034,24 @@ export function firstReading(doc: string, tableId: number, by: Author): Reading 
 }
 
 // ------------------------------------------------------------------ the inbox adapter
-/** Files placed in GRIDWRIGHT_INBOX (one directory, read on request — not watched): what is there, with family and period. */
-export function inboxRoot(): string | null {
+/**
+ * Files placed in GRIDWRIGHT_INBOX (one directory, read on request — not watched): what is there, with
+ * family and period. With accounts every client has its own folder inside it, named by the client's
+ * slug (GRIDWRIGHT_INBOX/<slug>/), and sees only that one.
+ */
+export function inboxRoot(tenant?: string): string | null {
   const root = (process.env.GRIDWRIGHT_INBOX ?? '').trim();
-  return root && existsSync(root) ? resolve(root) : null;
+  if (!root || !existsSync(root)) return null;
+  if (!ACCOUNTS) return resolve(root);
+  const slug = tenant ? getTenant(tenant)?.slug : undefined;
+  if (!slug) return null;
+  const dir = resolve(root, slug);
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch {
+    return null;
+  }
+  return dir;
 }
 export interface InboxFile {
   name: string;
@@ -1044,8 +1060,8 @@ export interface InboxFile {
   family: string;
   period?: string;
 }
-export function listInbox(): InboxFile[] {
-  const root = inboxRoot();
+export function listInbox(tenant?: string): InboxFile[] {
+  const root = inboxRoot(tenant);
   if (!root) return [];
   const out: InboxFile[] = [];
   for (const f of readdirSync(root)) {
@@ -1057,7 +1073,7 @@ export function listInbox(): InboxFile[] {
 }
 /** Take one file from the inbox into a document's intake (the file stays until it is placed, then moves to taken/). */
 export function intakeFromInbox(doc: string, by: Author, name: string): IntakeProfile {
-  const root = inboxRoot();
+  const root = inboxRoot(tenantOfDoc(doc));
   if (!root) throw new Error('no inbox configured (GRIDWRIGHT_INBOX)');
   const safe = basename(name);
   const path = resolve(root, safe);
@@ -1065,8 +1081,8 @@ export function intakeFromInbox(doc: string, by: Author, name: string): IntakePr
   const buf = readFileSync(path);
   return intake(doc, by, { name: safe, base64: buf.toString('base64'), origin: 'inbox' });
 }
-export function inboxTaken(name: string, key: string) {
-  const root = inboxRoot();
+export function inboxTaken(name: string, key: string, doc: string) {
+  const root = inboxRoot(tenantOfDoc(doc));
   if (!root) return;
   const safe = basename(name);
   const path = resolve(root, safe);
