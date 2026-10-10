@@ -178,7 +178,7 @@ export function TopBar() {
           : `Saved to the server${savedAt ? ' at ' + timeOf(savedAt) : ''} — every change autosaves`;
 
   return (
-    <div className="topbar">
+    <header className="topbar">
       <div className="brand" title="Gridwright">
         <span className="logo">▦</span>
       </div>
@@ -316,6 +316,6 @@ export function TopBar() {
       {selectedChart !== null && btn('chart', 'Chart', 'The selected chart: title, series, highlight, benchmark, export')}
       {me.auth === 'accounts' && <Menu label={<span className="client-chip">{me.tenant?.name ?? 'No client'}</span>} title={`Client: ${me.tenant?.name ?? '—'} (your role: ${me.role}) — switch client, members, your account`} className="client-menu" items={clientItems} testId="client" active={panel === 'admin'} />}
       <Menu label="More" title="Everything else: navigation, tables, rules, charts, database, history, files, print, settings" items={moreItems} testId="more" active={['navigate', 'table', 'format', 'sql', 'history', 'files', 'settings'].includes(panel)} />
-    </div>
+    </header>
   );
 }

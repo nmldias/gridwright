@@ -35,10 +35,11 @@ export function FormulaBar() {
   };
 
   return (
-    <div className="formula-bar">
+    <div className="formula-bar" role="region" aria-label="Formula bar">
       <input
         ref={nameRef}
         className="name-box"
+        aria-label="Name box: active cell, or type a table name or reference to jump there"
         title="Active cell — type a table name or a reference (Sales::B2, Sales::A1:C9, B2) and press Enter to jump there"
         value={nameDraft ?? label}
         spellCheck={false}
@@ -71,6 +72,7 @@ export function FormulaBar() {
         <input
           ref={ref}
           className="formula-input"
+          aria-label="Formula or value of the active cell"
           value={shown}
           placeholder={cell?.s ? 'spilled output (read-only)' : ''}
           readOnly={!!cell?.s}

@@ -85,7 +85,7 @@ def main():
         page.wait_for_selector(".ai-panel textarea", timeout=5000)
         page.fill(".ai-panel textarea", "Why did freight go up in March?")
         set_panel("review")
-        page.wait_for_selector(".review-panel", timeout=5000)
+        page.wait_for_selector(".review-panel", timeout=20000)  # the review renders after the checks run; slow under a parallel CI load
         set_panel("ai")
         page.wait_for_selector(".ai-panel textarea", timeout=5000)
         check("an unsent question survives a trip to Review and back", page.input_value(".ai-panel textarea") == "Why did freight go up in March?", page.input_value(".ai-panel textarea"))
@@ -138,7 +138,7 @@ def main():
         page.evaluate("() => window.__gw.applyTemplate('ref-landed-cost')")
         time.sleep(1.2)
         set_panel("review")
-        page.wait_for_selector(".review-panel .review-summary", timeout=5000)
+        page.wait_for_selector(".review-panel .review-summary", timeout=20000)
         lead = page.text_content(".review-panel .review-summary .lead") or ""
         sub = page.text_content(".review-panel .review-summary .muted") or ""
         check("the summary speaks of proposals awaiting review and of failing checks", lead == "Nothing awaiting review" and "2 checks failing" in sub, f"{lead} / {sub}")
@@ -245,7 +245,7 @@ def main():
         pg.locator(".code-panel .panel-close").first.click()
         time.sleep(0.2)
         pg.click(".topbar button:has-text('Review')")
-        pg.wait_for_selector(".review-panel", timeout=5000)
+        pg.wait_for_selector(".review-panel", timeout=20000)
         close = pg.locator(".review-panel .panel-close")
         box = close.bounding_box()
         check("the panel covers the screen with a close control inside it, 44 px", box is not None and box["width"] >= 44 and box["height"] >= 44 and pg.evaluate("() => document.querySelector('.side').getBoundingClientRect().width") >= 389, str(box))

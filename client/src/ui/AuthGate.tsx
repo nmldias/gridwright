@@ -76,14 +76,16 @@ export function AuthGate({ children }: { children: ReactNode }) {
 
   if (checking && !opened) {
     return (
-      <div className="boot">
+      <main className="boot" aria-busy="true">
         <div className="logo big">▦</div>
         <div>connecting…</div>
-      </div>
+      </main>
     );
   }
+  // a page of its own is the main landmark; over an open workbook (which has its own <main>) it is a modal dialog
+  const Shell = opened ? 'div' : 'main';
   const overlay = screen && (
-    <div className={opened ? 'auth-overlay' : 'auth-screen'}>
+    <Shell className={opened ? 'auth-overlay' : 'auth-screen'} {...(opened ? { role: 'dialog', 'aria-modal': true, 'aria-label': 'Sign in' } : {})}>
       {screen.kind === 'login' && <LoginCard note={screen.note} onDone={() => void check()} />}
       {screen.kind === 'password' && <PasswordCard me={screen.me} onDone={() => void check()} />}
       {screen.kind === 'no-client' && <NoClientCard me={screen.me} />}
@@ -102,7 +104,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
           }}
         />
       )}
-    </div>
+    </Shell>
   );
   return (
     <>
