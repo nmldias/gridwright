@@ -336,8 +336,12 @@ if "$DATA/pyenv/bin/python" -c 'import importlib.util, sys; sys.exit(0 if import
     sleep 1
   done
 fi
-py_line="$(curl -fsS -H "Authorization: Bearer ${GW_TOKEN:-}" "http://127.0.0.1:$PORT/api/python" 2>/dev/null | "$NODE_BIN" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const p=JSON.parse(s);process.stdout.write(p.available?`CPython ${p.version}, sandbox: ${p.sandbox}${p.sandbox!=="bwrap"&&p.fallbacks?" ("+p.fallbacks+" — run the installer with --sandbox)":""}${p.gpu===null?", GPU: still probing (see Settings → Re-check server Python)":p.gpu.startsWith("cudf")?", GPU: "+p.gpu:", GPU: "+p.gpu}`:"off — "+(p.reason||"no python3 found (run with --python or set GW_PYTHON)"))}catch{process.stdout.write("unknown")}})')"
-[ "$ACCOUNTS" = 1 ] && py_line="see Settings after signing in (with accounts on, only bubblewrap is accepted unless GRIDWRIGHT_ALLOW_WEAK_SANDBOX=1)"
+if [ "$ACCOUNTS" = 1 ]; then
+  # /api/python needs a signed-in person with accounts on
+  py_line="see Settings after signing in (with accounts on, only bubblewrap is accepted unless GRIDWRIGHT_ALLOW_WEAK_SANDBOX=1)"
+else
+  py_line="$(curl -fsS -H "Authorization: Bearer ${GW_TOKEN:-}" "http://127.0.0.1:$PORT/api/python" 2>/dev/null | "$NODE_BIN" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const p=JSON.parse(s);process.stdout.write(p.available?`CPython ${p.version}, sandbox: ${p.sandbox}${p.sandbox!=="bwrap"&&p.fallbacks?" ("+p.fallbacks+" — run the installer with --sandbox)":""}${p.gpu===null?", GPU: still probing (see Settings → Re-check server Python)":p.gpu.startsWith("cudf")?", GPU: "+p.gpu:", GPU: "+p.gpu}`:"off — "+(p.reason||"no python3 found (run with --python or set GW_PYTHON)"))}catch{process.stdout.write("unknown")}})')"
+fi
 say "server-side Python cells: $py_line"
 
 if [ "$TAILSCALE" = 1 ]; then
