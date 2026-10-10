@@ -3,9 +3,10 @@
 // here. A reflection — the last thing recorded, with a way to correct it — is kept per document too.
 
 import { create } from 'zustand';
-import { api, type Companion, type ContextRecord, type RecordKind, type Watch, type WatchDef } from '../api/client';
+import { api, type Companion, type ContextRecord, type RecordKind, type Suggestion, type Watch, type WatchDef } from '../api/client';
 import { getClientId } from '../api/ws';
 import { getState, setStatus, useStore } from '../state/store';
+import { familyOf } from './snapshots';
 
 export interface Reflection {
   at: number;
@@ -87,18 +88,28 @@ export function statementOf(text: string): { kind: RecordKind; text: string } | 
   return null;
 }
 
-/** After an import: the file is a source of the table, a snapshot with a period the person can set. */
-export async function recordImport(fileName: string, table: number, tableName: string, rows: number, fields: string[]) {
+/** After an import: the file is a source of the table — a snapshot, with the period read from the file name when it carries one. */
+export async function recordImport(fileName: string, table: number, tableName: string, rows: number, fields: string[], opts: { period?: string; replaced?: boolean } = {}) {
   const fileId = getState().fileId;
-  if (!fileId) return;
-  const text = `Imported ${fileName}: ${rows} row${rows === 1 ? '' : 's'} into ${tableName}${fields.length ? ` (fields: ${fields.slice(0, 12).join(', ')}${fields.length > 12 ? ', …' : ''})` : ''}`;
+  if (!fileId) {
+    setStatus(`${opts.replaced ? 'Updated' : 'Imported'} ${tableName} from ${fileName} — save the document so the companion keeps the snapshot`, 6000);
+    return;
+  }
+  const text = `${opts.replaced ? 'Updated' : 'Imported'} ${tableName} from ${fileName}: ${rows} row${rows === 1 ? '' : 's'}${fields.length ? ` (${fields.slice(0, 12).join(', ')}${fields.length > 12 ? ', …' : ''})` : ''}`;
+  // the source is the file series (the name without its date), so that each new snapshot supersedes the last
+  const family = familyOf(fileName);
   try {
-    const r = await api.files.addRecord(fileId, { kind: 'source', text, source: fileName, links: [{ table }], client: getClientId() });
-    reflect(fileId, { text: `Linked ${fileName} to ${tableName} as a manually supplied snapshot — period not set`, record: r });
+    const r = await api.files.addRecord(fileId, { kind: 'source', text, source: family, period: opts.period, links: [{ table }], client: getClientId() });
+    reflect(fileId, { text: `${opts.replaced ? `${tableName} updated from ${fileName}` : `${fileName} linked to ${tableName}`}${opts.period ? ` — period ${opts.period}` : ' — period not set'}`, record: r });
     void loadCompanion(fileId);
   } catch {
     /* the import stands; the context is best-effort */
   }
+}
+
+/** One tap on a suggestion: an approved watch, nothing to write. */
+export async function acceptSuggestion(sg: Suggestion): Promise<Watch | null> {
+  return addWatch(sg.def);
 }
 
 export async function confirmRecord(r: ContextRecord) {

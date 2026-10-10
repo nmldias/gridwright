@@ -1579,3 +1579,21 @@ details.evidence > div {
 .source-chip .muted {
   font-size: var(--ui-small);
 }
+
+.suggestions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.suggestion {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 6px;
+  background: var(--panel);
+}
+.suggestion .small button {
+  min-height: 0;
+}

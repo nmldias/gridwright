@@ -37,7 +37,7 @@ export interface ContextRecord {
   links?: { table?: number; ref?: string }[];
 }
 
-export type WatchKind = 'threshold' | 'check' | 'change';
+export type WatchKind = 'threshold' | 'check' | 'change' | 'worsening';
 export type Op = '>' | '>=' | '<' | '<=' | '=' | '!=';
 
 export interface WatchDef {
@@ -51,6 +51,8 @@ export interface WatchDef {
   kind: WatchKind;
   op?: Op;
   value?: number;
+  /** for `worsening`: which way is bad (default up) */
+  bad?: 'up' | 'down';
   /** consecutive comparable observations in breach before it is reported (baseline until then) */
   sustain: number;
   response: 'note' | 'brief' | 'case';
@@ -62,6 +64,8 @@ export interface WatchDef {
 export interface Observation {
   at: string;
   seq: number;
+  /** the period of the snapshot this observation was made on (from the latest source record of the tables read) */
+  period?: string;
   value: number | boolean | string | null;
   error?: string;
   breach: boolean;
@@ -114,7 +118,8 @@ export interface Watch {
 
 export interface Event {
   at: string;
-  kind: 'record' | 'watch' | 'check' | 'issue' | 'decision' | 'source';
+  /** trace: bookkeeping kept in the activity but left out of the brief */
+  kind: 'record' | 'watch' | 'check' | 'issue' | 'decision' | 'source' | 'trace';
   text: string;
   by?: string;
   level: 'quiet' | 'watch' | 'attention';
@@ -221,7 +226,8 @@ export function addRecord(doc: string, by: Author, origin: 'user' | 'agent' | 's
     }
   }
   s.records.push(r);
-  event(s, { kind: r.kind === 'source' ? 'source' : 'record', text: `${origin === 'agent' ? 'Proposed' : 'Recorded'} ${r.kind}: ${text.slice(0, 160)}`, by: who(by), level: 'quiet' });
+  const shown = r.kind === 'source' ? text.replace(/\s*\(.*\)\s*$/, '') + (r.period ? ` (period ${r.period})` : '') : `${origin === 'agent' ? 'Proposed' : 'Kept'} ${r.kind === 'objective' ? 'what matters' : r.kind === 'exclusion' ? 'what to leave out' : r.kind}: ${text.slice(0, 160)}`;
+  event(s, { kind: r.kind === 'source' ? 'source' : 'record', text: shown, by: who(by), level: 'quiet' });
   saveState(s);
   return r;
 }
@@ -258,7 +264,7 @@ export function removeRecord(doc: string, id: string, by: Author): boolean {
 const OPS: Op[] = ['>', '>=', '<', '<=', '=', '!='];
 
 export function normaliseDef(input: Partial<WatchDef>): WatchDef {
-  const kind: WatchKind = input.kind === 'check' || input.kind === 'change' ? input.kind : 'threshold';
+  const kind: WatchKind = input.kind === 'check' || input.kind === 'change' || input.kind === 'worsening' ? input.kind : 'threshold';
   const formula = String(input.formula ?? '').trim();
   if (!formula) throw new Error('formula required');
   const def: WatchDef = {
@@ -276,9 +282,10 @@ export function normaliseDef(input: Partial<WatchDef>): WatchDef {
     def.op = OPS.includes(input.op as Op) ? (input.op as Op) : '>';
     def.value = Number(input.value ?? 0) || 0;
   }
+  if (kind === 'worsening') def.bad = input.bad === 'down' ? 'down' : 'up';
   return def;
 }
-const hashDef = (d: WatchDef) => createHash('sha256').update(JSON.stringify([d.formula, d.table ?? '', d.kind, d.op ?? '', d.value ?? '', d.scope])).digest('hex').slice(0, 12);
+const hashDef = (d: WatchDef) => createHash('sha256').update(JSON.stringify([d.formula, d.table ?? '', d.kind, d.op ?? '', d.value ?? '', d.bad ?? '', d.scope])).digest('hex').slice(0, 12);
 
 export function addWatch(doc: string, by: Author, origin: 'user' | 'agent', input: Partial<WatchDef>): Watch {
   const s = loadState(doc);
@@ -298,7 +305,7 @@ export function addWatch(doc: string, by: Author, origin: 'user' | 'agent', inpu
     history: [],
   };
   s.watches.push(w);
-  event(s, { kind: 'watch', text: `${origin === 'agent' ? 'Proposed watch' : 'Watching'}: ${def.purpose} (${def.formula}${def.kind === 'threshold' ? ` ${def.op} ${def.value}` : ''})`, by: who(by), level: 'quiet' });
+  event(s, { kind: 'watch', text: `${origin === 'agent' ? 'Proposed watch' : 'Watching'}: ${def.purpose} — ${ruleText(def)}`, by: who(by), level: 'quiet' });
   saveState(s);
   return w;
 }
@@ -316,11 +323,11 @@ export function updateWatch(doc: string, id: string, by: Author, patch: { approv
   if (patch.def) {
     const next = normaliseDef({ ...w.def, ...patch.def });
     const nextHash = hashDef(next);
-    const thresholdMoved = w.def.kind === 'threshold' && next.kind === 'threshold' && (next.value !== w.def.value || next.op !== w.def.op);
+    const ruleMoved = ruleText(w.def) !== ruleText(next);
     const materially = nextHash !== w.defHash;
-    if (thresholdMoved) {
-      // never silently normalised: the move is a decision in the context, with who, when and why
-      const text = `Threshold of “${w.def.purpose}” moved from ${w.def.op} ${w.def.value} to ${next.op} ${next.value}${patch.reason ? ` — ${patch.reason}` : ''}`;
+    if (ruleMoved) {
+      // never silently normalised: a changed rule is a decision in the context, with who, when and why
+      const text = `Rule of “${w.def.purpose}” changed from “${ruleText(w.def)}” to “${ruleText(next)}”${patch.reason ? ` — ${patch.reason}` : ''}`;
       s.records.push({ id: newId(), kind: 'decision', text, arrivedAt: now(), by, origin: 'user', status: 'stated', source: 'watch definition' });
       event(s, { kind: 'decision', text, by: who(by), level: 'watch' });
     }
@@ -402,6 +409,19 @@ function evaluate(doc: string, def: WatchDef): { value: Plain; error?: string } 
   }
 }
 
+/** The rule in words: “more than 1”, “must stay TRUE”, “getting worse”, “any change”. */
+export function ruleText(d: WatchDef): string {
+  if (d.kind === 'threshold') {
+    const opWord = d.op === '>' ? 'more than' : d.op === '>=' ? 'at least' : d.op === '<' ? 'below' : d.op === '<=' ? 'at most' : d.op === '=' ? 'equal to' : 'different from';
+    return `${opWord} ${fmt(d.value ?? 0)}`;
+  }
+  if (d.kind === 'check') return 'must stay TRUE';
+  if (d.kind === 'worsening') return d.bad === 'down' ? 'falling, snapshot after snapshot' : 'rising, snapshot after snapshot';
+  return 'any change';
+}
+const dateWord = (iso: string) => new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+const whenOf = (o: Observation) => o.period ?? dateWord(o.at);
+
 const compare = (v: number, op: Op, limit: number) => (op === '>' ? v > limit : op === '>=' ? v >= limit : op === '<' ? v < limit : op === '<=' ? v <= limit : op === '=' ? v === limit : v !== limit);
 const fmt = (v: Plain) => (typeof v === 'number' ? (Number.isInteger(v) ? v.toLocaleString('en-GB') : v.toLocaleString('en-GB', { maximumFractionDigits: 2 })) : String(v));
 
@@ -424,14 +444,33 @@ export function checkDocument(doc: string, reason = 'change', changedTables: num
       const a = affectedBy(g, changedTables.map((t) => `table:${t}`));
       affected = a.watches.map((id) => s.watches.find((w) => w.id === id)?.def.purpose ?? id);
       const names = changedTables.map((t) => g.nodes.find((n) => n.id === `table:${t}`)?.label ?? `table ${t}`);
-      if (affected.length) event(s, { kind: 'check', text: `${names.join(', ')} changed → reassessing ${affected.join(', ')}`, level: 'quiet' });
+      if (affected.length) event(s, { kind: 'trace', text: `${names.join(', ')} changed → reassessing ${affected.join(', ')}`, level: 'quiet' });
     } catch {
       /* the graph is a convenience; the checks run regardless */
     }
   }
+  // the snapshot period of each table: its latest live source record (set by the person or read from the file name)
+  const periodOfTable = new Map<number, string>();
+  for (const r of s.records) {
+    if (r.kind !== 'source' || r.status === 'retired' || r.status === 'superseded') continue;
+    for (const l of r.links ?? []) if (typeof l.table === 'number' && r.period) periodOfTable.set(l.table, r.period);
+  }
+  let metas: TableMetaView[] = [];
+  try {
+    const { book } = openDocument(doc);
+    try {
+      metas = tableMetas(book);
+    } finally {
+      book.free();
+    }
+  } catch {
+    /* no engine: no periods */
+  }
   for (const w of s.watches) {
     if (w.authority !== 'approved') continue;
     const { value, error } = evaluate(doc, w.def);
+    const readTables = tablesReferenced(w.def.formula, metas);
+    const period = readTables.map((t) => periodOfTable.get(t)).find(Boolean);
     // freshness: an essential source older than allowed means no conclusion is presented
     let fresh = true;
     if (w.def.freshnessHours && w.def.sources?.length) {
@@ -446,10 +485,14 @@ export function checkDocument(doc: string, reason = 'change', changedTables: num
       if (w.def.kind === 'threshold') breach = typeof value === 'number' && compare(value, w.def.op ?? '>', w.def.value ?? 0);
       else if (w.def.kind === 'check') breach = value === false;
       else if (w.def.kind === 'change') breach = !!prev && prev.def === w.defHash && prev.value !== value;
+      else if (w.def.kind === 'worsening') {
+        const prevComparable = [...w.observations].reverse().find((o) => o.def === w.defHash && !o.error && typeof o.value === 'number');
+        breach = !!prevComparable && typeof value === 'number' && (w.def.bad === 'down' ? value < (prevComparable.value as number) : value > (prevComparable.value as number));
+      }
     }
-    const novel = !prev || prev.seq !== seq || prev.value !== value || !!prev.error !== !!error || prev.fresh !== fresh || prev.def !== w.defHash;
+    const novel = !prev || prev.seq !== seq || prev.value !== value || !!prev.error !== !!error || prev.fresh !== fresh || prev.def !== w.defHash || prev.period !== period;
     if (novel) {
-      w.observations.push({ at, seq, value, error, breach, fresh, def: w.defHash });
+      w.observations.push({ at, seq, period, value, error, breach, fresh, def: w.defHash });
       changed = true;
     }
     w.lastChecked = at;
@@ -458,11 +501,13 @@ export function checkDocument(doc: string, reason = 'change', changedTables: num
     let run = 0;
     for (let i = comparable.length - 1; i >= 0 && comparable[i].breach && !comparable[i].error; i--) run++;
     const prevHealth = w.health;
+    // a worsening watch needs one more observation than its sustain: the one it worsens from
+    const needed = w.def.kind === 'worsening' ? w.def.sustain + 1 : w.def.sustain;
     if (error) {
       w.health = 'error';
     } else if (!fresh) {
       w.health = 'stale';
-    } else if (comparable.length < w.def.sustain) {
+    } else if (comparable.length < needed) {
       w.health = 'baseline';
     } else if (run >= w.def.sustain) {
       w.health = 'attention';
@@ -473,9 +518,16 @@ export function checkDocument(doc: string, reason = 'change', changedTables: num
     // resolved after two comparable observations back within bounds
     if (w.health === 'attention') {
       attention++;
-      const evidence = comparable.slice(-Math.max(w.def.sustain, 3)).map((o) => `${o.at.slice(0, 16).replace('T', ' ')} (revision ${o.seq}): ${fmt(o.value)}`);
-      const limit = w.def.kind === 'threshold' ? ` ${w.def.op} ${fmt(w.def.value ?? 0)}` : w.def.kind === 'check' ? ' (check false)' : ' (changed)';
-      const summary = `${w.def.purpose}: ${fmt(value)}${limit}, ${run === 1 ? 'on this observation' : `across ${run} comparable observations`}`;
+      const trail = comparable.slice(-Math.max(needed, 3));
+      const evidence = trail.map((o) => `${whenOf(o)}: ${fmt(o.value)}`);
+      const before = trail.length > 1 ? trail[trail.length - 2] : undefined;
+      const movement = before && typeof before.value === 'number' && typeof value === 'number' && before.value !== value ? ` (was ${fmt(before.value)} on ${whenOf(before)})` : '';
+      const summary =
+        w.def.kind === 'worsening'
+          ? `${w.def.purpose}: ${fmt(value)}${movement} — ${w.def.bad === 'down' ? 'falling' : 'rising'} ${run === 1 ? 'since the last snapshot' : `for ${run} snapshots running`}`
+          : w.def.kind === 'check'
+            ? `${w.def.purpose}: no longer holds${run > 1 ? ` (${run} snapshots running)` : ''}`
+            : `${w.def.purpose}: ${fmt(value)}${movement} — ${ruleText(w.def)}${run > 1 ? `, ${run} snapshots running` : ''}`;
       const uncertainty: string[] = [];
       if (w.def.scope) uncertainty.push(`Scope as defined: ${w.def.scope}`);
       const staleOthers = (w.def.sources ?? []).map((n) => sources.find((x) => x.name.toLowerCase() === n.toLowerCase())).filter((x) => x && x.supply === 'import');
@@ -493,7 +545,7 @@ export function checkDocument(doc: string, reason = 'change', changedTables: num
         w.issue.evidence = evidence;
         w.issue.uncertainty = uncertainty;
         w.issue.interpretation = undefined; // the words no longer describe the evidence
-        event(s, { kind: 'issue', text: `${moved ? 'Strengthened' : 'Revised'} — ${summary}`, level: 'attention' });
+        event(s, { kind: 'issue', text: `${moved ? 'Worse again' : 'Still'} — ${summary}`, level: 'attention' });
         changed = true;
       }
     } else if (w.issue && w.issue.status === 'open' && w.health === 'ok') {
@@ -502,7 +554,7 @@ export function checkDocument(doc: string, reason = 'change', changedTables: num
         w.issue.status = 'resolved';
         w.issue.resolvedAt = at;
         w.issue.updatedAt = at;
-        w.issue.next = `Back within bounds (${fmt(value)}) on two comparable observations.`;
+        w.issue.next = `Back within bounds (${fmt(value)}) on two snapshots.`;
         w.history.push(w.issue);
         if (w.history.length > 20) w.history = w.history.slice(-20);
         event(s, { kind: 'issue', text: `Resolved — ${w.def.purpose} is back within bounds (${fmt(value)})`, level: 'watch' });
@@ -510,18 +562,140 @@ export function checkDocument(doc: string, reason = 'change', changedTables: num
         changed = true;
       }
     }
+    const prevComparable = comparable.length > 1 ? comparable[comparable.length - 2] : undefined;
     if (w.health !== prevHealth && !(w.health === 'attention' && prevHealth !== 'attention')) {
       if (w.health === 'stale') event(s, { kind: 'check', text: `Not checked: ${w.def.purpose} — ${(w.def.sources ?? []).join(', ')} older than ${w.def.freshnessHours} h`, level: 'watch' });
       else if (w.health === 'error') event(s, { kind: 'check', text: `Cannot evaluate “${w.def.purpose}”: ${error}`, level: 'watch' });
-      else if (w.health === 'baseline' && prevHealth === 'unchecked') event(s, { kind: 'check', text: `Building a baseline for “${w.def.purpose}” (${comparable.length} of ${w.def.sustain} comparable observations)`, level: 'quiet' });
+      else if (w.health === 'baseline' && prevHealth === 'unchecked') event(s, { kind: 'check', text: `${w.def.purpose}: ${fmt(value)} now — watching for the next snapshot before saying more`, level: 'quiet' });
       changed = true;
-    } else if (novel && w.def.kind === 'change' && breach) {
-      event(s, { kind: 'check', text: `Worth watching — ${w.def.purpose} changed from ${fmt(prev!.value)} to ${fmt(value)}`, level: 'watch' });
+    } else if (novel && prevComparable && !error && prevComparable.value !== value && w.health !== 'attention') {
+      // a movement that is not (yet) an issue is worth a look, in plain words
+      const worse = w.def.kind === 'worsening' ? breach : w.def.kind === 'threshold' && typeof value === 'number' && typeof prevComparable.value === 'number' ? (w.def.op === '<' || w.def.op === '<=' ? value < prevComparable.value : value > prevComparable.value) : false;
+      const tail = w.health === 'baseline' && breach ? ' — watching for another snapshot before raising it' : '';
+      event(s, { kind: 'check', text: `${w.def.purpose}: ${fmt(value)} (was ${fmt(prevComparable.value)} on ${whenOf(prevComparable)})${worse ? ', worse' : ''}${tail}`, level: worse || w.def.kind === 'change' ? 'watch' : 'quiet' });
     }
   }
   void reason;
   saveState(s);
   return { attention, changed, affected };
+}
+
+// ------------------------------------------------------------------ suggestions
+// The companion proposes what to watch from the columns themselves, in plain words: a days or
+// date column means ageing, a yes/no column an exclusion, an identifier column duplicates, an
+// amount column blanks and a total. Formulas are generated; nobody has to write one.
+export interface Suggestion {
+  id: string;
+  purpose: string;
+  why: string;
+  def: WatchDef;
+}
+
+interface ColumnProfile {
+  index: number;
+  header: string;
+  n: number;
+  blanks: number;
+  numbers: number;
+  unique: number;
+  yesNo: number;
+  dates: number;
+  max: number;
+}
+
+const q = (name: string) => (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ? name : `'${name.replace(/'/g, "''")}'`);
+const col = (table: string, header: string) => `${q(table)}[${header}]`;
+
+function profileTable(cells: CellViewJson[], t: TableMetaView): ColumnProfile[] {
+  const out: ColumnProfile[] = [];
+  const byCol = new Map<number, CellViewJson[]>();
+  for (const c of cells) {
+    if (c.r < t.header_rows) continue;
+    if (!byCol.has(c.c)) byCol.set(c.c, []);
+    byCol.get(c.c)!.push(c);
+  }
+  const headerOf = (c: number) => {
+    const h = cells.find((x) => x.r === t.header_rows - 1 && x.c === c);
+    return h && h.v && 's' in h.v ? h.v.s.trim() : '';
+  };
+  const dataRows = Math.max(0, t.rows - t.header_rows);
+  for (let c = 0; c < t.cols; c++) {
+    const header = headerOf(c);
+    if (!header) continue;
+    const vals = byCol.get(c) ?? [];
+    const prof: ColumnProfile = { index: c, header, n: dataRows, blanks: 0, numbers: 0, unique: 0, yesNo: 0, dates: 0, max: 0 };
+    const seen = new Set<string>();
+    let filled = 0;
+    for (const v of vals) {
+      if (!v.v || (('s' in v.v) && !v.v.s.trim())) continue;
+      filled++;
+      const key = 'n' in v.v ? String(v.v.n) : 's' in v.v ? v.v.s.trim().toLowerCase() : JSON.stringify(v.v);
+      seen.add(key);
+      if ('n' in v.v) {
+        prof.numbers++;
+        prof.max = Math.max(prof.max, v.v.n);
+        if (v.f?.number_format && /[dmy]/i.test(v.f.number_format) && !/[#0]/.test(v.f.number_format)) prof.dates++;
+      } else if ('s' in v.v) {
+        if (/^(yes|no|y|n|sim|não|nao|true|false)$/i.test(v.v.s.trim())) prof.yesNo++;
+        if (/^\d{4}-\d{2}-\d{2}/.test(v.v.s.trim())) prof.dates++;
+      } else if ('b' in v.v) prof.yesNo++;
+    }
+    prof.blanks = dataRows - filled;
+    prof.unique = seen.size;
+    out.push(prof);
+  }
+  return out;
+}
+
+export function suggestWatches(doc: string): Suggestion[] {
+  if (!engineAvailable() || !readFile(doc)) return [];
+  const s = loadState(doc);
+  const have = new Set(s.watches.map((w) => w.def.formula.replace(/\s+/g, '')));
+  const out: Suggestion[] = [];
+  const add = (id: string, purpose: string, why: string, def: Partial<WatchDef>) => {
+    const d = normaliseDef({ sustain: 2, response: 'brief', ...def, purpose });
+    if (have.has(d.formula.replace(/\s+/g, ''))) return;
+    out.push({ id, purpose, why, def: d });
+  };
+  const { book } = openDocument(doc);
+  try {
+    for (const t of tableMetas(book)) {
+      if (t.pivot || t.header_rows < 1 || t.rows - t.header_rows < 2) continue;
+      const cells = JSON.parse(book.cells(t.id)) as CellViewJson[];
+      const cols = profileTable(cells, t);
+      const dataRows = t.rows - t.header_rows;
+      const mostly = (p: ColumnProfile, k: keyof ColumnProfile) => (p[k] as number) >= Math.max(1, (dataRows - p.blanks) * 0.8);
+      const flag = cols.find((p) => mostly(p, 'yesNo') && /reserv|hold|sold|exclu|vendid|block/i.test(p.header)) ?? cols.find((p) => mostly(p, 'yesNo'));
+      const flagText = flag ? ` (excluding ${flag.header} = yes)` : '';
+      const flagCond = flag ? `, ${col(t.name, flag.header)}, "no"` : '';
+      const rowWord = /vehic|viatur|carro|stock|invent/i.test(t.name) ? 'vehicles' : 'rows';
+      const prefix = tableMetas(book).filter((m) => !m.pivot && m.header_rows >= 1 && m.rows - m.header_rows >= 2).length > 1 ? `${t.name}: ` : '';
+      const cap = (x: string) => x.charAt(0).toUpperCase() + x.slice(1);
+      // a row exists when its key column is filled: spare empty rows at the foot of a table are not "missing" anything
+      const keyCol = cols.find((p) => !mostly(p, 'numbers') && p.unique >= Math.max(2, (dataRows - p.blanks) * 0.7)) ?? cols[0];
+      const present = keyCol ? `, ${col(t.name, keyCol.header)}, "<>"` : '';
+      for (const p of cols) {
+        const h = p.header;
+        if (mostly(p, 'numbers') && /\b(days?|age|ageing|aging|dias|idade)\b/i.test(h) && p.max > 30) {
+          const limit = p.max >= 90 ? 90 : 30;
+          add(`${t.id}:${p.index}:age`, cap(`${prefix}${rowWord} over ${limit} ${/dias/i.test(h) ? 'dias' : 'days'}${flag ? ' (excl. reserved)' : ''}`), `“${h}” reads like days in stock; ageing beyond ${limit} days usually needs a decision${flag ? `; ${flag.header} = yes is left out` : ''}`, { formula: flag ? `=COUNTIFS(${col(t.name, h)}, ">${limit}"${flagCond})` : `=COUNTIF(${col(t.name, h)}, ">${limit}")`, kind: 'worsening', bad: 'up', scope: `${t.name}${flagText}`, sources: [t.name] });
+        } else if (mostly(p, 'dates') && /date|data|entr|receiv|arriv|in\b/i.test(h)) {
+          add(`${t.id}:${p.index}:since`, cap(`${prefix}${rowWord} older than 90 days${flag ? ' (excl. reserved)' : ''}`), `“${h}” is a date; counting what is older than 90 days from today${flag ? `; ${flag.header} = yes is left out` : ''}`, { formula: flag ? `=COUNTIFS(${col(t.name, h)}, "<"&(TODAY()-90)${flagCond})` : `=COUNTIF(${col(t.name, h)}, "<"&(TODAY()-90))`, kind: 'worsening', bad: 'up', scope: `${t.name}${flagText}`, sources: [t.name] });
+        }
+        if (mostly(p, 'numbers') && !mostly(p, 'dates') && /cost|amount|value|price|total|valor|custo|montante|pre[cç]o|margin|margem|landed|cif|fob/i.test(h) && !/days|dias/i.test(h)) {
+          add(`${t.id}:${p.index}:blank`, cap(`${prefix}${rowWord} with no ${h.toLowerCase()}`), `a missing ${h.toLowerCase()} makes a margin or a total provisional`, { formula: `=COUNTIFS(${col(t.name, h)}, ""${present})`, kind: 'threshold', op: '>', value: 0, sustain: 1, scope: t.name, sources: [t.name] });
+          add(`${t.id}:${p.index}:total`, cap(`${prefix}total ${h.toLowerCase()}`), `the total moves when a snapshot changes; a movement is worth a look, not an alarm`, { formula: `=SUM(${col(t.name, h)})`, kind: 'change', sustain: 1, scope: t.name, sources: [t.name] });
+        }
+        if (!mostly(p, 'numbers') && /\b(vin|id|ref|reference|chassis|invoice|factura|fatura|cheque|no\.?|number|code|c[oó]digo)\b/i.test(h) && p.unique >= Math.max(2, (dataRows - p.blanks) * 0.7)) {
+          add(`${t.id}:${p.index}:dup`, cap(`${prefix}duplicate ${h}${/s$/i.test(h) ? '' : 's'}`), `“${h}” looks like an identifier; a duplicate is usually a posting error`, { formula: `=COUNTA(${col(t.name, h)}) - COUNTUNIQUE(${col(t.name, h)})`, kind: 'threshold', op: '>', value: 0, sustain: 1, scope: t.name, sources: [t.name] });
+        }
+      }
+    }
+  } finally {
+    book.free();
+  }
+  const rank = (x: Suggestion) => (x.id.endsWith(':age') || x.id.endsWith(':since') ? 0 : x.id.endsWith(':blank') ? 1 : x.id.endsWith(':dup') ? 2 : 3);
+  return out.sort((a, b) => rank(a) - rank(b)).slice(0, 8);
 }
 
 // ------------------------------------------------------------------ brief
@@ -531,7 +705,7 @@ export function brief(doc: string): Brief {
   const since = s.seenAt ? Date.parse(s.seenAt) : 0;
   const recent = s.events.filter((e) => Date.parse(e.at) > since);
   const changed = recent
-    .filter((e) => e.level !== 'attention')
+    .filter((e) => e.level !== 'attention' && e.kind !== 'trace')
     .map((e) => e.text)
     .filter((t, i, arr) => arr.lastIndexOf(t) === i)
     .slice(-8);

@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { canEdit, canManage, canSign, canView, deleteAccess, normalise, permissionFor, readAccess, writeAccess, type FileAccess } from './access.js';
 import { chat, completeOnce } from './ai.js';
-import { addRecord, addWatch, affectedBy, brief as companionBrief, checkDocument, contextForModel, deleteCompanion, findIssue, graphOf, markSeen, removeRecord, removeWatch, setCompanionNotifier, setInterpretation, snapshot as companionSnapshot, startCompanion, updateRecord, updateWatch, type RecordKind } from './companion.js';
+import { addRecord, addWatch, affectedBy, brief as companionBrief, checkDocument, contextForModel, deleteCompanion, findIssue, graphOf, markSeen, removeRecord, removeWatch, setCompanionNotifier, setInterpretation, snapshot as companionSnapshot, startCompanion, suggestWatches, updateRecord, updateWatch, type RecordKind } from './companion.js';
 import { appendEntry, checkpointSeqs, compactCheckpoints, currentSeq, deleteHistory, historyCsv, opTouchesCell, readAll, recentEntries, replayBundle, writeCheckpoint } from './history.js';
 import { identityEnabled, identityOf } from './identity.js';
 import { accessChanged, attachMultiplayer, broadcastEntries, notifyCompanion, notifyProposal as notifyProposalRoom, notifySaved } from './multiplayer.js';
@@ -39,7 +39,7 @@ import {
   type StoredConnection,
 } from './storage.js';
 
-const VERSION = '0.8.0';
+const VERSION = '0.8.1';
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? '0.0.0.0';
 const TOKEN = process.env.GRIDWRIGHT_TOKEN ?? '';
@@ -277,6 +277,15 @@ app.get('/api/files/:id/companion/graph', (req, res) => {
     const g = graphOf(req.params.id);
     const changed = typeof req.query.changed === 'string' ? req.query.changed.split(',').map((x) => x.trim()).filter(Boolean) : [];
     res.json(changed.length ? { ...g, affected: affectedBy(g, changed) } : g);
+  } catch (e) {
+    res.status(400).json({ error: errorMessage(e) });
+  }
+});
+// what the companion proposes to watch, read off the columns; accepting one creates an approved watch
+app.get('/api/files/:id/companion/suggest', (req, res) => {
+  if (!docPermission(req, res, 'view')) return;
+  try {
+    res.json(suggestWatches(req.params.id));
   } catch (e) {
     res.status(400).json({ error: errorMessage(e) });
   }

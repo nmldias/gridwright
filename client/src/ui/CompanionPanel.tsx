@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
-import { api, RECORD_KINDS, type ContextRecord, type RecordKind, type Watch, type WatchDef } from '../api/client';
+import { api, RECORD_KINDS, type ContextRecord, type RecordKind, type Suggestion, type Watch, type WatchDef } from '../api/client';
 import { readOnly, setStatus, useStore } from '../state/store';
-import { addWatch, approveWatch, changeWatch, checkNow, clearReflection, confirmRecord, correctRecord, loadCompanion, markSeen, remember, removeRecord, removeWatch, retireRecord, useCompanion } from './companion';
+import { acceptSuggestion, addWatch, approveWatch, changeWatch, checkNow, clearReflection, confirmRecord, correctRecord, loadCompanion, markSeen, remember, removeRecord, removeWatch, retireRecord, useCompanion } from './companion';
 
-const KIND_LABEL: Record<RecordKind, string> = { objective: 'Objectives', exclusion: 'Exclusions', decision: 'Decisions', fact: 'Facts', source: 'Sources', hypothesis: 'Hypotheses', contradiction: 'Contradictions' };
-const HEALTH_LABEL: Record<Watch['health'], string> = { ok: 'within bounds', baseline: 'building a baseline', attention: 'needs attention', stale: 'not checked — source stale', error: 'cannot evaluate', unchecked: 'not checked yet', proposed: 'proposed — awaiting approval' };
+const KIND_LABEL: Record<RecordKind, string> = { objective: 'What matters', exclusion: 'Left out', decision: 'Decisions', fact: 'Facts', source: 'Snapshots and sources', hypothesis: 'Hypotheses', contradiction: 'Contradictions' };
+const HEALTH_LABEL: Record<Watch['health'], string> = { ok: 'fine', baseline: 'waiting for the next snapshot', attention: 'needs attention', stale: 'not checked — source stale', error: 'cannot evaluate', unchecked: 'not checked yet', proposed: 'proposed — needs your approval' };
+const ruleWords = (d: WatchDef) => (d.kind === 'threshold' ? `${d.op === '>' ? 'more than' : d.op === '>=' ? 'at least' : d.op === '<' ? 'below' : d.op === '<=' ? 'at most' : d.op === '=' ? 'equal to' : 'not'} ${fmtValue(d.value)}` : d.kind === 'check' ? 'must stay TRUE' : d.kind === 'worsening' ? `${d.bad === 'down' ? 'falling' : 'rising'} snapshot after snapshot` : 'any change');
 const ago = (iso?: string) => {
   if (!iso) return 'never';
   const m = Math.round((Date.now() - Date.parse(iso)) / 60000);
@@ -42,11 +43,12 @@ export function CompanionBrief() {
   const h = b.health;
   const attention = h.attention;
   const checked = h.checked ? `checked ${ago(h.checked)}` : data.watches.some((w) => w.authority === 'approved') ? 'not checked yet' : '';
-  const healthText = [h.ok ? `${h.ok} within bounds` : '', h.baseline ? `${h.baseline} building a baseline` : '', h.stale ? `${h.stale} stale` : '', h.error ? `${h.error} cannot evaluate` : '', h.proposed ? `${h.proposed} proposed` : ''].filter(Boolean).join(' · ');
+  const healthText = [h.ok ? `${h.ok} fine` : '', h.baseline ? `${h.baseline} waiting for the next snapshot` : '', h.stale ? `${h.stale} stale` : '', h.error ? `${h.error} cannot evaluate` : '', h.proposed ? `${h.proposed} proposed` : ''].filter(Boolean).join(' · ');
+  const worthALook = !attention && data.events.some((e) => e.level === 'watch' && (!data.seenAt || e.at > data.seenAt));
   return (
     <div className={`companion ${attention ? 'attention' : ''}`}>
       <div className="companion-head">
-        <b className="companion-lead">{attention ? `${attention} need${attention === 1 ? 's' : ''} attention` : b.matters[0]?.startsWith('Not checked') ? 'Not checked' : 'All quiet'}</b>
+        <b className="companion-lead">{attention ? `${attention} need${attention === 1 ? 's' : ''} attention` : b.matters[0]?.startsWith('Not checked') ? 'Not checked' : worthALook ? 'Worth a look' : 'All quiet'}</b>
         <span className="muted small">
           {checked}
           {healthText ? ` · ${healthText}` : ''}
@@ -116,10 +118,42 @@ export function CompanionBrief() {
   );
 }
 
+function QuickRecord({ kind, placeholder }: { kind: RecordKind; placeholder: string }) {
+  const [text, setText] = useState('');
+  return (
+    <div className="row">
+      <input
+        className="grow"
+        placeholder={placeholder}
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => {
+          e.stopPropagation();
+          if (e.key === 'Enter' && text.trim()) {
+            void remember(kind, text.trim());
+            setText('');
+          }
+        }}
+      />
+      <button
+        className="small"
+        disabled={!text.trim()}
+        onClick={() => {
+          void remember(kind, text.trim());
+          setText('');
+        }}
+      >
+        Keep
+      </button>
+    </div>
+  );
+}
+
 function ContextView({ records, sources }: { records: ContextRecord[]; sources: Companion['brief']['sources'] }) {
-  const [kind, setKind] = useState<RecordKind>('objective');
+  const [kind, setKind] = useState<RecordKind>('fact');
   const [text, setText] = useState('');
   const [period, setPeriod] = useState('');
+  const [more, setMore] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
   const ro = readOnly();
@@ -127,9 +161,12 @@ function ContextView({ records, sources }: { records: ContextRecord[]; sources: 
   const groups = RECORD_KINDS.map((k) => [k, live.filter((r) => r.kind === k)] as const).filter(([, rs]) => rs.length);
   return (
     <div className="companion-section">
-      <div className="muted small">
-        What the companion holds, each item with its origin and status. A person's words stand; an agent's reading waits for your confirmation; a newer snapshot of the same source supersedes the older one.
-      </div>
+      {!ro && (
+        <>
+          <QuickRecord kind="objective" placeholder="What matters here, e.g. preserve replacement-cost margin" />
+          <QuickRecord kind="exclusion" placeholder="What to leave out, e.g. customer-reserved vehicles in Inventory" />
+        </>
+      )}
       {sources.length > 0 && (
         <div className="small">
           <b>Sources:</b>{' '}
@@ -213,8 +250,13 @@ function ContextView({ records, sources }: { records: ContextRecord[]; sources: 
           ))}
         </div>
       ))}
-      {!live.length && <div className="muted small">Nothing recorded yet.</div>}
-      {!ro && (
+      {!live.length && <div className="muted small">Nothing recorded yet — imports, what matters and what to leave out appear here, each with its origin and status.</div>}
+      {!ro && !more && (
+        <button className="link small" onClick={() => setMore(true)}>
+          record something else (a fact, a decision, a hypothesis, a contradiction)…
+        </button>
+      )}
+      {!ro && more && (
         <div className="row wrap ctx-add">
           <select value={kind} onChange={(e) => setKind(e.target.value as RecordKind)}>
             {RECORD_KINDS.map((k) => (
@@ -247,8 +289,21 @@ type Companion = import('../api/client').Companion;
 function WatchingView({ watches, fileId }: { watches: Watch[]; fileId: string }) {
   const ro = readOnly();
   const [adding, setAdding] = useState(false);
-  const [def, setDef] = useState<Partial<WatchDef>>({ purpose: '', scope: '', formula: '', kind: 'threshold', op: '>', value: 0, sustain: 1, response: 'brief' });
+  const [def, setDef] = useState<Partial<WatchDef>>({ purpose: '', scope: '', formula: '', kind: 'worsening', bad: 'up', op: '>', value: 0, sustain: 2, response: 'brief' });
   const [explaining, setExplaining] = useState<string | null>(null);
+  const [suggestions, setSuggestions] = useState<Suggestion[] | null>(null);
+  const [details, setDetails] = useState<Record<string, boolean>>({});
+  const cellsVersion = useStore((s) => s.cellsVersion);
+  useEffect(() => {
+    let live = true;
+    api.files
+      .suggestions(fileId)
+      .then((sg) => live && setSuggestions(sg))
+      .catch(() => live && setSuggestions([]));
+    return () => {
+      live = false;
+    };
+  }, [fileId, watches.length, cellsVersion]);
   const explain = async (w: Watch, again = false) => {
     if (!w.issue) return;
     setExplaining(w.id);
@@ -263,25 +318,64 @@ function WatchingView({ watches, fileId }: { watches: Watch[]; fileId: string })
   };
   return (
     <div className="companion-section">
-      <div className="muted small">Each watch is a formula evaluated against the live document after every change and on a timer, with a threshold, a check that must stay TRUE, or a change detector. Reported only when the breach is sustained over the number of comparable observations you set; a moved threshold is recorded as your decision. Essential sources that are stale suspend the conclusion.</div>
+      {suggestions === null && <div className="muted small">Looking at the columns…</div>}
+      {suggestions && suggestions.length > 0 && !ro && (
+        <div className="suggestions">
+          <div className="brief-h">Suggested from the columns — one tap each</div>
+          {suggestions.map((sg) => (
+            <div key={sg.id} className="suggestion">
+              <div className="grow">
+                <div>{sg.purpose}</div>
+                <div className="muted small">{sg.why}</div>
+              </div>
+              <button className="small" onClick={() => void acceptSuggestion(sg)} title={`${sg.def.formula} — ${ruleWords(sg.def)}`}>
+                Watch this
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      {watches.length > 0 && <div className="brief-h">Watching</div>}
       {watches.map((w) => {
-        const last = w.observations[w.observations.length - 1];
+        const comparable = w.observations.filter((o) => o.def === w.defHash && !o.error);
+        const last = comparable[comparable.length - 1];
+        const before = comparable.length > 1 ? comparable[comparable.length - 2] : undefined;
+        const open = !!details[w.id];
         return (
           <div key={w.id} className={`watch-item ${w.health}`}>
             <div className="row">
               <b className="grow">{w.def.purpose}</b>
               <span className={`badge ${w.health === 'attention' ? 'amber' : w.health === 'ok' ? 'green' : ''}`}>{HEALTH_LABEL[w.health]}</span>
             </div>
-            <div className="muted small">
-              <code>{w.def.formula}</code>
-              {w.def.kind === 'threshold' ? ` ${w.def.op} ${fmtValue(w.def.value)}` : w.def.kind === 'check' ? ' must stay TRUE' : ' any change'}
-              {w.def.sustain > 1 ? ` · ${w.def.sustain} comparable observations` : ''}
-              {w.def.sources?.length ? ` · needs ${w.def.sources.join(', ')} fresh within ${w.def.freshnessHours} h` : ''}
-              {w.def.scope ? ` · scope: ${w.def.scope}` : ''}
+            <div className="small">
+              {last ? (
+                <>
+                  <b>{fmtValue(last.value)}</b>
+                  {last.period ? ` (${last.period})` : ''}
+                  {before ? ` · was ${fmtValue(before.value)}${before.period ? ` on ${before.period}` : ''}` : ' · first snapshot'}
+                </>
+              ) : (
+                'no observation yet'
+              )}
+              {w.observations[w.observations.length - 1]?.error ? ` · ${w.observations[w.observations.length - 1].error}` : ''}
             </div>
             <div className="muted small">
-              {last ? `last value ${last.error ? last.error : fmtValue(last.value)} (${ago(last.at)}) · ${w.observations.filter((o) => o.def === w.defHash).length} comparable observation${w.observations.filter((o) => o.def === w.defHash).length === 1 ? '' : 's'}` : 'no observation yet'} · {w.origin === 'agent' ? 'proposed by an agent' : `by ${w.by.name}`}
+              {ruleWords(w.def)}
+              {w.def.sustain > 1 && w.def.kind !== 'change' ? ` for ${w.def.sustain} snapshots` : ''}
+              {w.def.scope ? ` · ${w.def.scope}` : ''}
+              {' · '}
+              <button className="link small" onClick={() => setDetails({ ...details, [w.id]: !open })}>
+                {open ? 'hide details' : 'details'}
+              </button>
             </div>
+            {open && (
+              <div className="muted small">
+                <code>{w.def.formula}</code>
+                {w.def.sources?.length && w.def.freshnessHours ? ` · needs ${w.def.sources.join(', ')} fresh within ${w.def.freshnessHours} h` : ''}
+                {' · '}
+                {comparable.length} snapshot{comparable.length === 1 ? '' : 's'} compared · checked {ago(w.lastChecked)} · {w.origin === 'agent' ? 'proposed by an agent' : `by ${w.by.name}`}
+              </div>
+            )}
             {w.issue?.status === 'open' && (
               <div className="issue">
                 <div>
@@ -345,7 +439,7 @@ function WatchingView({ watches, fileId }: { watches: Watch[]; fileId: string })
           </div>
         );
       })}
-      {!watches.length && <div className="muted small">Nothing is being watched yet.</div>}
+      {!watches.length && (!suggestions || !suggestions.length) && <div className="muted small">Nothing is being watched yet. Import a sheet with a header row and the companion will suggest what to watch.</div>}
       {!ro &&
         (adding ? (
           <div className="watch-form">
@@ -354,10 +448,17 @@ function WatchingView({ watches, fileId }: { watches: Watch[]; fileId: string })
             <input placeholder="Scope and exclusions, in words" value={def.scope} onChange={(e) => setDef({ ...def, scope: e.target.value })} onKeyDown={(e) => e.stopPropagation()} />
             <div className="row wrap">
               <select value={def.kind} onChange={(e) => setDef({ ...def, kind: e.target.value as WatchDef['kind'] })}>
-                <option value="threshold">threshold</option>
-                <option value="check">check must stay TRUE</option>
-                <option value="change">any change</option>
+                <option value="worsening">tell me when it gets worse</option>
+                <option value="threshold">tell me when it passes a limit</option>
+                <option value="check">must stay TRUE</option>
+                <option value="change">tell me when it changes</option>
               </select>
+              {def.kind === 'worsening' && (
+                <select value={def.bad} onChange={(e) => setDef({ ...def, bad: e.target.value as 'up' | 'down' })}>
+                  <option value="up">worse = higher</option>
+                  <option value="down">worse = lower</option>
+                </select>
+              )}
               {def.kind === 'threshold' && (
                 <>
                   <select value={def.op} onChange={(e) => setDef({ ...def, op: e.target.value as WatchDef['op'] })}>
@@ -371,20 +472,9 @@ function WatchingView({ watches, fileId }: { watches: Watch[]; fileId: string })
                 </>
               )}
               <label className="small">
-                sustain{' '}
-                <input className="num" type="number" min={1} max={50} value={def.sustain} onChange={(e) => setDef({ ...def, sustain: Number(e.target.value) })} onKeyDown={(e) => e.stopPropagation()} title="consecutive comparable observations in breach before it is reported" />
-              </label>
-              <select value={def.response} onChange={(e) => setDef({ ...def, response: e.target.value as WatchDef['response'] })} title="what to do when it is breached">
-                <option value="brief">put it in the brief</option>
-                <option value="case">open a decision case</option>
-                <option value="note">note it quietly</option>
-              </select>
-            </div>
-            <div className="row wrap">
-              <input className="grow" placeholder="Essential sources (table names, comma-separated)" value={(def.sources ?? []).join(', ')} onChange={(e) => setDef({ ...def, sources: e.target.value.split(',').map((x) => x.trim()).filter(Boolean) })} onKeyDown={(e) => e.stopPropagation()} />
-              <label className="small">
-                fresh within{' '}
-                <input className="num" type="number" min={0} value={def.freshnessHours ?? ''} onChange={(e) => setDef({ ...def, freshnessHours: e.target.value ? Number(e.target.value) : undefined })} onKeyDown={(e) => e.stopPropagation()} /> h
+                after{' '}
+                <input className="num" type="number" min={1} max={50} value={def.sustain} onChange={(e) => setDef({ ...def, sustain: Number(e.target.value) })} onKeyDown={(e) => e.stopPropagation()} title="snapshots in a row before it is raised" />{' '}
+                snapshot{(def.sustain ?? 1) === 1 ? '' : 's'} in a row
               </label>
             </div>
             <div className="row">
@@ -401,7 +491,9 @@ function WatchingView({ watches, fileId }: { watches: Watch[]; fileId: string })
             </div>
           </div>
         ) : (
-          <button onClick={() => setAdding(true)}>Add a watch</button>
+          <button className="link small" onClick={() => setAdding(true)}>
+            write your own watch…
+          </button>
         ))}
     </div>
   );

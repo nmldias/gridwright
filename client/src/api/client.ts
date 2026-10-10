@@ -113,9 +113,10 @@ export interface WatchDef {
   scope: string;
   formula: string;
   table?: string;
-  kind: 'threshold' | 'check' | 'change';
+  kind: 'threshold' | 'check' | 'change' | 'worsening';
   op?: '>' | '>=' | '<' | '<=' | '=' | '!=';
   value?: number;
+  bad?: 'up' | 'down';
   sustain: number;
   response: 'note' | 'brief' | 'case';
   sources?: string[];
@@ -124,6 +125,7 @@ export interface WatchDef {
 export interface Observation {
   at: string;
   seq: number;
+  period?: string;
   value: number | boolean | string | null;
   error?: string;
   breach: boolean;
@@ -198,6 +200,12 @@ export interface GraphEdge {
   to: string;
   type: string;
   via: string;
+}
+export interface Suggestion {
+  id: string;
+  purpose: string;
+  why: string;
+  def: WatchDef;
 }
 export interface Companion {
   records: ContextRecord[];
@@ -318,6 +326,9 @@ export const api = {
     // the companion: context records, watches, issues, the brief and the graph
     async companion(id: string): Promise<Companion> {
       return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion`));
+    },
+    async suggestions(id: string): Promise<Suggestion[]> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/suggest`));
     },
     async companionSeen(id: string): Promise<void> {
       await fetch(`/api/files/${encodeURIComponent(id)}/companion/seen`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
