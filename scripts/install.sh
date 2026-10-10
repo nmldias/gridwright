@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-shot install of the prebuilt Gridwright release on a Linux host (arm64 or x86_64),
-# without root: installs Node 22 into ~/.local if the host has no Node ≥ 20, installs the
+# without root: installs Node 22 into ~/.local if the host has no Node ≥ 22.13, installs the
 # server dependencies, registers a systemd *user* service (survives reboots), a nightly
 # backup timer, and optionally fronts the server with `tailscale serve` (HTTPS + identity).
 #
@@ -83,17 +83,17 @@ die() { printf '\033[31mERROR\033[0m %s\n' "$*" >&2; exit 1; }
 [ -f server/engine/gridwright_core.js ] || echo "note: server/engine is missing, so the MCP server and proposals will be off (rebuild with scripts/build.sh or fetch a newer release)" >&2
 command -v curl >/dev/null 2>&1 || die "curl is required"
 
-# --- Node ≥ 20 ---------------------------------------------------------------------
-node_major() { "$1" -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0; }
+# --- Node ≥ 22.13 (node:sqlite, the companion's store, is unflagged from there) ----------------
+node_ok() { "$1" -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a>22||(a===22&&b>=13)?0:1)' 2>/dev/null; }
 NODE_BIN="$(command -v node 2>/dev/null || true)"
-if [ -z "$NODE_BIN" ] || [ "$(node_major "$NODE_BIN")" -lt 20 ]; then
+if [ -z "$NODE_BIN" ] || ! node_ok "$NODE_BIN"; then
   arch="$(uname -m)"
   case "$arch" in aarch64|arm64) na=arm64 ;; x86_64|amd64) na=x64 ;; *) die "unsupported CPU: $arch" ;; esac
   ver="$(curl -fsSL --max-time 30 https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt 2>/dev/null | grep -o "node-v22[0-9.]*-linux-$na.tar.xz" | head -1 | sed -E 's/node-(v[0-9.]+)-.*/\1/')"
   ver="${ver:-$NODE_FALLBACK}"
   dest="$HOME/.local/node-$ver"
   if [ ! -x "$dest/bin/node" ]; then
-    say "no Node ≥ 20 on this host; installing Node $ver ($na) into $dest"
+    say "no Node ≥ 22.13 on this host; installing Node $ver ($na) into $dest"
     mkdir -p "$HOME/.local"
     tmp="$(mktemp -d)"
     curl -fsSL --max-time 600 "https://nodejs.org/dist/$ver/node-$ver-linux-$na.tar.xz" -o "$tmp/node.tar.xz"

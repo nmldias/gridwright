@@ -181,24 +181,31 @@ def main():
             rest("PUT", "/api/ai/settings", {"baseUrl": MOCK, "model": "mock"})
             srv.stop()
             srv.start(crash_at="investigation:dispatched")
-            died = False
-            try:
-                rest("POST", f"/api/files/{fid}/companion/investigate", {"question": "Investigate slowly whether the ageing is concentrated in one model"}, timeout=30)
-            except Exception:
-                died = True
+            queued = rest("POST", f"/api/files/{fid}/companion/investigate", {"question": "Investigate slowly whether the ageing is concentrated in one model"}, timeout=30)
             code = srv.wait_dead()
-            check("C. dispatching an investigation reaches the crash point: the record is saved, the process started, the server is gone", died and code is not None, f"died={died} code={code}")
+            check("C. an investigation is a job: the record and the job are saved at once, the worker claims it and starts the process — the crash point there takes the server down", queued.get("job") and code is not None, f"job={queued.get('job')} code={code}")
             srv.start()
             comp = rest("GET", f"/api/files/{fid}/companion")
             inv = comp["investigations"][-1] if comp.get("investigations") else None
-            check("   after the restart the investigation is interrupted, not running for ever: said in the activity, nothing it proposed is current", inv is not None and inv["status"] == "failed" and str(inv.get("error", "")).startswith("interrupted") and any(e["text"].startswith("Investigation interrupted") for e in comp["events"]), f"{inv and inv['status']} {inv and inv.get('error')}")
+            jobs = rest("GET", f"/api/files/{fid}/jobs")["jobs"]
+            job = next((j for j in jobs if j["id"] == queued["job"]), None)
+            check("   after the restart the investigation is interrupted, not running for ever: said in the activity, nothing it proposed is current; the job says the same", inv is not None and inv["status"] == "failed" and str(inv.get("error", "")).startswith("interrupted") and any(e["text"].startswith("Investigation interrupted") for e in comp["events"]) and job is not None and job["status"] == "interrupted" and str(job.get("error", "")).startswith("interrupted"), f"{inv and inv['status']} {inv and inv.get('error')} job={job and job['status']}")
             started = rest("POST", f"/api/files/{fid}/companion/investigate", {"question": "Is the ageing concentrated in one model?"})
             for _ in range(120):
                 cur = rest("GET", f"/api/files/{fid}/companion/investigations/{started['id']}")
                 if cur["status"] != "running":
                     break
                 time.sleep(1)
-            check("   a new investigation starts at once and completes on the durable thread", cur["status"] == "done" and cur.get("answer", "").startswith("Findings:"), f"{cur['status']} {cur.get('error')}")
+            job2 = rest("GET", f"/api/files/{fid}/jobs/{started['job']}")
+            check("   a new investigation starts at once and completes on the durable thread; its job is done with the investigation as its result", cur["status"] == "done" and cur.get("answer", "").startswith("Findings:") and job2["status"] == "done" and job2["attempts"] == 1 and job2.get("result", {}).get("ref") == started["id"], f"{cur['status']} {cur.get('error')} job={job2['status']} attempts={job2['attempts']}")
+            # a queued job stopped before it runs, and the worker's own crash point: a job claimed, the server gone, the job interrupted
+            srv.stop()
+            srv.start(crash_at="job:claimed")
+            q = rest("POST", f"/api/files/{fid}/companion/investigate", {"question": "Investigate the reserved vehicles"}, timeout=30)
+            code = srv.wait_dead()
+            srv.start()
+            job3 = rest("GET", f"/api/files/{fid}/jobs/{q['job']}")
+            check("   a job claimed by the worker when the process dies is interrupted at the next start, never left running", code is not None and job3["status"] == "interrupted", f"code={code} job={job3['status']}")
         else:
             print(f"SKIP C. investigation dispatch recovery ({'no --mock-llm' if not MOCK else stack.get('reason')})")
     finally:

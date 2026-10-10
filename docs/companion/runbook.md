@@ -113,6 +113,6 @@ Fixtures: `e2e/fixtures/vehicles/` (synthetic; expected figures in `expected.jso
 
 ## 8. Prerequisites and tested platforms
 
-- Node ≥ 20 (22 used); Python ≥ 3.10 with the lock file (3.13 in the development container, 3.12 in CI); bubblewrap and, on Ubuntu ≥ 23.10, the installer's AppArmor profile for the strongest sandbox; an OpenAI-compatible model endpoint for *Ask* and investigations (optional — everything deterministic works without one).
+- Node ≥ 22.13 (node:sqlite for the store; 22.22 used here); Python ≥ 3.10 with the lock file (3.13 in the development container, 3.12 in CI); bubblewrap and, on Ubuntu ≥ 23.10, the installer's AppArmor profile for the strongest sandbox; an OpenAI-compatible model endpoint for *Ask* and investigations (optional — everything deterministic works without one).
 - Tested in this pass: Linux x86_64 (the development container, all suites; CI on `ubuntu-latest`). Spark 1 (arm64, DGX OS) ran 0.9.0 with the stack confirmed by `/api/investigation`; 0.10.0 has not been deployed there — see the report.
 - PostgreSQL / MariaDB / SQL Server are only needed for the SQL suites and for SQL snapshots.

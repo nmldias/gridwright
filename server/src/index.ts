@@ -10,6 +10,9 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { brief as companionBrief, interruptRunningInvestigations, setCompanionNotifier, startCompanion } from './companion.js';
 import { probeStack, setInvestigationNotifier, stackStatus } from './investigate.js';
+import { onJobChange, reconcileAfterRestart, startWorker, workerStatus } from './jobs.js';
+import { openStore } from './store.js';
+import { CONTRACT_VERSION } from './contracts.js';
 import { registerCompanionRoutes } from './routes/companion.js';
 import { registerConnectionRoutes } from './routes/connections.js';
 import { registerDocumentRoutes } from './routes/documents.js';
@@ -18,7 +21,7 @@ import { registerInvestigationRoutes } from './routes/investigation.js';
 import { registerPythonRoutes } from './routes/python.js';
 import { requireRole } from './routes/common.js';
 import { identityEnabled, identityOf } from './identity.js';
-import { attachMultiplayer, notifyCompanion, notifyProposal as notifyProposalRoom } from './multiplayer.js';
+import { attachMultiplayer, notifyCompanion, notifyJob, notifyProposal as notifyProposalRoom } from './multiplayer.js';
 import { handleMcp, setProposalNotifier } from './mcp.js';
 import { engineAvailable } from './headless.js';
 import { probePython, pythonStatus } from './pyrun.js';
@@ -75,7 +78,7 @@ const publicPython = (req: Request) => {
   return p.available ? { version: p.version, sandbox: p.sandbox, gpu: p.gpu, timeoutMs: p.limits.timeoutMs, memoryMb: p.limits.memoryMb, can: { run: canRunPython(who), gpu: canUseGpu(who) } } : null;
 };
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, version: VERSION, multiplayer: true, pyodide: !!pyodideDir(), identity: identityEnabled, token: !!TOKEN, tools: true, defaultSharing: DEFAULT_SHARING, mcp: engineAvailable(), python: publicPython(req), investigation: stackStatus().available });
+  res.json({ ok: true, version: VERSION, contract: CONTRACT_VERSION, multiplayer: true, pyodide: !!pyodideDir(), identity: identityEnabled, token: !!TOKEN, tools: true, defaultSharing: DEFAULT_SHARING, mcp: engineAvailable(), python: publicPython(req), investigation: stackStatus().available, worker: workerStatus() });
 });
 
 // --- routes: ./routes/*; the rules they call live in the services ---------------------------------
@@ -92,10 +95,16 @@ setProposalNotifier((doc, p) => notifyProposalRoom(doc, p));
 setCompanionNotifier((doc, payload) => notifyCompanion(doc, payload));
 setInvestigationNotifier((doc) => notifyCompanion(doc, { attention: companionBrief(doc).health.attention }));
 startCompanion(Number(process.env.GRIDWRIGHT_COMPANION_INTERVAL_MS ?? 600_000));
+// the store (jobs, sources, recipes, dataset versions) and the worker: what the previous process left running is
+// interrupted before anything new is claimed
+await openStore();
 {
+  const jobs = reconcileAfterRestart('the server restarted while it ran');
   const interrupted = interruptRunningInvestigations('the server restarted while it ran');
-  if (interrupted) console.log(`investigations interrupted by the restart: ${interrupted} (marked, their proposals set aside)`);
+  if (jobs.length || interrupted) console.log(`interrupted by the restart: ${jobs.length} job${jobs.length === 1 ? '' : 's'}, ${interrupted} investigation${interrupted === 1 ? '' : 's'} (marked; nothing they proposed is current)`);
 }
+onJobChange((job) => notifyJob(job.doc, { id: job.id, type: job.type, status: job.status, error: job.error }));
+startWorker();
 void probeStack().then((st) => console.log(st.available ? `investigation stack: ${st.python} (${Object.entries(st.versions ?? {}).map(([k, v]) => `${k} ${v}`).join(', ')})` : `investigation stack off: ${st.reason}`));
 app.all('/mcp', (req, res) => void handleMcp(req, res));
 

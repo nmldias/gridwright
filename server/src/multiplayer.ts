@@ -193,6 +193,14 @@ export function notifyCompanion(file: string, payload: { attention: number }) {
   for (const p of room.values()) if (p.ws.readyState === WebSocket.OPEN) p.ws.send(msg);
 }
 
+/** A job of the document changed state (queued, running, done, failed, stopped, superseded, interrupted). */
+export function notifyJob(file: string, payload: { id: string; type: string; status: string; error?: string }) {
+  const room = rooms.get(file);
+  if (!room) return;
+  const msg = JSON.stringify({ type: 'job', file, job: payload });
+  for (const p of room.values()) if (p.ws.readyState === WebSocket.OPEN) p.ws.send(msg);
+}
+
 export function notifySaved(file: string, byClient?: string) {
   const room = rooms.get(file);
   if (!room) return;

@@ -23,13 +23,13 @@ export function recordRun(doc: string, by: Author, run: Omit<CodeRun, 'id' | 'at
   return r;
 }
 
-export function startInvestigation(doc: string, by: Author, input: { question: string; issue?: string; thread?: string }): Investigation {
+export function startInvestigation(doc: string, by: Author, input: { question: string; issue?: string; thread?: string; job?: string }): Investigation {
   const s = loadState(doc);
   const running = s.investigations!.find((i) => i.status === 'running' && Date.now() - Date.parse(i.startedAt) < 15 * 60_000);
   if (running) throw new Error('an investigation is already running on this document');
   const question = String(input.question ?? '').trim().slice(0, 2000);
   if (!question) throw new Error('question required');
-  const inv: Investigation = { id: newId(), question, issue: input.issue && safeId(input.issue) ? input.issue : undefined, thread: input.thread && /^[a-zA-Z0-9:_-]{1,80}$/.test(input.thread) ? input.thread : `doc:${doc}`, startedAt: now(), status: 'running', steps: [], runs: [], records: [], proposals: [], by, assumptionsSeq: s.assumptionsSeq ?? 0 };
+  const inv: Investigation = { id: newId(), question, issue: input.issue && safeId(input.issue) ? input.issue : undefined, thread: input.thread && /^[a-zA-Z0-9:_-]{1,80}$/.test(input.thread) ? input.thread : `doc:${doc}`, startedAt: now(), status: 'running', steps: [], runs: [], records: [], proposals: [], by, assumptionsSeq: s.assumptionsSeq ?? 0, job: input.job };
   s.investigations!.push(inv);
   event(s, { kind: 'investigation', text: `Investigating: ${short(question, 120)}`, by: who(by), level: 'quiet' });
   saveState(s);
@@ -115,6 +115,16 @@ export function interruptRunningInvestigations(reason: string): number {
     saveState(s);
   }
   return n;
+}
+
+/** The job an investigation runs on, once known. */
+export function setInvestigationJob(doc: string, id: string, job: string) {
+  const s = loadState(doc);
+  const inv = s.investigations!.find((i) => i.id === id);
+  if (inv && inv.job !== job) {
+    inv.job = job;
+    saveState(s);
+  }
 }
 
 export function getInvestigation(doc: string, id: string): Investigation | null {

@@ -247,6 +247,8 @@ export interface Investigation {
   /** the assumptions it was made under: a later change makes it provisional */
   assumptionsSeq: number;
   stale?: boolean;
+  /** the job that runs it (status, attempt, limit, cancellation live there) */
+  job?: string;
 }
 
 export interface CompanionState {
@@ -392,6 +394,11 @@ export function bumpAssumptions(s: CompanionState, r: ContextRecord, how: 'added
   event(s, { kind: 'assumption', text: `Assumption ${how}: ${r.kind} “${short(r.text, 100)}” — ${had ? `${had} earlier investigation${had === 1 ? ' is' : 's are'} now provisional; ` : ''}conclusions reached before it are provisional until re-checked`, by: who(by), level: 'watch' });
 }
 
+let fenceHook: ((doc: string, why: string) => void) | null = null;
+/** Called whenever a document's running work is fenced (jobs.ts supersedes the document's jobs). */
+export function setFenceHook(fn: typeof fenceHook) {
+  fenceHook = fn;
+}
 /** A running investigation under a direction that just changed: its result, when it comes, is superseded — kept as history, never current. */
 export function fenceRunning(s: CompanionState, why: string) {
   for (const i of s.investigations ?? []) {
@@ -399,6 +406,11 @@ export function fenceRunning(s: CompanionState, why: string) {
       i.superseded = now();
       event(s, { kind: 'investigation', text: `The investigation “${short(i.question, 80)}” was overtaken (${why}): whatever it finds is kept as history, not applied`, level: 'quiet' });
     }
+  }
+  try {
+    fenceHook?.(s.doc, why);
+  } catch (e) {
+    console.error('fence hook failed:', (e as Error).message);
   }
 }
 

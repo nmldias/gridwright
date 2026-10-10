@@ -8,6 +8,8 @@ import { InvestigateSchema, RunRequestSchema } from '../contracts.js';
 import { canRunPython } from '../execpolicy.js';
 import { identityOf } from '../identity.js';
 import { cancelInvestigation, probeStack, runCodeForDocument, stackStatus, startInvestigationProcess } from '../investigate.js';
+import { cancelJob, getJob, listJobs, workerStatus } from '../jobs.js';
+import type { JobStatus } from '../store.js';
 import { notifyCompanion } from '../multiplayer.js';
 import { authorOf, body, docPermission, fail, noAgent, requireRole } from './common.js';
 
@@ -58,5 +60,32 @@ export function registerInvestigationRoutes(app: Express, ctx: { token: string; 
     const inv = getInvestigation(req.params.id, req.params.iid);
     if (!inv) return res.status(404).json({ error: 'not found' });
     res.json(inv);
+  });
+  // jobs: every piece of background work on a document — identity, input versions, status, attempt, limit, result reference
+  app.get('/api/files/:id/jobs', (req, res) => {
+    if (!docPermission(req, res, 'view')) return;
+    const status = typeof req.query.status === 'string' ? (req.query.status.split(',').filter(Boolean) as JobStatus[]) : undefined;
+    res.json({ worker: workerStatus(), jobs: listJobs({ doc: req.params.id, status, limit: Number(req.query.limit ?? 50) }) });
+  });
+  app.get('/api/files/:id/jobs/:jid', (req, res) => {
+    if (!docPermission(req, res, 'view')) return;
+    const job = getJob(req.params.jid);
+    if (!job || job.doc !== req.params.id) return res.status(404).json({ error: 'not found' });
+    res.json(job);
+  });
+  app.post('/api/files/:id/jobs/:jid/cancel', requireRole('editor'), (req, res) => {
+    if (!docPermission(req, res, 'view') || !noAgent(req, res)) return;
+    const job = getJob(req.params.jid);
+    if (!job || job.doc !== req.params.id) return res.status(404).json({ error: 'not found' });
+    // an investigation's record is stopped through its own path so that its proposals are set aside
+    if (job.type === 'investigation' && typeof job.input.investigation === 'string') {
+      try {
+        cancelInvestigation(req.params.id, job.input.investigation, authorOf(req));
+      } catch (e) {
+        return fail(res, e);
+      }
+    } else cancelJob(job.id, authorOf(req));
+    notifyCompanion(req.params.id, { attention: companionBrief(req.params.id).health.attention });
+    res.json(getJob(job.id));
   });
 }

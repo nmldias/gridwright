@@ -10,13 +10,17 @@ import { execFile, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { finishInvestigation, recordRun, requestCancel, startInvestigation, type Investigation } from './companion.js';
+import { finishInvestigation, recordRun, requestCancel, setFenceHook, setInvestigationJob, startInvestigation, type Investigation } from './companion.js';
 import { fnv } from './evidence.js';
 import { openDocument, snapshotOf } from './headless.js';
 import { issueAgentToken, revokeAgentToken, type Identity } from './identity.js';
 import { runPython } from './pyrun.js';
 import { crashPoint, DATA_DIR, decrypt, readAiConfig } from './storage.js';
 import type { Author } from './history.js';
+import { cancelJob, enqueue, kick, listJobs, registerRunner, supersedeJobsOf, type JobOutcome } from './jobs.js';
+
+// a change of direction fences the document's running jobs along with its investigations
+setFenceHook((doc, why) => supersedeJobsOf(doc, why));
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SCRIPT = [join(here, '../../integrations/companion/investigate.py'), join(here, '../integrations/companion/investigate.py'), process.env.GRIDWRIGHT_INVESTIGATE_SCRIPT ?? ''].find((p) => p && existsSync(p)) ?? join(here, '../../integrations/companion/investigate.py');
@@ -104,83 +108,120 @@ export function setInvestigationNotifier(fn: typeof notifyDone) {
   notifyDone = fn;
 }
 
-const running = new Map<string, import('node:child_process').ChildProcess>();
-/** Stop a running investigation: the record is marked, the process is told to stop (then killed), its late result is fenced. */
+/** Stop a running investigation: the record is marked, its job is told to stop (the process is killed), its late result is fenced. */
 export function cancelInvestigation(doc: string, id: string, by: Author): Investigation {
   const inv = requestCancel(doc, id, by);
-  const child = running.get(id);
-  if (child) {
-    try {
-      child.kill('SIGTERM');
-      setTimeout(() => {
-        try {
-          child.kill('SIGKILL');
-        } catch {
-          /* gone */
-        }
-      }, 5000).unref();
-    } catch {
-      /* gone */
-    }
+  for (const job of listJobs({ doc, type: 'investigation', status: ['queued', 'running'] })) {
+    if (job.input.investigation === id) cancelJob(job.id, by);
   }
   return inv;
 }
 
+let serverConfig: { serverToken: string } = { serverToken: '' };
+
 /**
- * Start a bounded investigation as a separate process. It gets: the base URL (loopback), a
- * short-lived agent token for the requesting identity, the model endpoint the server is
- * configured with, and a durable thread store under the data directory. It returns at once; the
- * result lands on the investigation record when the process ends.
+ * Start a bounded investigation: the record is made at once and a job queued for the worker, which
+ * runs the stack as a separate process. The process gets: the base URL (loopback), a short-lived
+ * agent token for the requesting identity, the model endpoint the server is configured with, and
+ * a durable thread store under the data directory. The result lands on the investigation record
+ * when the process ends; the job carries the mechanics (attempt, cancellation, time limit, status).
  */
 export function startInvestigationProcess(fileId: string, who: Identity, by: Author, input: { question: string; issue?: string; thread?: string }, base: string, serverToken: string): Investigation {
-  const inv = startInvestigation(fileId, by, input);
   const st = stack;
-  if (!st.available) {
-    finishInvestigation(fileId, inv.id, { status: 'failed', error: `the investigation stack is not available: ${st.reason ?? 'not probed'}` });
-    throw new Error(`the investigation stack is not available: ${st.reason ?? 'not probed'}`);
-  }
-  const cfg = readAiConfig();
-  const apiKey = cfg.apiKeyEnc ? decrypt(cfg.apiKeyEnc) : process.env.AI_API_KEY ?? '';
-  const token = issueAgentToken(who, `investigation ${inv.id}`, TIMEOUT_MS + 60_000);
-  const env: NodeJS.ProcessEnv = {
-    PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',
-    LANG: 'C.UTF-8',
-    HOME: process.env.HOME ?? '/tmp',
-    GRIDWRIGHT_BASE: base,
-    GRIDWRIGHT_AGENT_TOKEN: token,
-    GRIDWRIGHT_TOKEN: serverToken,
-    GRIDWRIGHT_THREADS_DB: join(DATA_DIR, 'companion', 'threads.sqlite'),
-    OPENAI_BASE_URL: cfg.baseUrl,
-    OPENAI_API_KEY: apiKey || 'none',
-    GRIDWRIGHT_MODEL: cfg.model,
-  };
-  const args = ['-E', SCRIPT, fileId, '--investigation', inv.id, '--thread', inv.thread, '--question', inv.question, '--json'];
-  if (inv.issue) args.push('--issue', inv.issue);
-  const child = spawn(st.python, args, { env, stdio: ['ignore', 'pipe', 'pipe'], cwd: resolve(dirname(SCRIPT)) });
-  running.set(inv.id, child);
-  crashPoint('investigation:dispatched');
-  let out = '';
-  let err = '';
-  child.stdout.on('data', (b: Buffer) => {
-    if (out.length < 2_000_000) out += b.toString('utf8');
-  });
-  child.stderr.on('data', (b: Buffer) => {
-    if (err.length < 200_000) err += b.toString('utf8');
-  });
-  const timer = setTimeout(() => child.kill('SIGKILL'), TIMEOUT_MS);
-  child.on('close', (code) => {
-    clearTimeout(timer);
-    running.delete(inv.id);
-    revokeAgentToken(token);
-    try {
-      const line = out.trim().split('\n').filter((l) => l.startsWith('{')).pop();
-      const result = line ? (JSON.parse(line) as { answer?: string; model?: string; steps?: { tool: string; summary: string }[]; records?: string[]; proposals?: string[]; error?: string }) : null;
-      if (code === 0 && result && !result.error) finishInvestigation(fileId, inv.id, { status: 'done', answer: result.answer, model: result.model, steps: result.steps, records: result.records, proposals: result.proposals });
-      else finishInvestigation(fileId, inv.id, { status: 'failed', error: result?.error ?? (err.trim().split('\n').filter(Boolean).slice(-1)[0] || `the investigation process exited with ${code}`), steps: result?.steps, records: result?.records, proposals: result?.proposals });
-    } catch (e) {
-      finishInvestigation(fileId, inv.id, { status: 'failed', error: (e as Error).message });
-    }
-    notifyDone?.(fileId);
-  });
-  return inv;
+  if (!st.available) throw new Error(`the investigation stack is not available: ${st.reason ?? 'not probed'}`);
+  const inv = startInvestigation(fileId, by, input);
+  serverConfig = { serverToken };
+  const job = enqueue({ type: 'investigation', doc: fileId, by, maxAttempts: 1, timeoutMs: TIMEOUT_MS, input: { investigation: inv.id, question: inv.question, thread: inv.thread, issue: inv.issue, base, who: { login: who.login, name: who.name, role: who.role }, assumptionsSeq: inv.assumptionsSeq } });
+  setInvestigationJob(fileId, inv.id, job.id);
+  kick();
+  return { ...inv, job: job.id };
 }
+
+/** The job runner: one investigation process, acting for the person who asked, bounded by the job's limit. */
+registerRunner('investigation', (ctl) =>
+  new Promise<JobOutcome>((done) => {
+    const { job } = ctl;
+    const fileId = job.doc;
+    const invId = String(job.input.investigation ?? '');
+    const st = stack;
+    if (!st.available) {
+      finishInvestigation(fileId, invId, { status: 'failed', error: `the investigation stack is not available: ${st.reason ?? 'not probed'}` });
+      notifyDone?.(fileId);
+      return done({ status: 'failed', error: `the investigation stack is not available: ${st.reason ?? 'not probed'}` });
+    }
+    const whoIn = (job.input.who ?? {}) as { login?: string; name?: string; role?: string };
+    const who: Identity = { login: whoIn.login ?? '', name: whoIn.name ?? '', role: (whoIn.role as Identity['role']) ?? 'editor' };
+    const cfg = readAiConfig();
+    const apiKey = cfg.apiKeyEnc ? decrypt(cfg.apiKeyEnc) : process.env.AI_API_KEY ?? '';
+    const token = issueAgentToken(who, `investigation ${invId}`, job.limits.timeoutMs + 60_000);
+    const env: NodeJS.ProcessEnv = {
+      PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',
+      LANG: 'C.UTF-8',
+      HOME: process.env.HOME ?? '/tmp',
+      GRIDWRIGHT_BASE: String(job.input.base ?? ''),
+      GRIDWRIGHT_AGENT_TOKEN: token,
+      GRIDWRIGHT_TOKEN: serverConfig.serverToken,
+      GRIDWRIGHT_THREADS_DB: join(DATA_DIR, 'companion', 'threads.sqlite'),
+      OPENAI_BASE_URL: cfg.baseUrl,
+      OPENAI_API_KEY: apiKey || 'none',
+      GRIDWRIGHT_MODEL: cfg.model,
+    };
+    const args = ['-E', SCRIPT, fileId, '--investigation', invId, '--thread', String(job.input.thread ?? `doc:${fileId}`), '--question', String(job.input.question ?? ''), '--json'];
+    if (job.input.issue) args.push('--issue', String(job.input.issue));
+    const child = spawn(st.python, args, { env, stdio: ['ignore', 'pipe', 'pipe'], cwd: resolve(dirname(SCRIPT)) });
+    crashPoint('investigation:dispatched');
+    ctl.onCancel(() => {
+      try {
+        child.kill('SIGTERM');
+        setTimeout(() => {
+          try {
+            child.kill('SIGKILL');
+          } catch {
+            /* gone */
+          }
+        }, 5000).unref();
+      } catch {
+        /* gone */
+      }
+    });
+    const beat = setInterval(() => ctl.heartbeat(), 15_000);
+    beat.unref();
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (b: Buffer) => {
+      if (out.length < 2_000_000) out += b.toString('utf8');
+    });
+    child.stderr.on('data', (b: Buffer) => {
+      if (err.length < 200_000) err += b.toString('utf8');
+    });
+    child.on('error', (e) => {
+      clearInterval(beat);
+      revokeAgentToken(token);
+      finishInvestigation(fileId, invId, { status: 'failed', error: e.message });
+      notifyDone?.(fileId);
+      done({ status: 'failed', error: e.message });
+    });
+    child.on('close', (code) => {
+      clearInterval(beat);
+      revokeAgentToken(token);
+      let outcome: JobOutcome;
+      try {
+        const line = out.trim().split('\n').filter((l) => l.startsWith('{')).pop();
+        const result = line ? (JSON.parse(line) as { answer?: string; model?: string; steps?: { tool: string; summary: string }[]; records?: string[]; proposals?: string[]; error?: string }) : null;
+        if (code === 0 && result && !result.error) {
+          const inv = finishInvestigation(fileId, invId, { status: 'done', answer: result.answer, model: result.model, steps: result.steps, records: result.records, proposals: result.proposals });
+          outcome = { status: 'done', result: { ref: invId, summary: `${inv.status}: ${(result.answer ?? '').slice(0, 160)}` } };
+        } else {
+          const error = result?.error ?? (err.trim().split('\n').filter(Boolean).slice(-1)[0] || `the investigation process exited with ${code}`);
+          finishInvestigation(fileId, invId, { status: 'failed', error, steps: result?.steps, records: result?.records, proposals: result?.proposals });
+          outcome = { status: 'failed', error, result: { ref: invId } };
+        }
+      } catch (e) {
+        finishInvestigation(fileId, invId, { status: 'failed', error: (e as Error).message });
+        outcome = { status: 'failed', error: (e as Error).message, result: { ref: invId } };
+      }
+      notifyDone?.(fileId);
+      done(outcome);
+    });
+  }),
+);

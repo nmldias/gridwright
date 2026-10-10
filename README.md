@@ -82,7 +82,7 @@ curl -fsSL https://github.com/nmldias/gridwright/archive/refs/heads/release.tar.
   && cd gridwright-release && scripts/install.sh
 ```
 
-The `release` branch carries the prebuilt engine, client and server, so only Node ≥ 20 is needed (the installer fetches Node 22 into `~/.local` if the host has none). It registers a systemd *user* service `gridwright` (restarts on failure, starts at boot once linger is enabled), a nightly backup timer, and prints the URL. Options:
+The `release` branch carries the prebuilt engine, client and server, so only Node ≥ 22.13 is needed (the installer fetches Node 22 into `~/.local` if the host has none that recent; the companion's store uses Node's own SQLite). It registers a systemd *user* service `gridwright` (restarts on failure, starts at boot once linger is enabled), a nightly backup timer, and prints the URL. Options:
 
 ```bash
 scripts/install.sh --tailscale   # HTTPS on the tailnet via `tailscale serve`, identity + roles from Tailscale
@@ -105,7 +105,7 @@ Documents, history, connections and settings live in `./data`; put a Pyodide dis
 
 ### From source
 
-Requirements: Rust (rustup), Node 22. `scripts/build.sh` builds the wasm engine, the client and the server; `cd server && npm start`. Development with hot reload: `scripts/dev.sh`.
+Requirements: Rust (rustup), Node ≥ 22.13. `scripts/build.sh` builds the wasm engine, the client and the server; `cd server && npm start`. Development with hot reload: `scripts/dev.sh`.
 
 ### Configuration (environment)
 
