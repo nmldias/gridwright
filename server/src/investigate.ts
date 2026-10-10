@@ -8,14 +8,13 @@
 
 import { execFile, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { finishInvestigation, recordRun, requestCancel, setFenceHook, setInvestigationJob, startInvestigation, type Investigation } from './companion.js';
 import { fnv } from './evidence.js';
 import { openDocument, snapshotOf } from './headless.js';
 import { identityForLogin, issueAgentToken, revokeAgentToken, type Identity } from './identity.js';
-import { runAsAgentCell, runPython, type RunResult, type Snapshot } from './pyrun.js';
+import { hiddenDirs, runAsAgentCell, runPython, type RunResult, type Snapshot } from './pyrun.js';
 import { aiKeyOf, crashPoint, DATA_DIR, readAiConfig } from './storage.js';
 import { tenantOfDoc } from './access.js';
 import { ACCOUNTS } from './tenancy.js';
@@ -92,7 +91,7 @@ export async function runCodeForDocument(fileId: string, by: Author, req: RunReq
   } finally {
     book.free();
   }
-  const r = await runPython(code, snapshot, false);
+  const r = await runPython(code, snapshot, false, tenantOfDoc(fileId));
   const sandbox = String(r.runtime?.packages?.sandbox ?? 'none');
   let output: string | undefined;
   if (r.ok && r.output !== undefined && r.output !== null) {
@@ -145,7 +144,8 @@ function probeStackPaths(py: string): Promise<{ executable: string; sites: strin
     }),
   );
 }
-const HIDDEN_ROOTS = () => [resolve(DATA_DIR), '/root', '/home', homedir()];
+// the very directories the cell sandbox hides: site-packages under any of them must be re-exposed
+const HIDDEN_ROOTS = () => hiddenDirs();
 const under = (p: string, roots: string[]) => roots.some((r) => p === r || p.startsWith(r.endsWith('/') ? r : `${r}/`));
 
 /** The document's own working directory for agent cells (their LangGraph threads); deleted with the document. */
@@ -181,6 +181,7 @@ export async function runAgentCell(fileId: string, who: Identity, by: Author, co
       expose: [resolve(dirname(SCRIPT)), ...sites],
       pythonPath: sites,
       env: { GRIDWRIGHT_DOC: fileId, GRIDWRIGHT_AGENT_TOKEN: token, GRIDWRIGHT_MODEL: cfg.model, GRIDWRIGHT_COMPANION_DIR: resolve(dirname(SCRIPT)) },
+      tenant: tenantOfDoc(fileId),
     }, CELL_TIMEOUT_MS);
     let output: string | undefined;
     if (r.ok && r.output !== undefined && r.output !== null) {

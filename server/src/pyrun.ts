@@ -6,7 +6,7 @@
 // run record so an auditor can see what protected the host.
 
 import { spawn, execFile, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { cpus, freemem, homedir, tmpdir, totalmem } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -65,6 +65,20 @@ try {
   /* reported when a run fails */
 }
 const CACHE_IN_SANDBOX = '/tmp/gw-cache';
+/**
+ * Each client has its own cache directory: a cache is writable by the code that runs, so a shared
+ * one would be a channel between clients (and numba keeps pickled kernels — a poisoning risk).
+ */
+function cacheDirFor(tenant: string): string {
+  const safe = (tenant || 'default').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64) || 'default';
+  const dir = join(CACHE_DIR, safe);
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+  } catch {
+    /* reported when a run fails */
+  }
+  return dir;
+}
 const cacheEnv = (base: string): Record<string, string> => ({ MPLCONFIGDIR: join(base, 'mpl'), NUMBA_CACHE_DIR: join(base, 'numba'), CUPY_CACHE_DIR: join(base, 'cupy'), XDG_CACHE_HOME: join(base, 'xdg') });
 const RUNNER = [join(here, '../runner/gridwright_runner.py'), join(here, '../../runner/gridwright_runner.py')].find((p) => existsSync(p)) ?? join(here, '../runner/gridwright_runner.py');
 const MARKER = '\n__GRIDWRIGHT_RESULT__\n';
@@ -109,15 +123,28 @@ async function interpreter(): Promise<string | null> {
   return (await which('python3')) ?? (await which('python'));
 }
 
-/** Directories hidden from sandboxed code (secrets, documents, other people's files). */
-function hiddenDirs(): string[] {
-  const out = new Set<string>([resolve(DATA_DIR), '/root', '/home']);
+/**
+ * Directories hidden from sandboxed code: secrets, documents and other people's files, and every
+ * tree where the host keeps Unix sockets (Docker, systemd, D-Bus, LXD, snapd, GnuPG agents…). An
+ * unshared network namespace does not stop a connect() to a socket *file*, so those trees must not
+ * be visible at all. Paths are resolved, so a symlink (/var/run -> /run) is hidden at its target.
+ */
+export function hiddenDirs(): string[] {
+  const wanted = [resolve(DATA_DIR), '/root', '/home', '/run', '/var', '/mnt', '/media', '/srv'];
   try {
-    out.add(homedir());
+    wanted.push(homedir());
   } catch {
     /* no home */
   }
-  return Array.from(out).filter((d) => existsSync(d));
+  const out = new Set<string>();
+  for (const d of wanted) {
+    try {
+      if (existsSync(d)) out.add(realpathSync(d));
+    } catch {
+      /* unreadable: nothing to hide */
+    }
+  }
+  return Array.from(out);
 }
 
 function nvidiaDevices(): string[] {
@@ -131,7 +158,7 @@ function nvidiaDevices(): string[] {
 }
 
 /** argv that runs the runner script under the given sandbox (`serve` = warm host mode). */
-export function wrap(sandbox: Sandbox, py: string, gpu: boolean, serve = false): string[] {
+export function wrap(sandbox: Sandbox, py: string, gpu: boolean, serve = false, tenant = 'default'): string[] {
   const script = RUNNER;
   const tail = serve ? [py, script, '--serve'] : [py, script];
   if (sandbox === 'bwrap') {
@@ -141,8 +168,8 @@ export function wrap(sandbox: Sandbox, py: string, gpu: boolean, serve = false):
     const expose = new Set<string>([dirname(script), resolve(dirname(dirname(py)))]);
     for (const dir of expose) if (existsSync(dir)) args.push('--ro-bind', dir, dir);
     if (gpu) for (const dev of nvidiaDevices()) args.push('--dev-bind', dev, dev);
-    // one writable directory for library caches (fonts, JIT kernels), bound after the hiding mounts
-    if (existsSync(CACHE_DIR)) args.push('--bind', CACHE_DIR, CACHE_IN_SANDBOX);
+    // one writable directory for library caches (fonts, JIT kernels) — the client's own — bound after the hiding mounts
+    args.push('--bind', cacheDirFor(tenant), CACHE_IN_SANDBOX);
     args.push('--setenv', 'PATH', '/usr/local/bin:/usr/bin:/bin', '--setenv', 'HOME', '/tmp');
     for (const [k, v] of Object.entries({ ...runtimeEnv(), ...cacheEnv(CACHE_IN_SANDBOX) })) args.push('--setenv', k, v);
     for (const k of ['LD_LIBRARY_PATH', 'CUDA_HOME', 'CUDA_VISIBLE_DEVICES', 'VIRTUAL_ENV']) if (process.env[k]) args.push('--setenv', k, process.env[k] as string);
@@ -153,8 +180,8 @@ export function wrap(sandbox: Sandbox, py: string, gpu: boolean, serve = false):
   return tail;
 }
 
-function childEnv(cwd: string): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', HOME: cwd, ...runtimeEnv(), ...cacheEnv(CACHE_DIR) };
+function childEnv(cwd: string, tenant = 'default'): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', HOME: cwd, ...runtimeEnv(), ...cacheEnv(cacheDirFor(tenant)) };
   for (const k of ['LD_LIBRARY_PATH', 'CUDA_HOME', 'CUDA_VISIBLE_DEVICES', 'VIRTUAL_ENV']) if (process.env[k]) env[k] = process.env[k];
   return env;
 }
@@ -226,8 +253,40 @@ function execute(argv: string[], request: unknown, timeoutMs: number, extraEnv: 
   });
 }
 
+/**
+ * Run inside bubblewrap by the probe: every Unix socket file the sandbox can see is tried. A network
+ * namespace does not stop connect() on a socket *file*, and one reachable host socket (Docker,
+ * systemd, D-Bus…) is a way out of the sandbox — so any success turns server-side Python off.
+ */
+const SOCKET_SCAN = `
+import os, socket, stat
+_skip = ('/proc', '/sys', '/usr', '/lib', '/lib32', '/lib64', '/libx32', '/bin', '/sbin', '/snap', '/boot')
+_found = []
+for _root, _dirs, _files in os.walk('/'):
+    _dirs[:] = [d for d in _dirs if os.path.join(_root, d) not in _skip]
+    for _f in _files:
+        _p = os.path.join(_root, _f)
+        try:
+            if not stat.S_ISSOCK(os.lstat(_p).st_mode):
+                continue
+        except OSError:
+            continue
+        _s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        _s.settimeout(1)
+        try:
+            _s.connect(_p)
+            _found.append(_p)
+        except OSError:
+            pass
+        finally:
+            _s.close()
+if _found:
+    raise RuntimeError('host sockets reachable from the sandbox: ' + ', '.join(_found[:6]))
+1+1
+`;
+
 async function probeSandbox(py: string, sb: Sandbox): Promise<{ ok: boolean; version: string; reason?: string }> {
-  const r = await execute(wrap(sb, py, false), { code: '1+1', snapshot: { tables: [], current: { table: 0, row: 0, col: 0 } }, gpu: false, limits: { cpuSeconds: 60, memoryMb: LIMITS.memoryMb } }, 120_000);
+  const r = await execute(wrap(sb, py, false, false, '_probe'), { code: sb === 'bwrap' ? SOCKET_SCAN : '1+1', snapshot: { tables: [], current: { table: 0, row: 0, col: 0 } }, gpu: false, limits: { cpuSeconds: 60, memoryMb: LIMITS.memoryMb } }, 120_000);
   const out = r.result?.output as unknown[][] | undefined;
   if (r.result?.ok && Array.isArray(out) && out[0]?.[0] === 2) {
     return { ok: true, version: String((r.result.runtime as { version?: string })?.version ?? '') };
@@ -291,6 +350,8 @@ export interface AgentRunOptions {
   pythonPath: string[];
   /** what the cell is given: the document, its agent token, the model name — never a key */
   env: Record<string, string>;
+  /** the document's client: its cache directory is the only writable one besides the work directory */
+  tenant?: string;
 }
 
 const AGENT_IN = { socket: '/tmp/gridwright.sock', work: '/tmp/work' };
@@ -307,7 +368,7 @@ export function wrapAgent(sandbox: Sandbox, opts: AgentRunOptions): { argv: stri
     for (const dir of hiddenDirs()) args.push('--tmpfs', dir);
     const expose = new Set<string>([dirname(RUNNER), resolve(dirname(dirname(opts.python))), ...opts.expose]);
     for (const dir of expose) if (existsSync(dir)) args.push('--ro-bind', dir, dir);
-    if (existsSync(CACHE_DIR)) args.push('--bind', CACHE_DIR, CACHE_IN_SANDBOX);
+    args.push('--bind', cacheDirFor(opts.tenant ?? 'default'), CACHE_IN_SANDBOX);
     args.push('--bind', opts.workDir, AGENT_IN.work, '--bind', opts.socket, AGENT_IN.socket);
     const env: Record<string, string> = { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: '/tmp', ...runtimeEnv(), ...cacheEnv(CACHE_IN_SANDBOX), ...opts.env, ...pyPath, GRIDWRIGHT_SOCKET: AGENT_IN.socket, GRIDWRIGHT_WORK: AGENT_IN.work, GRIDWRIGHT_THREADS_DB: `${AGENT_IN.work}/threads.sqlite` };
     for (const [k, v] of Object.entries(env)) args.push('--setenv', k, v);
@@ -358,7 +419,7 @@ export async function runAsAgentCell(code: string, snapshot: Snapshot, opts: Age
 /** Does a GPU-requested run find RAPIDS cuDF? Slow (imports cudf), so it runs in the background. */
 export async function probeGpu(): Promise<string | null> {
   if (!status.available || !status.sandbox) return null;
-  const r = await execute(wrap(status.sandbox, status.interpreter, true), { code: '1', snapshot: { tables: [], current: { table: 0, row: 0, col: 0 } }, gpu: true, limits: { cpuSeconds: 60, memoryMb: LIMITS.memoryMb } }, 90_000);
+  const r = await execute(wrap(status.sandbox, status.interpreter, true, false, '_probe'), { code: '1', snapshot: { tables: [], current: { table: 0, row: 0, col: 0 } }, gpu: true, limits: { cpuSeconds: 60, memoryMb: LIMITS.memoryMb } }, 90_000);
   const gpu = String(((r.result?.runtime as { packages?: Record<string, string> })?.packages ?? {}).gpu ?? (r.timedOut ? 'unavailable: probe timed out' : 'unavailable'));
   status = { ...status, gpu };
   return gpu;
@@ -372,6 +433,8 @@ export const pythonStatus = () => status;
 // process each time, because forking after CUDA initialisation is not safe.
 
 interface Host {
+  /** the client whose cells this host runs: a host never runs another client's code */
+  tenant: string;
   proc: ChildProcess;
   busy: boolean;
   /** resolves when the host has imported its libraries and is reading requests; rejects if it dies first */
@@ -399,10 +462,10 @@ function drainQueue() {
   if (next) next();
 }
 
-function startHost(sandbox: Sandbox, py: string): Host {
-  const argv = wrap(sandbox, py, false, true);
+function startHost(sandbox: Sandbox, py: string, tenant: string): Host {
+  const argv = wrap(sandbox, py, false, true, tenant);
   const cwd = mkdtempSync(join(tmpdir(), 'gw-pyhost-'));
-  const proc = spawn(argv[0], argv.slice(1), { cwd, env: childEnv(cwd), stdio: ['pipe', 'pipe', 'pipe'] });
+  const proc = spawn(argv[0], argv.slice(1), { cwd, env: childEnv(cwd, tenant), stdio: ['pipe', 'pipe', 'pipe'] });
   let markReady: () => void = () => undefined;
   let markDead: (e: Error) => void = () => undefined;
   const ready = new Promise<void>((res, rej) => {
@@ -410,7 +473,7 @@ function startHost(sandbox: Sandbox, py: string): Host {
     markDead = rej;
   });
   ready.catch(() => undefined); // observed by hostRun; never an unhandled rejection
-  const host: Host = { proc, busy: false, ready, buf: '', waiter: null, runs: 0, dead: false };
+  const host: Host = { tenant, proc, busy: false, ready, buf: '', waiter: null, runs: 0, dead: false };
   proc.stdout!.setEncoding('utf8');
   proc.stdout!.on('data', (chunk: string) => {
     host.buf += chunk;
@@ -451,17 +514,29 @@ function startHost(sandbox: Sandbox, py: string): Host {
   return host;
 }
 
-function idleHost(sandbox: Sandbox, py: string): Host | null {
-  const free = hosts.find((h) => !h.busy && !h.dead);
+function idleHost(sandbox: Sandbox, py: string, tenant: string): Host | null {
+  const free = hosts.find((h) => !h.busy && !h.dead && h.tenant === tenant);
   if (free) return free;
-  if (hosts.length < LIMITS.concurrency) return startHost(sandbox, py);
+  if (hosts.length < LIMITS.concurrency) return startHost(sandbox, py, tenant);
+  // the pool is full: an idle host of another client makes room (its client pays a cold start next time)
+  const spare = hosts.find((h) => !h.busy && !h.dead);
+  if (spare) {
+    dropHost(spare);
+    try {
+      spare.proc.kill('SIGKILL');
+    } catch {
+      /* gone */
+    }
+    return startHost(sandbox, py, tenant);
+  }
   return null;
 }
 
 /** Start one host ahead of the first cell so it does not pay the cold start. */
 export function warmPool() {
-  if (!status.available || !status.sandbox || hosts.length) return;
-  const host = startHost(status.sandbox, status.interpreter);
+  // with accounts each client gets its own hosts on first use; one shared warm host would mix clients
+  if (!status.available || !status.sandbox || hosts.length || ACCOUNTS) return;
+  const host = startHost(status.sandbox, status.interpreter, 'default');
   host.ready.catch((e) => console.error('python host failed to start:', (e as Error).message));
 }
 
@@ -509,10 +584,10 @@ async function hostRun(host: Host, request: Record<string, unknown>, timeoutMs: 
   });
 }
 
-function pooledRun(sandbox: Sandbox, py: string, request: Record<string, unknown>, timeoutMs: number): Promise<{ result: Record<string, unknown> | null; ms: number }> {
+function pooledRun(sandbox: Sandbox, py: string, request: Record<string, unknown>, timeoutMs: number, tenant: string): Promise<{ result: Record<string, unknown> | null; ms: number }> {
   return new Promise((res) => {
     const attempt = () => {
-      const host = idleHost(sandbox, py);
+      const host = idleHost(sandbox, py, tenant);
       if (!host) {
         queue.push(attempt);
         return;
@@ -543,38 +618,82 @@ export function stopPool() {
 // waiting; beyond that a run is refused at once ("busy") rather than piling up behind the models
 // this host may also be serving.
 export const QUEUE_MAX = num(process.env.GRIDWRIGHT_PYTHON_QUEUE, 64, 10_000);
+// With accounts, one client may not hold every slot or fill the whole queue: each has a share of the
+// slots and of the queue, and a freed slot goes to the clients in turn (round robin), so a busy client
+// can delay another by at most one run.
+const TENANT_SLOTS = ACCOUNTS ? num(process.env.GRIDWRIGHT_PYTHON_TENANT_CONCURRENCY, Math.max(1, Math.ceil(LIMITS.concurrency / 2)), 32) : LIMITS.concurrency;
+const TENANT_QUEUE = ACCOUNTS ? num(process.env.GRIDWRIGHT_PYTHON_TENANT_QUEUE, Math.max(4, Math.ceil(QUEUE_MAX / 4)), 10_000) : QUEUE_MAX;
 let executing = 0;
-const admission: (() => void)[] = [];
+let queued = 0;
+const runningBy = new Map<string, number>();
+const waitingBy = new Map<string, (() => void)[]>();
+/** clients with someone waiting, in the order they are served next */
+const turn: string[] = [];
 export class Busy extends Error {}
-const admit = () =>
-  new Promise<void>((res, rej) => {
-    if (executing < LIMITS.concurrency) {
-      executing++;
-      res();
-    } else if (admission.length >= QUEUE_MAX) rej(new Busy(`server busy: ${executing} running and ${admission.length} queued (limit ${QUEUE_MAX}) — try again shortly`));
-    else admission.push(res);
-  });
-const leave = () => {
-  const next = admission.shift();
-  if (next) next();
-  else executing--;
+const canStart = (tenant: string) => executing < LIMITS.concurrency && (runningBy.get(tenant) ?? 0) < TENANT_SLOTS;
+const start = (tenant: string) => {
+  executing++;
+  runningBy.set(tenant, (runningBy.get(tenant) ?? 0) + 1);
 };
-export const admissionState = () => ({ executing, queued: admission.length, concurrency: LIMITS.concurrency, queue: QUEUE_MAX });
+const admit = (tenant: string) =>
+  new Promise<void>((res, rej) => {
+    if (canStart(tenant) && !(waitingBy.get(tenant)?.length)) {
+      start(tenant);
+      return res();
+    }
+    const mine = waitingBy.get(tenant) ?? [];
+    if (queued >= QUEUE_MAX) return rej(new Busy(`server busy: ${executing} running and ${queued} queued (limit ${QUEUE_MAX}) — try again shortly`));
+    if (mine.length >= TENANT_QUEUE) return rej(new Busy(`your client already has ${mine.length} runs queued (limit ${TENANT_QUEUE}) — try again shortly`));
+    mine.push(res);
+    waitingBy.set(tenant, mine);
+    queued++;
+    if (!turn.includes(tenant)) turn.push(tenant);
+  });
+function dispatch() {
+  let progressed = true;
+  while (progressed && executing < LIMITS.concurrency && turn.length) {
+    progressed = false;
+    for (let i = 0; i < turn.length; i++) {
+      const tenant = turn[i];
+      if (!canStart(tenant)) continue;
+      const mine = waitingBy.get(tenant) ?? [];
+      const next = mine.shift();
+      turn.splice(i, 1);
+      if (mine.length) turn.push(tenant); // back of the line
+      else waitingBy.delete(tenant);
+      if (next) {
+        queued--;
+        start(tenant);
+        next();
+        progressed = true;
+      }
+      break;
+    }
+  }
+}
+const leave = (tenant: string) => {
+  executing--;
+  const n = (runningBy.get(tenant) ?? 1) - 1;
+  if (n > 0) runningBy.set(tenant, n);
+  else runningBy.delete(tenant);
+  dispatch();
+};
+export const admissionState = () => ({ executing, queued, concurrency: LIMITS.concurrency, queue: QUEUE_MAX, perClient: { concurrency: TENANT_SLOTS, queue: TENANT_QUEUE } });
 
 /** Run one cell. Never throws: every failure is an `ok: false` result the client can show. */
-export async function runPython(code: string, snapshot: Snapshot, gpu: boolean): Promise<RunResult> {
+export async function runPython(code: string, snapshot: Snapshot, gpu: boolean, tenant = 'default'): Promise<RunResult> {
   const st = status.available ? status : await probePython();
   const base = { std_out: '', deps: [] as RunResult['deps'], runtime: { name: 'python-server', version: st.version, packages: { sandbox: st.sandbox ?? 'none' } }, ms: 0 };
   if (!st.available || !st.sandbox) return { ...base, ok: false, error: `server-side Python is not available: ${st.reason ?? 'unknown'}` };
   const limits = { cpuSeconds: Math.ceil(LIMITS.timeoutMs / 1000), memoryMb: LIMITS.memoryMb, maxCells: LIMITS.maxCells, fileMb: 64 };
   try {
-    await admit();
+    await admit(tenant);
   } catch (e) {
     return { ...base, ok: false, error: errorMessageOf(e), busy: true };
   }
   try {
     if (!gpu) {
-      const r = await pooledRun(st.sandbox, st.interpreter, { id: Date.now(), code, snapshot, gpu: false, limits, timeoutMs: LIMITS.timeoutMs, retries: 0 }, LIMITS.timeoutMs);
+      const r = await pooledRun(st.sandbox, st.interpreter, { id: Date.now(), code, snapshot, gpu: false, limits, timeoutMs: LIMITS.timeoutMs, retries: 0 }, LIMITS.timeoutMs, tenant);
       if (r.result) {
         const runtime = (r.result.runtime as RunResult['runtime']) ?? base.runtime;
         runtime.packages = { ...(runtime.packages ?? {}), sandbox: st.sandbox };
@@ -582,7 +701,7 @@ export async function runPython(code: string, snapshot: Snapshot, gpu: boolean):
       }
       return { ...base, ok: false, error: `the Python host did not answer within ${Math.round(LIMITS.timeoutMs / 1000)} s and was restarted`, ms: r.ms };
     }
-    const r = await execute(wrap(st.sandbox, st.interpreter, true), { code, snapshot, gpu: true, limits }, LIMITS.timeoutMs + 2000);
+    const r = await execute(wrap(st.sandbox, st.interpreter, true, false, tenant), { code, snapshot, gpu: true, limits }, LIMITS.timeoutMs + 2000, cacheEnv(cacheDirFor(tenant)));
     if (r.result) {
       const runtime = (r.result.runtime as RunResult['runtime']) ?? base.runtime;
       runtime.packages = { ...(runtime.packages ?? {}), sandbox: st.sandbox };
@@ -592,7 +711,7 @@ export async function runPython(code: string, snapshot: Snapshot, gpu: boolean):
     const error = r.timedOut ? `time limit of ${Math.round(LIMITS.timeoutMs / 1000)} s exceeded` : r.signal === 'SIGKILL' ? `the process was killed (memory limit ${LIMITS.memoryMb} MB?)${tail ? `: ${tail}` : ''}` : `python exited with ${r.code ?? r.signal}${tail ? `: ${tail}` : ''}`;
     return { ...base, ok: false, error, ms: r.ms };
   } finally {
-    leave();
+    leave(tenant);
   }
 }
 

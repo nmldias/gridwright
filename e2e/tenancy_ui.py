@@ -2,7 +2,8 @@
 """The multi-tenant interface (GRIDWRIGHT_AUTH=accounts), in a browser:
   - the sign-in screen comes first; a wrong password is refused; a temporary password must be changed
   - the top bar names the client the tab works in; the menu lists the person's clients
-  - a client administrator adds a member in Clients & people and gets a temporary password to hand over
+  - a client administrator invites a member in Clients & people and gets a link to hand over; the
+    invitee opens it in their own browser and joins with a password they choose
   - a document saved in one client is not listed in another; switching client changes the URL
   - two tabs work in two clients at the same time
   - a session that ends while the app is open asks to sign in again over the app, keeping the document
@@ -160,14 +161,26 @@ try:
 
         form = page.locator(".admin-form").first
         form.locator("input[type=email]").fill("bob@acme.test")
-        form.locator("input[placeholder^=name]").fill("Bob")
         form.locator("button[type=submit]").click()
         page.wait_for_selector(".secret-box", timeout=5000)
-        secret = page.locator(".secret-value").inner_text().strip()
-        ok(len(secret) >= 10, "adding Bob shows a temporary password to hand over")
-        ok(page.locator(".member-row", has_text="bob@acme.test").count() == 1, "…and Bob appears in the members")
+        link = page.locator(".secret-value").inner_text().strip()
+        ok("?invite=gwi_" in link, "inviting Bob shows an invitation link to hand over")
+        page.wait_for_selector(".member-row:has-text('bob@acme.test')", timeout=5000)
+        ok(page.locator(".member-row", has_text="bob@acme.test").locator("text=invited").count() == 1, "…and Bob is listed as invited, not yet a member")
         shot(page, "05-members")
         page.locator(".secret-box button", has_text="Done").click()
+        # Bob opens the link in his own browser and joins with a password he chooses
+        ctx3 = browser.new_context(viewport={"width": 1400, "height": 900})
+        p3 = ctx3.new_page()
+        p3.goto(link)
+        p3.wait_for_selector(".auth-card:has-text('invited to')", timeout=15000)
+        ok(p3.locator(".auth-card", has_text="Acme Holdings").count() == 1 and p3.locator(".auth-card input[type=email]").input_value() == "bob@acme.test", "the link shows the client, the role and the e-mail")
+        shot(p3, "05b-invitation")
+        p3.fill(".auth-card input[type=password]", "bob-own-password-1")
+        p3.click(".auth-card button[type=submit]")
+        p3.wait_for_selector("[data-menu=client]", timeout=30000)
+        ok(p3.locator("[data-menu=client] .client-chip").inner_text() == "Acme Holdings" and "invite=" not in p3.url, "Bob joins and lands in Acme")
+        ctx3.close()
 
         # a document saved in Acme
         page.locator(".save-btn").click()

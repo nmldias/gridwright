@@ -11,6 +11,7 @@ import * as book from '../engine/book';
 import { a1, isCodeKind, type CellKind } from '../engine/types';
 import { cellAt, useStore } from '../state/store';
 import { runCell } from '../workers/runner';
+import { clearBlocked, trust } from '../workers/trust';
 import { clearDraft, draftKey, getDraft, hasDraft, setDraft as keepDraft } from './drafts';
 import { PanelHeader } from './PanelHeader';
 
@@ -60,6 +61,11 @@ export function CodePanel() {
     if (text !== cell?.i) {
       book.apply({ type: 'set_cell', table: codeCell.table, row: codeCell.row, col: codeCell.col, input: text, kind: lang, conn: cell?.conn ?? null, refresh: cell?.refresh ?? 0, runtime: cell?.runtime ?? null, gpu: cell?.gpu ?? null });
     } else if (run) {
+      // the person is looking at this code and pressed Run: that is their approval of it
+      if (cell && isCodeKind(cell.k)) {
+        trust([cell]);
+        clearBlocked([codeCell]);
+      }
       runCell(codeCell);
     }
   };

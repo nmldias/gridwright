@@ -1,6 +1,9 @@
 // WebGL grid renderer built on PixiJS v8. Draws free-floating tables on an
 // infinite canvas with viewport culling and pooled bitmap text.
 
+// Pixi compiles its shader-uniform sync functions with new Function() unless this polyfill is
+// loaded; with it the grid renders under a Content-Security-Policy without 'unsafe-eval'.
+import 'pixi.js/unsafe-eval';
 import { Application, Assets, BitmapFontManager, BitmapText, Container, Graphics, Sprite, Texture } from 'pixi.js';
 import type { CellView, Chart, Merge, TableId, TableMeta } from '../engine/types';
 import { colToLetters } from '../engine/types';

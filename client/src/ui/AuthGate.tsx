@@ -9,7 +9,13 @@ import { currentTenant, onAuthSignal, setCurrentTenant, switchTenant } from '../
 import { useStore, type Me } from '../state/store';
 import { PlatformConsole } from './AdminPanel';
 
-type Screen = { kind: 'login'; note?: string } | { kind: 'password'; me: Me } | { kind: 'no-client'; me: Me } | null;
+type Screen = { kind: 'login'; note?: string } | { kind: 'password'; me: Me } | { kind: 'no-client'; me: Me } | { kind: 'invite'; code: string } | null;
+
+const dropInvite = () => {
+  const url = new URL(location.href);
+  url.searchParams.delete('invite');
+  history.replaceState(null, '', url.toString());
+};
 
 export function AuthGate({ children }: { children: ReactNode }) {
   const [opened, setOpened] = useState(false);
@@ -26,6 +32,9 @@ export function AuthGate({ children }: { children: ReactNode }) {
         setScreen(null);
         return;
       }
+      // ?invite=<code>: an invitation link — accepted (or set aside) before anything else
+      const invite = new URLSearchParams(location.search).get('invite');
+      if (invite) return setScreen({ kind: 'invite', code: invite });
       // ?tenant=<slug> names the client of this tab (links, bookmarks); it wins over what the tab had
       const fromUrl = new URLSearchParams(location.search).get('tenant');
       if (fromUrl) setCurrentTenant(fromUrl);
@@ -78,6 +87,21 @@ export function AuthGate({ children }: { children: ReactNode }) {
       {screen.kind === 'login' && <LoginCard note={screen.note} onDone={() => void check()} />}
       {screen.kind === 'password' && <PasswordCard me={screen.me} onDone={() => void check()} />}
       {screen.kind === 'no-client' && <NoClientCard me={screen.me} />}
+      {screen.kind === 'invite' && (
+        <InviteCard
+          code={screen.code}
+          onDone={(tenant) => {
+            dropInvite();
+            if (tenant) {
+              setCurrentTenant(tenant);
+              const url = new URL(location.href);
+              url.searchParams.delete('tenant');
+              history.replaceState(null, '', url.toString());
+            }
+            void check();
+          }}
+        />
+      )}
     </div>
   );
   return (
@@ -136,7 +160,84 @@ function LoginCard({ note, onDone }: { note?: string; onDone: () => void }) {
       <button className="primary" type="submit" disabled={busy || !login || !password}>
         {busy ? 'Signing in…' : 'Sign in'}
       </button>
-      <p className="muted small">No account? Your client's administrator adds you and gives you a temporary password.</p>
+      <p className="muted small">No account? Your client's administrator invites you with a link.</p>
+    </form>
+  );
+}
+
+/** An invitation link: join the client with the password of one's account, or choose one when new. */
+function InviteCard({ code, onDone }: { code: string; onDone: (tenant?: string) => void }) {
+  const [inv, setInv] = useState<{ tenant: string; login: string; role: string; expiresAt: string } | null>(null);
+  const [gone, setGone] = useState('');
+  const [name, setName] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    accounts
+      .invitation(code)
+      .then(setInv)
+      .catch((e) => setGone((e as Error).message));
+  }, [code]);
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setError('');
+    try {
+      const r = await accounts.acceptInvitation(code, password, name.trim() || undefined);
+      setPassword('');
+      onDone(r.tenant.id);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  if (gone) {
+    return (
+      <div className="auth-card">
+        <Brand sub="Invitation" />
+        <div className="auth-note">{gone}</div>
+        <button className="primary" onClick={() => onDone()}>
+          Continue
+        </button>
+      </div>
+    );
+  }
+  if (!inv) {
+    return (
+      <div className="auth-card">
+        <Brand sub="Invitation" />
+        <div className="muted small">checking the invitation…</div>
+      </div>
+    );
+  }
+  return (
+    <form className="auth-card" onSubmit={(e) => void submit(e)} onKeyDown={(e) => e.stopPropagation()}>
+      <Brand sub={`Join ${inv.tenant}`} />
+      <div className="auth-note">
+        You are invited to <b>{inv.tenant}</b> as <b>{inv.role}</b>.
+      </div>
+      <label className="field">
+        <span>E-mail</span>
+        <input type="email" autoComplete="username" value={inv.login} readOnly />
+      </label>
+      <label className="field">
+        <span>Your name (if you are new here)</span>
+        <input value={name} autoComplete="name" onChange={(e) => setName(e.target.value)} />
+      </label>
+      <label className="field">
+        <span>Password</span>
+        <input autoFocus type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} required />
+      </label>
+      <div className="muted small">If you already have a Gridwright account, enter its password. Otherwise choose one now (at least 10 characters).</div>
+      {error && <div className="err small">{error}</div>}
+      <button className="primary" type="submit" disabled={busy || !password}>
+        {busy ? 'Joining…' : `Join ${inv.tenant}`}
+      </button>
+      <button type="button" className="link" onClick={() => onDone()}>
+        Not now
+      </button>
     </form>
   );
 }
@@ -205,7 +306,7 @@ function NoClientCard({ me }: { me: Me }) {
       ? 'This client account is suspended. Contact the platform administrator.'
       : me.denied === 'not-a-member'
         ? 'You are not a member of the client this link points to.'
-        : 'You are not a member of any client yet. Ask an administrator to add you.';
+        : 'You are not a member of any client yet. Ask an administrator for an invitation link.';
   return (
     <div className={`auth-card ${me.platformAdmin ? 'wide' : ''}`}>
       <Brand sub={`Signed in as ${me.login}`} />

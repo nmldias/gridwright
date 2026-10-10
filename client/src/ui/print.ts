@@ -6,7 +6,17 @@ import { chartData, chartSvg } from '../grid/charts';
 import { getState } from '../state/store';
 import type { TableId } from '../engine/types';
 
-const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+// Everything that reaches the print document is escaped for text *and* attributes: a cell value,
+// a fill or a colour is the author's input, and the print window shares the app's origin.
+const esc = (s: string) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+/** an inline picture: raster data URLs only (no SVG, nothing that is not plain base64) */
+const SAFE_IMAGE = /^data:image\/(png|jpe?g|gif|webp|bmp);base64,[A-Za-z0-9+/=\s]+$/;
+/** a CSS colour the print view accepts: #hex, a colour name, rgb()/rgba()/hsl()/hsla() with numbers only */
+const SAFE_COLOR = /^(#[0-9a-fA-F]{3,8}|[a-zA-Z]{1,24}|(rgb|rgba|hsl|hsla)\([0-9.,%\s]+\))$/;
+export const safeColor = (c: unknown): string | null => (typeof c === 'string' && SAFE_COLOR.test(c.trim()) ? c.trim() : null);
+export const safeImage = (s: unknown): string | null => (typeof s === 'string' && s.length < 20_000_000 && SAFE_IMAGE.test(s) ? s : null);
+/** the print document may show pictures and styles and nothing else: no script, no network */
+const PRINT_CSP = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:";
 
 export function tableHtml(id: TableId): string {
   const st = getState();
@@ -31,7 +41,7 @@ export function tableHtml(id: TableId): string {
   if (lastR < 0) return `<section class="table"><h2>${esc(meta.name)}</h2><p class="muted">empty</p></section>`;
   const out: string[] = [`<section class="table"><h2>${esc(meta.name)}</h2><table>`];
   const widths = meta.col_widths.slice(0, lastC + 1);
-  out.push('<colgroup>' + widths.map((w) => `<col style="width:${Math.round(w)}px">`).join('') + '</colgroup>');
+  out.push('<colgroup>' + widths.map((w) => `<col style="width:${Math.round(Number(w) || 0)}px">`).join('') + '</colgroup>');
   for (let r = 0; r <= lastR; r++) {
     if (hidden.has(r)) continue;
     const isHeader = r < meta.header_rows;
@@ -40,24 +50,27 @@ export function tableHtml(id: TableId): string {
       if (inner.has(r * 65536 + c)) continue;
       const cell = cells?.get(r * 65536 + c);
       const m = mergeAt.get(r * 65536 + c);
-      const span = m ? ` rowspan="${m.rs}" colspan="${m.cs}"` : '';
+      const span = m ? ` rowspan="${Math.max(1, Math.floor(Number(m.rs) || 1))}" colspan="${Math.max(1, Math.floor(Number(m.cs) || 1))}"` : '';
       if (!cell) {
         out.push(`<td${span}></td>`);
         continue;
       }
       const styles: string[] = [];
       const align = m && !cell.f?.align ? 'center' : alignOf(cell);
-      styles.push(`text-align:${align}`);
+      styles.push(`text-align:${align === 'right' || align === 'center' ? align : 'left'}`);
       if (cell.f?.bold) styles.push('font-weight:600');
       if (cell.f?.italic) styles.push('font-style:italic');
-      if (cell.f?.fill) styles.push(`background:${cell.f.fill}`);
-      if (cell.f?.color) styles.push(`color:${cell.f.color}`);
+      const fill = safeColor(cell.f?.fill);
+      const color = safeColor(cell.f?.color);
+      if (fill) styles.push(`background:${fill}`);
+      if (color) styles.push(`color:${color}`);
       if (cell.f?.wrap) styles.push('white-space:normal');
       const isErr = !!cell.v && typeof cell.v === 'object' && 'e' in cell.v;
       if (isErr) styles.push('color:#b91c1c');
       const text = displayOf(cell);
-      const img = cell.v && 's' in cell.v && cell.v.s.startsWith('data:image/') ? `<img src="${cell.v.s}" alt="">` : esc(text);
-      out.push(`<td${span} style="${styles.join(';')}">${img}</td>`);
+      const pic = cell.v && 's' in cell.v ? safeImage(cell.v.s) : null;
+      const body = pic ? `<img src="${esc(pic)}" alt="">` : esc(text);
+      out.push(`<td${span} style="${esc(styles.join(';'))}">${body}</td>`);
     }
     out.push('</tr>');
   }
@@ -77,7 +90,7 @@ export function printDocumentHtml(opts: { tables?: TableId[]; charts?: number[];
   const charts = opts.charts ?? st.charts.map((c) => c.id);
   const title = opts.title ?? st.fileName;
   const when = new Date().toLocaleString();
-  return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(title)}</title>
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${PRINT_CSP}"><title>${esc(title)}</title>
 <style>
   @page { margin: 14mm; }
   body { font-family: Inter, "Segoe UI", Helvetica, Arial, sans-serif; color: #1f1f1f; font-size: 11px; margin: 0; padding: 16px; }
@@ -112,6 +125,12 @@ export function openPrintView(opts: { tables?: TableId[]; charts?: number[]; tit
     a.download = `${(opts.title ?? getState().fileName).replace(/[^\w.-]+/g, '_')}.html`;
     a.click();
     return;
+  }
+  // no way back into the app from the print window, whatever it contains
+  try {
+    w.opener = null;
+  } catch {
+    /* read-only in some browsers */
   }
   w.document.open();
   w.document.write(html);

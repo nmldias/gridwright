@@ -2006,3 +2006,85 @@ details.evidence > div {
   flex-direction: column;
   gap: 10px;
 }
+
+/* --- code trust (workers/trust.ts, ui/TrustBanner.tsx) ------------------------------------ */
+.trust-banner {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 40;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  max-width: min(880px, calc(100% - 24px));
+  padding: 8px 12px;
+  border: 1px solid #d97706;
+  border-radius: 8px;
+  background: #fffbeb;
+  color: #78350f;
+  font-size: 12px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+}
+.trust-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+  align-items: center;
+}
+.trust-actions.end {
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+.trust-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(15, 23, 42, 0.45);
+}
+.trust-dialog {
+  width: min(760px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px);
+  display: flex;
+  flex-direction: column;
+  padding: 16px 18px;
+  border-radius: 10px;
+  background: var(--bg, #fff);
+  color: var(--text, #1f1f1f);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+}
+.trust-dialog h2 {
+  margin: 0 0 4px;
+  font-size: 15px;
+  font-weight: 600;
+}
+.trust-list {
+  overflow: auto;
+  flex: 1;
+  margin-top: 8px;
+}
+.trust-item h3 {
+  margin: 10px 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.trust-code {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 260px;
+  overflow: auto;
+  border-radius: 6px;
+  background: #0f172a;
+  color: #e2e8f0;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* AI usage meter (Clients & people) */
+.ai-usage .meter { height: 6px; border-radius: 3px; background: var(--border, #e3e3e3); overflow: hidden; margin: 6px 0 4px; }
+.ai-usage .meter-fill { height: 100%; background: var(--accent, #2f6fde); }
+.ai-usage .meter-fill.warn { background: #c0392b; }

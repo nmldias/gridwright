@@ -3,7 +3,7 @@
 // the activity trail, and for platform administrators the console: every client (create, suspend,
 // seats, delete when empty), every person, and the model endpoint clients use by default.
 import { type FormEvent, useCallback, useEffect, useState } from 'react';
-import { accounts, type AddedPerson, type ApiToken, type AuditEntry, type Member, type Role, type TenantInfo, type UserInfo } from '../api/accounts';
+import { accounts, type AddedPerson, type AiBudget, type AiUsage, type ApiToken, type AuditEntry, type Invitation, type InvitationSent, type Member, type PlatformAiUsage, type Role, type TenantInfo, type UserInfo } from '../api/accounts';
 import { switchTenant } from '../api/tenant';
 import { useStore, type Me } from '../state/store';
 import { PasswordForm, SignOut } from './AuthGate';
@@ -16,6 +16,9 @@ const ROLE_HINT: Record<Role, string> = {
   editor: 'creates and edits documents, runs queries',
   viewer: 'reads what is shared with them',
 };
+const fmt = (n: number) => n.toLocaleString();
+const budgetText = (b: AiBudget) => (b.tokens === null ? 'no monthly limit' : b.tokens === 0 ? 'AI turned off' : `${fmt(b.tokens)} tokens a month`);
+const usageText = (u: AiUsage) => `${fmt(u.requests)} request${u.requests === 1 ? '' : 's'} · ${fmt(u.totalTokens)} tokens${u.estimated ? ' (partly estimated)' : ''}`;
 const when = (iso?: string) => (iso ? new Date(iso).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }) : '—');
 const stop = (e: React.KeyboardEvent) => e.stopPropagation();
 
@@ -48,7 +51,7 @@ export function AdminPanel() {
 }
 
 /** A password or token shown once, to copy and hand over. */
-function Secret({ label, value, onClose }: { label: string; value: string; onClose: () => void }) {
+function Secret({ label, value, onClose, note }: { label: string; value: string; onClose: () => void; note?: string }) {
   const [copied, setCopied] = useState(false);
   return (
     <div className="secret-box">
@@ -67,7 +70,7 @@ function Secret({ label, value, onClose }: { label: string; value: string; onClo
           Done
         </button>
       </div>
-      <div className="muted small">It is shown only now. Send it privately; it must be changed at first sign-in.</div>
+      <div className="muted small">{note ?? 'It is shown only now. Send it privately; it must be changed at first sign-in.'}</div>
     </div>
   );
 }
@@ -142,6 +145,111 @@ function AddPersonForm({ onAdd, label = 'Add person' }: { onAdd: (p: { login: st
   );
 }
 
+/** Invite someone to the current client: they accept with their own password (or choose one). */
+function InviteForm({ onInvited }: { onInvited: () => void }) {
+  const [login, setLogin] = useState('');
+  const [role, setRole] = useState<Role>('editor');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [sent, setSent] = useState<InvitationSent | null>(null);
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setError('');
+    try {
+      setSent(await accounts.tenant.invite({ login: login.trim(), role }));
+      setLogin('');
+      onInvited();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <>
+      <form className="admin-form" onSubmit={(e) => void submit(e)} onKeyDown={stop}>
+        <div className="row">
+          <input className="grow" type="email" placeholder="e-mail" aria-label="e-mail to invite" value={login} onChange={(e) => setLogin(e.target.value)} required />
+          <select value={role} onChange={(e) => setRole(e.target.value as Role)} title={ROLE_HINT[role]} aria-label="role">
+            {ROLES.map((r) => (
+              <option key={r} value={r}>
+                {r}
+              </option>
+            ))}
+          </select>
+          <button className="primary" type="submit" disabled={busy || !login}>
+            {busy ? 'Inviting…' : 'Invite'}
+          </button>
+        </div>
+        <div className="muted small">{ROLE_HINT[role]}. They join when they open the link and accept it with their password — or choose one if they are new.</div>
+        {error && <div className="err small">{error}</div>}
+      </form>
+      {sent && (
+        <Secret
+          label={`Invitation link for ${sent.login} (${sent.role}, valid until ${when(sent.expiresAt)})`}
+          value={`${location.origin}${sent.link}`}
+          note="It is shown only now and works once. Send it to them privately."
+          onClose={() => setSent(null)}
+        />
+      )}
+    </>
+  );
+}
+
+function PendingInvitations({ list, onRevoke }: { list: Invitation[]; onRevoke: (i: Invitation) => void }) {
+  if (!list.length) return null;
+  return (
+    <>
+      <div className="panel-subtitle">Invited, not yet joined</div>
+      <ul className="member-list">
+        {list.map((i) => (
+          <li key={i.id} className="member-row">
+            <div className="grow member-who">
+              <div>
+                <b>{i.login}</b> <span className="pill loading">invited</span> <span className="pill">{i.role}</span>
+              </div>
+              <div className="muted small">
+                by {i.createdBy} · {when(i.createdAt)} · expires {when(i.expiresAt)}
+              </div>
+            </div>
+            <div className="member-actions">
+              <button className="small danger" onClick={() => onRevoke(i)} title="the link stops working">
+                Revoke
+              </button>
+            </div>
+          </li>
+        ))}
+      </ul>
+    </>
+  );
+}
+
+/** What this client used of the model this month, against its budget. */
+function AiUsageCard() {
+  const u = useLoad(() => accounts.tenant.aiUsage(), []);
+  if (u.error || !u.data) return null;
+  const { usage, budget, limits } = u.data;
+  const pct = budget.tokens ? Math.min(100, Math.round((usage.totalTokens / budget.tokens) * 100)) : null;
+  return (
+    <div className="client-card ai-usage">
+      <div className="row">
+        <b className="grow">AI this month</b>
+        <span className="muted small">{budgetText(budget)}</span>
+      </div>
+      <div className="small">{usageText(usage)}</div>
+      {pct !== null && (
+        <div className="meter" role="meter" aria-label="share of the monthly AI budget used" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}>
+          <div className={pct >= 90 ? 'meter-fill warn' : 'meter-fill'} style={{ width: `${pct}%` }} />
+        </div>
+      )}
+      <div className="muted small">
+        At most {limits.perMinuteClient} requests a minute for the whole client, {limits.perMinutePerson} per person. The platform sets the budget.
+      </div>
+    </div>
+  );
+}
+
 function MemberRow({ m, me, canManage, onRole, onRemove, onReset }: { m: Member; me: Me; canManage: boolean; onRole: (r: Role) => void; onRemove: () => void; onReset?: () => void }) {
   return (
     <li className="member-row">
@@ -182,6 +290,7 @@ function MembersView({ me }: { me: Me }) {
   const isAdmin = me.role === 'admin';
   const tenant = useLoad(() => accounts.tenant.get(), []);
   const members = useLoad(() => accounts.tenant.members(), []);
+  const invitations = useLoad(() => (isAdmin ? accounts.tenant.invitations() : Promise.resolve([] as Invitation[])), [isAdmin]);
   const [secret, setSecret] = useState<{ login: string; pw: string } | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
   const t = tenant.data;
@@ -231,15 +340,17 @@ function MembersView({ me }: { me: Me }) {
           </div>
         </div>
       )}
+      {isAdmin && <AiUsageCard />}
       {isAdmin && (
         <>
-          <div className="panel-subtitle">Add someone to this client</div>
-          <AddPersonForm onAdd={async (p) => {
-            const r = await accounts.tenant.add(p);
-            members.reload();
-            tenant.reload();
-            return r;
-          }} />
+          <div className="panel-subtitle">Invite someone to this client</div>
+          <InviteForm onInvited={() => invitations.reload()} />
+          <PendingInvitations
+            list={invitations.data ?? []}
+            onRevoke={(i) => {
+              if (confirm(`Revoke the invitation of ${i.login}? The link stops working.`)) void act(() => accounts.tenant.revokeInvitation(i.id)).then(() => invitations.reload());
+            }}
+          />
         </>
       )}
       <div className="panel-subtitle">Members</div>
@@ -284,6 +395,10 @@ const ACTION_LABEL: Record<string, string> = {
   'client.deleted': 'deleted the client',
   'client.ai-settings': 'changed the model settings',
   'member.added': 'added',
+  'member.invited': 'invited',
+  'member.invitation-accepted': 'accepted an invitation',
+  'member.invitation-revoked': 'revoked the invitation of',
+  'client.ai-budget': 'changed the AI budget',
   'member.removed': 'removed',
   'member.role-changed': 'changed the role of',
   'user.created': 'created the account of',
@@ -484,7 +599,7 @@ function NewClientForm({ onCreated }: { onCreated: () => void }) {
   );
 }
 
-function ClientRow({ t, me, onChange }: { t: TenantInfo; me: Me; onChange: () => void }) {
+function ClientRow({ t, me, onChange, ai }: { t: TenantInfo; me: Me; onChange: () => void; ai?: PlatformAiUsage['clients'][number] }) {
   const [open, setOpen] = useState(false);
   const [members, setMembers] = useState<Member[] | null>(null);
   const [error, setError] = useState('');
@@ -512,6 +627,12 @@ function ClientRow({ t, me, onChange }: { t: TenantInfo; me: Me; onChange: () =>
             {t.slug} · {t.plan} · {t.members} member{t.members === 1 ? '' : 's'}
             {t.seats ? `/${t.seats}` : ''} · {t.documents ?? 0} document{t.documents === 1 ? '' : 's'} · {t.connections ?? 0} connection{t.connections === 1 ? '' : 's'}
           </div>
+          {ai && (
+            <div className="muted small">
+              AI this month: {usageText(ai.usage)} · {budgetText(ai.budget)}
+              {ai.budget.own ? '' : ' (platform default)'}
+            </div>
+          )}
         </div>
         <button className="small" onClick={() => (setOpen(!open), !open && void loadMembers())}>
           {open ? 'Close' : 'Manage'}
@@ -555,6 +676,23 @@ function ClientRow({ t, me, onChange }: { t: TenantInfo; me: Me; onChange: () =>
                 </option>
               ))}
             </select>
+            <label className="row small" title="tokens a month; empty: the platform default, 0: AI off, “unlimited”: no limit">
+              AI budget
+              <input
+                defaultValue={ai?.budget.own ? (ai.budget.tokens === null ? 'unlimited' : String(ai.budget.tokens)) : ''}
+                placeholder="default"
+                style={{ width: 110 }}
+                onKeyDown={stop}
+                onBlur={(e) => {
+                  const v = e.target.value.trim().toLowerCase().replace(/[ ,_]/g, '');
+                  const was = ai?.budget.own ? (ai.budget.tokens === null ? 'unlimited' : String(ai.budget.tokens)) : '';
+                  if (v === was) return;
+                  const next = v === '' ? 'default' : v === 'unlimited' || v === '∞' ? null : Number(v);
+                  if (typeof next === 'number' && !(Number.isFinite(next) && next >= 0)) return setError('the AI budget is a number of tokens, “unlimited”, or empty for the default');
+                  void act(() => accounts.platform.setAiBudget(t.id, next));
+                }}
+              />
+            </label>
             <span className="grow" />
             {t.id !== 'default' && (
               <button
@@ -637,7 +775,9 @@ function PlatformModel() {
 
 export function PlatformConsole({ me }: { me: Me }) {
   const tenants = useLoad(() => accounts.platform.tenants(), []);
+  const ai = useLoad(() => accounts.platform.aiUsage(), []);
   const [q, setQ] = useState('');
+  const aiOf = (id: string) => ai.data?.clients.find((c) => c.id === id);
   const list = (tenants.data ?? []).filter((t) => !q || `${t.name} ${t.slug}`.toLowerCase().includes(q.toLowerCase()));
   return (
     <div className="platform-console">
@@ -650,11 +790,25 @@ export function PlatformConsole({ me }: { me: Me }) {
       {tenants.error && <div className="err small">{tenants.error}</div>}
       <ul className="client-list">
         {list.map((t) => (
-          <ClientRow key={t.id} t={t} me={me} onChange={() => tenants.reload()} />
+          <ClientRow
+            key={t.id}
+            t={t}
+            me={me}
+            ai={aiOf(t.id)}
+            onChange={() => {
+              tenants.reload();
+              ai.reload();
+            }}
+          />
         ))}
       </ul>
       <div className="panel-subtitle">Default model endpoint</div>
       <PlatformModel />
+      {ai.data && (
+        <div className="muted small">
+          Every client: at most {ai.data.limits.perMinuteClient} AI requests a minute ({ai.data.limits.perMinutePerson} per person); default budget {ai.data.defaultBudget === null ? 'unlimited' : `${fmt(ai.data.defaultBudget)} tokens a month`} (GRIDWRIGHT_AI_RPM_CLIENT, GRIDWRIGHT_AI_RPM_PERSON, GRIDWRIGHT_AI_MONTHLY_TOKENS).
+        </div>
+      )}
     </div>
   );
 }

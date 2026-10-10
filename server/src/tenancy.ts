@@ -85,7 +85,7 @@ export interface Account {
   mustChangePassword: boolean;
   credential: 'session' | 'token' | 'proxy';
   /** set when the client asked for could not be entered */
-  denied?: 'suspended' | 'not-a-member';
+  denied?: 'suspended' | 'not-a-member' | 'token-client';
 }
 
 const SESSION_COOKIE = 'gw_session';
@@ -116,12 +116,28 @@ CREATE TABLE IF NOT EXISTS audit (
   tenant TEXT, target TEXT, detail TEXT
 );
 CREATE INDEX IF NOT EXISTS audit_tenant ON audit(tenant, seq);
+CREATE TABLE IF NOT EXISTS invitations (
+  code_hash TEXT PRIMARY KEY, id TEXT NOT NULL UNIQUE, tenant TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  login TEXT NOT NULL, role TEXT NOT NULL, created_at TEXT NOT NULL, created_by TEXT NOT NULL DEFAULT '',
+  expires_at TEXT NOT NULL, accepted_at TEXT
+);
+CREATE INDEX IF NOT EXISTS invitations_tenant ON invitations(tenant, login);
+CREATE TABLE IF NOT EXISTS ai_usage (
+  tenant TEXT NOT NULL, month TEXT NOT NULL, requests INTEGER NOT NULL DEFAULT 0, prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0, estimated INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tenant, month)
+);
+CREATE TABLE IF NOT EXISTS ai_budgets (tenant TEXT PRIMARY KEY, monthly_tokens INTEGER);
+CREATE TABLE IF NOT EXISTS signin_failures (
+  key TEXT PRIMARY KEY, count INTEGER NOT NULL, first_at INTEGER NOT NULL, last_at INTEGER NOT NULL
+);
 `;
 
 type Row = Record<string, unknown>;
 let db: DatabaseSync | null = null;
 const now = () => new Date().toISOString();
 const s = (v: unknown): string | undefined => (v === null || v === undefined ? undefined : String(v));
+/** The accounts store, for modules that keep their own platform tables in it (aiquota.ts). */
+export const platformDb = (): DatabaseSync => theDb();
 function theDb(): DatabaseSync {
   if (!db) throw new Error('accounts are not initialised (GRIDWRIGHT_AUTH=accounts needs Node ≥ 22.13 for node:sqlite)');
   return db;
@@ -277,8 +293,12 @@ export function listUsers(): (User & { clients: number })[] {
   const rows = theDb().prepare('SELECT u.*, (SELECT COUNT(*) FROM memberships m WHERE m.login = u.login) AS clients FROM users u ORDER BY u.login').all() as Row[];
   return rows.map((r) => ({ ...userOf(r), clients: Number(r.clients) }));
 }
-/** A new person; without a password they get a temporary one (returned once) to change at first sign-in. */
-export function createUser(input: { login: string; name?: string; password?: string; platformAdmin?: boolean }, actor: string): { user: User; temporaryPassword?: string } {
+/**
+ * A new person; without a password they get a temporary one (returned once). A password someone
+ * else set — an administrator typing it in — must be changed at first sign-in too, so that nobody
+ * keeps knowing it; only a password the person chose themselves (`ownPassword`) stands.
+ */
+export function createUser(input: { login: string; name?: string; password?: string; platformAdmin?: boolean; ownPassword?: boolean }, actor: string): { user: User; temporaryPassword?: string } {
   const login = normaliseLogin(input.login);
   if (!validLogin(login)) throw new Error('a login is an e-mail address');
   if (getUser(login)) throw new Error(`${login} already has an account`);
@@ -292,7 +312,8 @@ export function createUser(input: { login: string; name?: string; password?: str
     pw = temp;
   }
   const name = String(input.name ?? '').trim().slice(0, 120) || login.split('@')[0];
-  theDb().prepare('INSERT INTO users (login, name, password, platform_admin, status, must_change, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(login, name, hashPassword(pw), input.platformAdmin ? 1 : 0, 'active', temp ? 1 : 0, now());
+  const mustChange = !!temp || !input.ownPassword;
+  theDb().prepare('INSERT INTO users (login, name, password, platform_admin, status, must_change, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(login, name, hashPassword(pw), input.platformAdmin ? 1 : 0, 'active', mustChange ? 1 : 0, now());
   audit(actor, 'user.created', { target: login, detail: input.platformAdmin ? 'platform administrator' : undefined });
   return { user: getUser(login)!, temporaryPassword: temp };
 }
@@ -539,7 +560,12 @@ export function resolveAccount(req: IncomingMessage, proxyLogin?: string): Accou
   const asked = boundTenant ?? requestedTenant(req);
   let chosen: { tenant: Tenant; role: Role } | undefined;
   let denied: Account['denied'];
-  if (asked) {
+  // an API token works in its own client only: naming another one is a mistake to surface, not ignore
+  const named = boundTenant ? requestedTenant(req) : '';
+  const bound = boundTenant ? getTenant(boundTenant) : null;
+  if (named && (!bound || (named !== bound.id && named !== bound.slug))) {
+    denied = 'token-client';
+  } else if (asked) {
     chosen = memberships.find((m) => m.tenant.id === asked || m.tenant.slug === asked);
     if (!chosen) denied = 'not-a-member';
   } else {
@@ -565,32 +591,136 @@ export function resolveAccount(req: IncomingMessage, proxyLogin?: string): Accou
 }
 
 // ------------------------------------------------------------------ sign-in throttling
-const failures = new Map<string, { n: number; first: number }>();
+// Hard limits per address and per address+account; across addresses an account only slows down (a
+// pause that grows to 30 s), so nobody can lock a known e-mail out by failing on purpose. Counters
+// live in SQLite (they survive a restart) and expire after the window; when too many are tracked
+// the oldest go first — never all at once.
 const WINDOW_MS = 15 * 60_000;
-const LIMITS = { ip: 30, login: 8 };
+const LIMITS = { ip: 30, pair: 8 };
+const SOFT_AFTER = 20;
+const SOFT_MAX_S = 30;
+const MAX_KEYS = 200_000;
+const failRow = (key: string) => theDb().prepare('SELECT count, first_at, last_at FROM signin_failures WHERE key = ?').get(key) as { count: number; first_at: number; last_at: number } | undefined;
 /** Seconds to wait before another attempt (0 = go ahead). */
 export function throttled(ip: string, login: string): number {
+  if (!db) return 0;
   const t = Date.now();
   let wait = 0;
-  for (const [key, limit] of [[`ip:${ip}`, LIMITS.ip], [`login:${login}`, LIMITS.login]] as const) {
-    const f = failures.get(key);
-    if (!f) continue;
-    if (t - f.first > WINDOW_MS) failures.delete(key);
-    else if (f.n >= limit) wait = Math.max(wait, Math.ceil((f.first + WINDOW_MS - t) / 1000));
+  for (const [key, limit] of [[`ip:${ip}`, LIMITS.ip], [`pair:${ip}|${login}`, LIMITS.pair]] as const) {
+    const r = failRow(key);
+    if (!r) continue;
+    if (t - r.first_at > WINDOW_MS) theDb().prepare('DELETE FROM signin_failures WHERE key = ?').run(key);
+    else if (r.count >= limit) wait = Math.max(wait, Math.ceil((r.first_at + WINDOW_MS - t) / 1000));
+  }
+  const r = failRow(`login:${login}`);
+  if (r && t - r.first_at <= WINDOW_MS && r.count >= SOFT_AFTER) {
+    const pause = Math.min(SOFT_MAX_S, 2 ** Math.min(5, r.count - SOFT_AFTER)) * 1000;
+    const left = r.last_at + pause - t;
+    if (left > 0) wait = Math.max(wait, Math.ceil(left / 1000));
   }
   return wait;
 }
+let pruned = 0;
 export function noteFailure(ip: string, login: string) {
+  if (!db) return;
   const t = Date.now();
-  for (const key of [`ip:${ip}`, `login:${login}`]) {
-    const f = failures.get(key);
-    if (!f || t - f.first > WINDOW_MS) failures.set(key, { n: 1, first: t });
-    else f.n++;
+  const up = theDb().prepare(
+    `INSERT INTO signin_failures (key, count, first_at, last_at) VALUES (?, 1, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET
+       count = CASE WHEN ? - first_at > ? THEN 1 ELSE count + 1 END,
+       first_at = CASE WHEN ? - first_at > ? THEN ? ELSE first_at END,
+       last_at = ?`,
+  );
+  for (const key of [`ip:${ip}`, `pair:${ip}|${login}`, `login:${login}`]) up.run(key, t, t, t, WINDOW_MS, t, WINDOW_MS, t, t);
+  if (t - pruned > 60_000) {
+    pruned = t;
+    theDb().prepare('DELETE FROM signin_failures WHERE last_at < ?').run(t - WINDOW_MS);
+    const n = Number((theDb().prepare('SELECT COUNT(*) AS n FROM signin_failures').get() as Row).n);
+    if (n > MAX_KEYS) theDb().prepare('DELETE FROM signin_failures WHERE key IN (SELECT key FROM signin_failures ORDER BY last_at LIMIT ?)').run(n - Math.floor(MAX_KEYS * 0.9));
   }
-  if (failures.size > 50_000) failures.clear();
 }
-export const clearFailures = (login: string) => failures.delete(`login:${login}`);
+/** After a successful sign-in: that address's count for the account, and the account's own pause. */
+export function clearFailures(ip: string, login: string) {
+  if (!db) return;
+  theDb().prepare('DELETE FROM signin_failures WHERE key IN (?, ?)').run(`pair:${ip}|${login}`, `login:${login}`);
+}
+/** "try again in 40 seconds" / "in 3 minutes" */
+export const waitText = (s: number) => (s < 60 ? `${s} second${s === 1 ? '' : 's'}` : `${Math.ceil(s / 60)} minute${s > 60 ? 's' : ''}`);
 
+// ------------------------------------------------------------------ invitations
+// A client administrator invites; the person accepts. An existing account is never attached to a
+// client without its owner's consent, and the reply to "invite x@y" is the same whether or not x@y
+// has an account anywhere (no way to probe which e-mails exist).
+export const INVITE_DAYS = Math.max(1, Number(process.env.GRIDWRIGHT_INVITE_DAYS ?? 7) || 7);
+export interface Invitation {
+  id: string;
+  tenant: string;
+  login: string;
+  role: Role;
+  createdAt: string;
+  createdBy: string;
+  expiresAt: string;
+}
+const invitationOf = (r: Row): Invitation => ({ id: String(r.id), tenant: String(r.tenant), login: String(r.login), role: isRole(r.role) ? r.role : 'viewer', createdAt: String(r.created_at), createdBy: String(r.created_by ?? ''), expiresAt: String(r.expires_at) });
+/** A new invitation (any earlier one for the same person and client is replaced); the code is shown once. */
+export function createInvitation(tenant: string, login: string, role: Role, actor: string): Invitation & { code: string } {
+  const t = getTenant(tenant);
+  if (!t) throw new Error('no such client');
+  const l = normaliseLogin(login);
+  if (!validLogin(l)) throw new Error('a login is an e-mail address');
+  if (!isRole(role)) throw new Error('role is admin, editor or viewer');
+  if (roleIn(t.id, l)) throw new Error(`${l} is already a member of ${t.name}`);
+  if (t.seats !== null && membersOf(t.id).length >= t.seats) throw new Error(`${t.name} has used all ${t.seats} seats of its plan`);
+  theDb().prepare('DELETE FROM invitations WHERE tenant = ? AND login = ? AND accepted_at IS NULL').run(t.id, l);
+  const code = `gwi_${randomBytes(24).toString('base64url')}`;
+  const id = randomBytes(8).toString('hex');
+  const created = now();
+  const expires = new Date(Date.now() + INVITE_DAYS * 86_400_000).toISOString();
+  theDb().prepare('INSERT INTO invitations (code_hash, id, tenant, login, role, created_at, created_by, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(hashOf(code), id, t.id, l, role, created, actor, expires);
+  audit(actor, 'member.invited', { tenant: t.id, target: l, detail: role });
+  return { id, tenant: t.id, login: l, role, createdAt: created, createdBy: actor, expiresAt: expires, code };
+}
+export function listInvitations(tenant: string): Invitation[] {
+  const rows = theDb().prepare('SELECT * FROM invitations WHERE tenant = ? AND accepted_at IS NULL AND expires_at > ? ORDER BY created_at DESC').all(tenant, now()) as Row[];
+  return rows.map(invitationOf);
+}
+export function revokeInvitation(tenant: string, id: string, actor: string): boolean {
+  const r = theDb().prepare('SELECT * FROM invitations WHERE tenant = ? AND id = ? AND accepted_at IS NULL').get(tenant, id) as Row | undefined;
+  if (!r) return false;
+  theDb().prepare('DELETE FROM invitations WHERE id = ?').run(id);
+  audit(actor, 'member.invitation-revoked', { tenant, target: String(r.login) });
+  return true;
+}
+/** The pending invitation behind a code (null: unknown, used, expired, or its client is gone/suspended). */
+export function invitationByCode(code: string): (Invitation & { tenantName: string }) | null {
+  if (!db || typeof code !== 'string' || !code.startsWith('gwi_') || code.length > 100) return null;
+  const r = db.prepare('SELECT * FROM invitations WHERE code_hash = ? AND accepted_at IS NULL AND expires_at > ?').get(hashOf(code), now()) as Row | undefined;
+  if (!r) return null;
+  const t = getTenant(String(r.tenant));
+  if (!t || t.status !== 'active') return null;
+  return { ...invitationOf(r), tenantName: t.name };
+}
+/**
+ * Accept: with the password of the existing account, or — when there is none — the password the
+ * person chooses now. The same message for "wrong password" and "no such account" mismatches.
+ */
+export function acceptInvitation(code: string, password: string, name: string | undefined): { login: string; tenant: Tenant; role: Role } {
+  const inv = invitationByCode(code);
+  if (!inv) throw new Error('this invitation is no longer valid — ask for a new one');
+  // the policy first, for both cases: the answer must not tell whether the account exists
+  const problem = passwordProblem(password);
+  if (problem) throw new Error(problem);
+  const existing = getUser(inv.login);
+  if (existing) {
+    if (!verifyLogin(inv.login, password)) throw new Error('wrong password for this account');
+  } else {
+    createUser({ login: inv.login, name, password, ownPassword: true }, inv.login);
+  }
+  addMember(inv.tenant, inv.login, inv.role, inv.createdBy || inv.login);
+  theDb().prepare('UPDATE invitations SET accepted_at = ? WHERE id = ?').run(now(), inv.id);
+  audit(inv.login, 'member.invitation-accepted', { tenant: inv.tenant, target: inv.login, detail: inv.role });
+  return { login: inv.login, tenant: getTenant(inv.tenant)!, role: inv.role };
+}
 // ------------------------------------------------------------------ start-up
 /**
  * Open the accounts store and make sure the platform can be entered: a default client (where every
@@ -625,7 +755,7 @@ export async function initTenancy(): Promise<void> {
   if (Number((db.prepare('SELECT COUNT(*) AS n FROM users').get() as Row).n) === 0) {
     const login = normaliseLogin(process.env.GRIDWRIGHT_ADMIN_EMAIL ?? 'admin@gridwright.local');
     const given = process.env.GRIDWRIGHT_ADMIN_PASSWORD ?? '';
-    const { temporaryPassword: temp } = createUser({ login, name: process.env.GRIDWRIGHT_ADMIN_NAME ?? 'Administrator', password: given || undefined, platformAdmin: true }, 'system');
+    const { temporaryPassword: temp } = createUser({ login, name: process.env.GRIDWRIGHT_ADMIN_NAME ?? 'Administrator', password: given || undefined, platformAdmin: true, ownPassword: !!given }, 'system');
     addMember(DEFAULT_TENANT, login, 'admin', 'system');
     if (temp) {
       const file = join(DATA_DIR, 'initial-admin.txt');

@@ -8,6 +8,7 @@ import mysql from 'mysql2';
 import pg from 'pg';
 import Cursor from 'pg-cursor';
 import { decrypt, type StoredConnection } from './storage.js';
+import { clientNetError, EGRESS_GUARD, guardedConnector, guardedSocket, GuardedSocket } from './netguard.js';
 
 const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -160,6 +161,8 @@ export async function runQuery(c: StoredConnection, sql: string, limit: number, 
 async function runPostgres(c: StoredConnection, password: string, sql: string, max: number, timeoutMs: number, readOnly: boolean, params: Param[], t0: number): Promise<QueryResult> {
   const { text } = rewritePlaceholders(sql, (i) => `$${i + 1}`);
   const client = new pg.Client({
+    // with the egress guard the socket resolves the name itself and refuses private addresses
+    ...(EGRESS_GUARD ? { stream: () => new GuardedSocket() } : {}),
     host: c.host,
     port: c.port,
     database: c.database,
@@ -201,7 +204,7 @@ async function runMssql(c: StoredConnection, password: string, sql: string, max:
     connectionTimeout: 10000,
     requestTimeout: timeoutMs,
     arrayRowMode: true,
-    options: { encrypt: !!c.ssl, trustServerCertificate: true, enableArithAbort: true },
+    options: { encrypt: !!c.ssl, trustServerCertificate: true, enableArithAbort: true, ...(EGRESS_GUARD ? { connector: guardedConnector(c.host, c.port || 1433) } : {}) } as any,
     pool: { max: 2, min: 0, idleTimeoutMillis: 5000 },
   });
   await pool.connect();
@@ -243,6 +246,7 @@ async function runMssql(c: StoredConnection, password: string, sql: string, max:
 
 async function runMysql(c: StoredConnection, password: string, sql: string, max: number, timeoutMs: number, readOnly: boolean, params: Param[], t0: number): Promise<QueryResult> {
   const raw = mysql.createConnection({
+    ...(EGRESS_GUARD ? { stream: () => guardedSocket(c.host, c.port || 3306) } : {}),
     host: c.host,
     port: c.port,
     database: c.database,
@@ -315,6 +319,6 @@ export async function testConnection(c: StoredConnection): Promise<{ ok: boolean
     const r = await runQuery(c, probe, 1);
     return { ok: true, message: String(r.rows[0]?.[0] ?? 'connected').split('\n')[0] };
   } catch (e) {
-    return { ok: false, message: (e as Error).message };
+    return { ok: false, message: EGRESS_GUARD ? clientNetError(e, 'the database server') : (e as Error).message };
   }
 }
