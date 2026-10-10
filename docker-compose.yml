@@ -19,7 +19,12 @@ services:
       GRIDWRIGHT_READONLY: ${GRIDWRIGHT_READONLY:-}
       # Sharing level of new documents: none (private; the default when identity is on), view or edit.
       GRIDWRIGHT_DEFAULT_SHARING: ${GRIDWRIGHT_DEFAULT_SHARING:-}
-      # Server-side Python cells: the image ships python3 + pandas; the container is the sandbox.
+      # Server-side Python cells and the companion's generated code: `auto` (default) runs them under
+      # bubblewrap when the container may create user namespaces (see security_opt below) and keeps
+      # them OFF otherwise — never a plain process by accident; `none` accepts the container as the only
+      # boundary knowingly (generated code then sees /data). /api/python reports what is in use.
+      GRIDWRIGHT_PYTHON_SANDBOX: ${GRIDWRIGHT_PYTHON_SANDBOX:-auto}
+      GRIDWRIGHT_INBOX: ${GRIDWRIGHT_INBOX:-}
       # Limits per run (ms, MB, parallel runs); GRIDWRIGHT_PYTHON=off disables the runtime.
       GRIDWRIGHT_PYTHON_TIMEOUT_MS: ${GRIDWRIGHT_PYTHON_TIMEOUT_MS:-60000}
       GRIDWRIGHT_PYTHON_MEMORY_MB: ${GRIDWRIGHT_PYTHON_MEMORY_MB:-2048}
@@ -28,6 +33,9 @@ services:
       AI_BASE_URL: ${AI_BASE_URL:-}
       AI_MODEL: ${AI_MODEL:-}
       AI_API_KEY: ${AI_API_KEY:-}
+    # Let the container create user namespaces so that bubblewrap isolates generated code from /data
+    # (the host must allow unprivileged user namespaces; Ubuntu ≥ 23.10 restricts them under AppArmor):
+    # security_opt: ["seccomp=unconfined", "apparmor=unconfined"]
     volumes:
       - ./data:/data          # documents, history, connections; ./data/pyodide → offline Python runtime
     extra_hosts:

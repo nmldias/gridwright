@@ -101,7 +101,7 @@ docker compose -f docker-compose.ghcr.yml up -d      # published multi-arch imag
 docker compose up -d --build                         # or build from source on this host (~10 min first time)
 ```
 
-Documents, history, connections and settings live in `./data`; put a Pyodide distribution in `./data/pyodide` for offline browser Python. The image ships python3 + pandas + matplotlib for server-side cells; inside Docker the container is the sandbox (no nested namespaces), so give it no more than it needs.
+Documents, history, connections and settings live in `./data`; put a Pyodide distribution in `./data/pyodide` for offline browser Python. The image ships python3 + pandas + matplotlib for server-side cells, bubblewrap, and the companion's investigation stack at the tested versions (`/api/investigation` reports it). Isolation is stated, not assumed: by default (`GRIDWRIGHT_PYTHON_SANDBOX=auto`) cells and generated code run under bubblewrap when the container may create user namespaces (`security_opt: ["seccomp=unconfined", "apparmor=unconfined"]` on a host that allows them) and stay **off** otherwise — `/api/python` says why; `GRIDWRIGHT_PYTHON_SANDBOX=none` accepts the container as the only boundary knowingly, and generated code then sees `/data`. CI starts the built image and checks what it declares (version, stack, sandbox level, MCP) before pushing it.
 
 ### From source
 

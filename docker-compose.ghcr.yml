@@ -14,9 +14,18 @@ services:
       GRIDWRIGHT_TRUST_TAILSCALE: ${GRIDWRIGHT_TRUST_TAILSCALE:-0}
       GRIDWRIGHT_ADMINS: ${GRIDWRIGHT_ADMINS:-}
       GRIDWRIGHT_READONLY: ${GRIDWRIGHT_READONLY:-}
+      # Server-side Python cells and the companion's generated code: `auto` (default) runs them under
+      # bubblewrap when the container may create user namespaces (see security_opt below) and keeps
+      # them OFF otherwise — never a plain process by accident; `none` accepts the container as the only
+      # boundary knowingly (generated code then sees /data). /api/python reports what is in use.
+      GRIDWRIGHT_PYTHON_SANDBOX: ${GRIDWRIGHT_PYTHON_SANDBOX:-auto}
+      GRIDWRIGHT_INBOX: ${GRIDWRIGHT_INBOX:-}
       AI_BASE_URL: ${AI_BASE_URL:-}
       AI_MODEL: ${AI_MODEL:-}
       AI_API_KEY: ${AI_API_KEY:-}
+    # Let the container create user namespaces so that bubblewrap isolates generated code from /data
+    # (the host must allow unprivileged user namespaces; Ubuntu ≥ 23.10 restricts them under AppArmor):
+    # security_opt: ["seccomp=unconfined", "apparmor=unconfined"]
     volumes:
       - ./data:/data          # documents, history, connections; put a Pyodide copy in ./data/pyodide for offline Python
     extra_hosts:

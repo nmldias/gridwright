@@ -49,10 +49,18 @@ RUN npx tsc -p tsconfig.json && npm prune --omit=dev
 # 4. Runtime
 # ---------------------------------------------------------------------------
 FROM node:22-bookworm-slim
-ENV NODE_ENV=production PORT=8787 HOST=0.0.0.0 GRIDWRIGHT_DATA=/data CLIENT_DIR=/app/client GRIDWRIGHT_PYTHON_SANDBOX=none
-# python3 + pandas for server-side Python cells (the container is the sandbox: no namespaces inside Docker)
-RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pandas python3-matplotlib && rm -rf /var/lib/apt/lists/*
+# GRIDWRIGHT_PYTHON_SANDBOX=auto: bubblewrap when the container may create user namespaces (run with
+# --security-opt seccomp=unconfined --security-opt apparmor=unconfined on a host that allows them),
+# a user namespace alone when it may, else a plain process with the container as the only boundary —
+# /api/python and /api/health report which, and every run record carries it
+ENV NODE_ENV=production PORT=8787 HOST=0.0.0.0 GRIDWRIGHT_DATA=/data CLIENT_DIR=/app/client GRIDWRIGHT_PYTHON_SANDBOX=auto GRIDWRIGHT_AGENT_PYTHON=/opt/companion/bin/python
+# python3 + pandas for server-side Python cells; bubblewrap for the sandbox when the runtime allows it;
+# the companion's investigation stack (LangChain, DeepAgents, LangGraph) in its own venv at the tested versions
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv python3-pandas python3-matplotlib bubblewrap && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+COPY integrations/companion ./integrations/companion
+RUN python3 -m venv --system-site-packages /opt/companion && /opt/companion/bin/pip install --no-cache-dir -q -r integrations/companion/requirements.lock.txt \
+ && /opt/companion/bin/python integrations/companion/investigate.py --probe
 COPY --from=server /src/server/dist ./server/dist
 COPY --from=server /src/server/engine ./server/engine
 COPY --from=server /src/server/runner ./server/runner

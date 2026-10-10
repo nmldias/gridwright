@@ -209,6 +209,43 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the amd64 image for testing
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: linux/amd64
+          load: true
+          tags: gridwright:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Test the deployable image, not the checkout (declared capabilities and isolation as it ships)
+        run: |
+          set -e
+          probe() { # $1 = container name
+            for i in $(seq 1 60); do curl -fsS "http://127.0.0.1:$2/api/health" >/dev/null 2>&1 && break; sleep 1; done
+            curl -fsS "http://127.0.0.1:$2/api/health" | tee /dev/stderr | grep -q "\"version\":\"$(node -p "require('./server/package.json').version")\""
+            curl -fsS "http://127.0.0.1:$2/api/investigation" | tee /dev/stderr | grep -q '"available":true'
+            for i in $(seq 1 60); do curl -fsS "http://127.0.0.1:$2/api/python" 2>/dev/null | grep -qv '"not probed yet"' && break; sleep 1; done
+            curl -fsS "http://127.0.0.1:$2/api/python" | tee /dev/stderr
+            curl -fsS -X POST "http://127.0.0.1:$2/mcp" -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | grep -q '"propose_edit"'
+          }
+          level() { curl -fsS "http://127.0.0.1:$1/api/python" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const p=JSON.parse(s);console.log(p.available?"on:"+p.sandbox:"off:"+p.reason)})'; }
+          # as it ships: the stack is there; server-side Python is either bubblewrap-sandboxed or off — never a plain process by default
+          docker run -d --name gw-default -p 8790:8787 gridwright:test
+          probe gw-default 8790
+          L=$(level 8790); echo "default run: $L"; case "$L" in on:bwrap|off:*) ;; *) echo "unexpected sandbox level by default: $L"; exit 1 ;; esac
+          docker logs gw-default | tail -5; docker rm -f gw-default
+          # with the container allowed to create user namespaces (host permitting): bubblewrap, the data directory hidden from cells — reported, not required
+          docker run -d --name gw-userns -p 8791:8787 --security-opt seccomp=unconfined --security-opt apparmor=unconfined gridwright:test
+          probe gw-userns 8791
+          echo "userns run: $(level 8791)"
+          docker rm -f gw-userns
+          # accepting the container as the only boundary, by name
+          docker run -d --name gw-none -p 8792:8787 -e GRIDWRIGHT_PYTHON_SANDBOX=none gridwright:test
+          probe gw-none 8792
+          curl -fsS http://127.0.0.1:8792/api/python | grep -q '"sandbox":"none"'
+          docker rm -f gw-none
       - name: Build and push (linux/amd64, linux/arm64) from the prebuilt tree
         uses: docker/build-push-action@v6
         with:
