@@ -11,8 +11,13 @@ import { decrypt, type StoredConnection } from './storage.js';
 
 const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
+/** The coarse kind of a result column, from the driver's column metadata — the data contract a value is converted under. */
+export type ColumnKind = 'number' | 'text' | 'date' | 'datetime' | 'boolean' | 'json' | 'binary' | 'unknown';
+
 export interface QueryResult {
   columns: string[];
+  /** the declared kind of each column: a VARCHAR of digits stays text, a NUMERIC becomes a number — never guessed from the value's look */
+  kinds: ColumnKind[];
   rows: (string | number | boolean | null)[][];
   /** rows seen by the server (limit + 1 when truncated) */
   rowCount: number;
@@ -27,16 +32,62 @@ export const MAX_TIMEOUT_MS = 300_000;
 export const DEFAULT_MAX_ROWS = 5000;
 export const HARD_MAX_ROWS = 50_000;
 
-function plain(v: unknown): string | number | boolean | null {
+// PostgreSQL type OIDs → kinds (pg reports the OID of every result column, expressions included)
+const PG_KINDS: Record<number, ColumnKind> = { 16: 'boolean', 17: 'binary', 20: 'number', 21: 'number', 23: 'number', 25: 'text', 26: 'number', 114: 'json', 700: 'number', 701: 'number', 790: 'number', 1042: 'text', 1043: 'text', 1082: 'date', 1083: 'text', 1114: 'datetime', 1184: 'datetime', 1186: 'text', 1700: 'number', 2950: 'text', 3802: 'json' };
+// MySQL / MariaDB column type codes → kinds
+const MYSQL_KINDS: Record<number, ColumnKind> = { 0: 'number', 1: 'number', 2: 'number', 3: 'number', 4: 'number', 5: 'number', 6: 'unknown', 7: 'datetime', 8: 'number', 9: 'number', 10: 'date', 11: 'text', 12: 'datetime', 13: 'number', 14: 'date', 15: 'text', 16: 'binary', 245: 'json', 246: 'number', 247: 'text', 248: 'text', 249: 'binary', 250: 'binary', 251: 'binary', 252: 'binary', 253: 'text', 254: 'text', 255: 'binary' };
+const MYSQL_BINARY_FLAG = 128;
+function mysqlKind(f: { columnType?: number; type?: number; flags?: number | string[]; charsetNr?: number; characterSet?: number }): ColumnKind {
+  const code = f.columnType ?? f.type;
+  const k = code === undefined ? 'unknown' : (MYSQL_KINDS[code] ?? 'unknown');
+  // a *_BLOB with a text character set is text (TEXT columns report as BLOB); binary ones carry the flag or the binary charset (63)
+  if (k === 'binary' && code !== undefined && code >= 249 && code <= 252) {
+    const charset = f.charsetNr ?? f.characterSet;
+    const binary = (typeof f.flags === 'number' && (f.flags & MYSQL_BINARY_FLAG) !== 0) || charset === 63;
+    return binary ? 'binary' : 'text';
+  }
+  return k;
+}
+// SQL Server: the mssql driver names each column's type (sql.VarChar → declaration 'varchar')
+function mssqlKind(t: unknown): ColumnKind {
+  const name = String((t as { declaration?: string; name?: string } | undefined)?.declaration ?? (t as { name?: string } | undefined)?.name ?? '').toLowerCase();
+  if (!name) return 'unknown';
+  if (/^(bit)$/.test(name)) return 'boolean';
+  if (/^(tinyint|smallint|int|bigint|decimal|numeric|float|real|money|smallmoney)$/.test(name)) return 'number';
+  if (/^date$/.test(name)) return 'date';
+  if (/^(datetime|datetime2|smalldatetime|datetimeoffset)$/.test(name)) return 'datetime';
+  if (/^(binary|varbinary|image)$/.test(name)) return 'binary';
+  return 'text';
+}
+
+const pad = (n: number) => String(n).padStart(2, '0');
+/** A date-typed value as the calendar day it names (no time zone shift), a datetime as ISO. */
+function dateText(v: unknown, kind: ColumnKind): string {
+  if (v instanceof Date) {
+    if (Number.isNaN(v.getTime())) return '';
+    return kind === 'date' ? `${v.getFullYear()}-${pad(v.getMonth() + 1)}-${pad(v.getDate())}` : v.toISOString();
+  }
+  return String(v);
+}
+
+/**
+ * A driver value under its column's declared kind. Numbers come only from numeric columns (a
+ * NUMERIC or BIGINT that pg returns as text is parsed; a value with 16 or more digits is kept as
+ * text so that no digit is lost); a text column stays text whatever its values look like —
+ * an identifier such as 000123 keeps its zeros; dates are the day they name.
+ */
+export function plain(v: unknown, kind: ColumnKind = 'unknown'): string | number | boolean | null {
   if (v === null || v === undefined) return null;
-  if (typeof v === 'number' || typeof v === 'boolean') return v;
-  if (typeof v === 'bigint') return Number(v);
+  if (kind === 'date' || kind === 'datetime') return dateText(v, kind);
+  if (typeof v === 'boolean') return v;
+  if (kind === 'boolean') return typeof v === 'number' ? v !== 0 : /^(1|t|true|yes)$/i.test(String(v));
+  if (typeof v === 'number') return v;
+  if (typeof v === 'bigint') return v <= Number.MAX_SAFE_INTEGER && v >= Number.MIN_SAFE_INTEGER ? Number(v) : v.toString();
   if (v instanceof Date) return v.toISOString();
   if (Buffer.isBuffer(v)) return v.toString('base64');
   if (typeof v === 'object') return JSON.stringify(v);
   const s = String(v);
-  // numeric strings from pg (NUMERIC/BIGINT come back as text)
-  if (/^-?\d+(\.\d+)?$/.test(s) && s.length < 16) return Number(s);
+  if (kind === 'number' && /^-?\d+(\.\d+)?([eE][-+]?\d+)?$/.test(s) && s.replace(/[-.]/g, '').length < 16) return Number(s);
   return s;
 }
 
@@ -123,8 +174,8 @@ async function runPostgres(c: StoredConnection, password: string, sql: string, m
     // a read-only transaction is enforced by the database itself, whatever the text says
     if (readOnly) await client.query('BEGIN READ ONLY');
     const cursor = client.query(new Cursor(text, params, { rowMode: 'array' } as never));
-    const { rows, fields } = await new Promise<{ rows: unknown[][]; fields: { name: string }[] }>((resolve, reject) => {
-      cursor.read(max + 1, (err: Error | undefined, rows: unknown[][], result?: { fields?: { name: string }[] }) => {
+    const { rows, fields } = await new Promise<{ rows: unknown[][]; fields: { name: string; dataTypeID?: number }[] }>((resolve, reject) => {
+      cursor.read(max + 1, (err: Error | undefined, rows: unknown[][], result?: { fields?: { name: string; dataTypeID?: number }[] }) => {
         if (err) reject(err);
         else resolve({ rows, fields: result?.fields ?? [] });
       });
@@ -132,7 +183,8 @@ async function runPostgres(c: StoredConnection, password: string, sql: string, m
     await new Promise<void>((resolve) => cursor.close(() => resolve()));
     if (readOnly) await client.query('ROLLBACK').catch(() => undefined);
     const truncated = rows.length > max;
-    return { columns: fields.map((f) => f.name), rows: rows.slice(0, max).map((row) => row.map(plain)), rowCount: rows.length, truncated, ms: Date.now() - t0 };
+    const kinds = fields.map((f) => (f.dataTypeID === undefined ? 'unknown' : (PG_KINDS[f.dataTypeID] ?? 'unknown')));
+    return { columns: fields.map((f) => f.name), kinds, rows: rows.slice(0, max).map((row) => row.map((v, i) => plain(v, kinds[i]))), rowCount: rows.length, truncated, ms: Date.now() - t0 };
   } finally {
     await client.end().catch(() => undefined);
   }
@@ -159,11 +211,14 @@ async function runMssql(c: StoredConnection, password: string, sql: string, max:
     request.stream = true;
     params.forEach((p, i) => request.input(`p${i}`, p));
     let columns: string[] = [];
+    let kinds: ColumnKind[] = [];
     const rows: unknown[][] = [];
     let truncated = false;
     await new Promise<void>((resolve, reject) => {
       request.on('recordset', (cols: unknown) => {
-        columns = Array.isArray(cols) ? (cols as { name: string }[]).map((x) => x.name) : Object.keys(cols as object);
+        const list = Array.isArray(cols) ? (cols as { name: string; type?: unknown }[]) : Object.values(cols as Record<string, { name: string; type?: unknown }>);
+        columns = list.map((x) => x.name);
+        kinds = list.map((x) => mssqlKind(x.type));
         rows.length = 0; // only the last result set is returned
       });
       request.on('row', (row: unknown) => {
@@ -180,7 +235,7 @@ async function runMssql(c: StoredConnection, password: string, sql: string, max:
       request.on('done', () => resolve());
       request.query(text);
     });
-    return { columns, rows: rows.map((row) => row.map(plain)), rowCount: rows.length + (truncated ? 1 : 0), truncated, ms: Date.now() - t0 };
+    return { columns, kinds, rows: rows.map((row) => row.map((v, i) => plain(v, kinds[i]))), rowCount: rows.length + (truncated ? 1 : 0), truncated, ms: Date.now() - t0 };
   } finally {
     await pool.close().catch(() => undefined);
   }
@@ -218,6 +273,7 @@ async function runMysql(c: StoredConnection, password: string, sql: string, max:
       }
     }
     let columns: string[] = [];
+    let kinds: ColumnKind[] = [];
     const rows: unknown[][] = [];
     let truncated = false;
     await new Promise<void>((resolve, reject) => {
@@ -226,9 +282,11 @@ async function runMysql(c: StoredConnection, password: string, sql: string, max:
       q.on('fields', (fields: unknown) => {
         // a statement without a result set (DDL, INSERT on a read-write connection) reports no fields
         if (!fields || !Array.isArray(fields) || !fields.length) return;
-        const f = fields as { name: string }[] | { name: string }[][];
-        const list = (Array.isArray(f[0]) ? (f as { name: string }[][])[f.length - 1] : (f as { name: string }[])) ?? [];
+        type F = { name: string; columnType?: number; type?: number; flags?: number | string[]; charsetNr?: number; characterSet?: number };
+        const f = fields as F[] | F[][];
+        const list = (Array.isArray(f[0]) ? (f as F[][])[f.length - 1] : (f as F[])) ?? [];
         columns = list.map((x) => x.name);
+        kinds = list.map(mysqlKind);
       });
       stream.on('data', (row: unknown) => {
         if (!Array.isArray(row) && !columns.length) return; // an OK packet, not a row
@@ -244,7 +302,7 @@ async function runMysql(c: StoredConnection, password: string, sql: string, max:
       stream.on('close', () => resolve());
     });
     if (readOnly && !truncated) await conn.query('ROLLBACK').catch(() => undefined);
-    return { columns, rows: rows.map((row) => row.map(plain)), rowCount: rows.length + (truncated ? 1 : 0), truncated, ms: Date.now() - t0 };
+    return { columns, kinds, rows: rows.map((row) => row.map((v, i) => plain(v, kinds[i]))), rowCount: rows.length + (truncated ? 1 : 0), truncated, ms: Date.now() - t0 };
   } finally {
     // a destroyed stream leaves the connection mid-result: drop it rather than reuse it
     raw.destroy();

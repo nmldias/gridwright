@@ -300,7 +300,7 @@ function IntakeCard({ p }: { p: IntakeProfile }) {
               {set.columns.map((c) => (
                 <tr key={c.index}>
                   <td>{c.header}{c.constant ? <span className="muted"> (all “{c.constant}”)</span> : ''}</td>
-                  <td>{c.type}{c.leadingZeros ? ` · ${c.leadingZeros} with leading zeros kept` : ''}{c.textInNumber ? ` · ${c.textInNumber} text` : ''}</td>
+                  <td>{c.type}{c.declared ? ` (declared ${c.declared})` : ''}{c.leadingZeros ? ` · ${c.leadingZeros} with leading zeros kept` : ''}{c.textInNumber ? ` · ${c.textInNumber} text` : ''}</td>
                   <td>{c.filled}{c.blanks ? ` (${c.blanks} blank)` : ''}</td>
                   <td>{c.unit ?? ''}</td>
                   <td className="muted">{c.sample.join(' · ')}</td>

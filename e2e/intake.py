@@ -12,7 +12,7 @@ suspends the trend) · a workbook with formulas · XML and JSON records · a sou
 (conflict kept) · hostile cells inert · a ragged row quarantined · monitoring failure is never quiet ·
 an agent's snapshot never displaces a person's · the inbox adapter · the phone.
 
-Usage: python3 e2e/intake.py [http://localhost:8787] [--inbox /path/to/GRIDWRIGHT_INBOX]
+Usage: python3 e2e/intake.py [http://localhost:8787] [--inbox /path/to/GRIDWRIGHT_INBOX] [--pg host:port:db:user:pass]
 """
 import json
 import os
@@ -28,9 +28,12 @@ from playwright.sync_api import sync_playwright
 ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
 BASE = ARGS[0] if ARGS else "http://localhost:8787"
 INBOX = None
+PG = None
 for i, a in enumerate(sys.argv):
     if a == "--inbox":
         INBOX = sys.argv[i + 1]
+    if a == "--pg":
+        PG = sys.argv[i + 1].split(":")
 OUT = os.environ.get("E2E_OUT", "/tmp/gridwright-e2e")
 os.makedirs(OUT, exist_ok=True)
 LAUNCH = ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"]
@@ -352,6 +355,20 @@ def main():
             check("   placed, the file moves to taken/ with its key; the table and the source record follow", applied["status"] == "applied" and moved and next(r for r in companion()["records"] if r["kind"] == "source" and r["status"] == "stated" and r["source"] == "inventory")["period"] == "2026-10-27", str(moved))
         else:
             print("SKIP inbox adapter (start the server with GRIDWRIGHT_INBOX and pass --inbox)")
+
+        # ================================================================ 15b. a SQL snapshot: the database's declared types are the contract
+        if PG:
+            host, port, db, user, pw = PG
+            conn = rest("POST", "/api/connections", {"name": "intake pg", "kind": "postgres", "host": host, "port": int(port), "database": db, "user": user, "password": pw, "ssl": False})
+            sql = "SELECT * FROM (VALUES ('000123'::varchar, 'Tucson'::text, 24150009.00::numeric, DATE '2026-10-06', 12345678901234567890::numeric, 95::int, true), ('000124', 'Creta', 18629981.50, DATE '2026-10-01', 12345678901234567891, 120, false)) AS v(vin, model, landed_cost, entry_date, reference, days, reserved) ORDER BY vin"
+            prof = rest("POST", f"/api/files/{fid}/intake", {"connection": conn["id"], "sql": sql})
+            cols = {c["header"]: c for c in prof["sets"][0]["columns"]}
+            row = prof["sets"][0]["rows"][1]
+            check("15b. a SQL snapshot takes the database's declared types as the contract: a VARCHAR of digits is an identifier with its zeros, NUMERIC is a number, DATE a date, a 20-digit NUMERIC keeps every digit", cols["vin"]["type"] == "identifier" and cols["vin"]["declared"] == "text" and row[0] == "'000123" and cols["landed_cost"]["type"] == "number" and cols["landed_cost"]["declared"] == "number" and row[2] == "24150009" and cols["entry_date"]["type"] == "date" and row[3] == "2026-10-06" and row[4] == "'12345678901234567890" and cols["days"]["type"] == "number", f"{[(h, c['type'], c.get('declared')) for h, c in cols.items()]} {row}")
+            check("   the profile says the types came from the source, and the query is kept without credentials", any("declarations" in n for n in prof["sanitised"]) and prof["query"]["connection"] == "intake pg" and "password" not in json.dumps(prof["query"]) and prof["query"]["kinds"][0] == "text", str(prof["query"])[:160])
+            rest("DELETE", f"/api/connections/{conn['id']}")
+        else:
+            print("SKIP 15b. SQL snapshot (no --pg)")
 
         # ================================================================ 16. the phone: the card's decision is reachable without horizontal scrolling
         browser.close()

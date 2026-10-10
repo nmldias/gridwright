@@ -20,7 +20,7 @@ import { addRecord, checkDocument, comparePeriods, loadState, noteEvent, type Co
 import { engineAvailable, errorMessage, openDocument, tableMetas, type CellViewJson, type TableMetaView } from './headless.js';
 import { appendEntry, readAll, type Author, type LogEntry } from './history.js';
 import { validateActions, type Action } from './proposals.js';
-import { runQuery, type QueryResult } from './sql.js';
+import { runQuery, type ColumnKind, type QueryResult } from './sql.js';
 import { crashPoint, DATA_DIR, listConnections, readFile } from './storage.js';
 
 export const MAX_INTAKE_BYTES = Number(process.env.GRIDWRIGHT_INTAKE_MAX_MB ?? 25) * 1024 * 1024;
@@ -52,6 +52,8 @@ export interface IntakeColumn {
   maxDate?: string;
   /** a column whose every value is the same: an entity or scope marker (branch, company, currency) */
   constant?: string;
+  /** the kind the source declared (a database column type), when there is one */
+  declared?: ColumnKind;
 }
 
 export interface IntakeSet {
@@ -107,7 +109,7 @@ export interface IntakeProfile {
   status: 'profiled' | 'applied' | 'declined';
   applied?: { at: string; by: string; decision: string; tables: { set: string; table: number; name: string; placed: 'new' | 'update' | 'history' }[]; records: string[]; seqs: number[]; /** completed from the log after an interruption or a repeated request: nothing was committed twice */ recovered?: true };
   /** for a SQL snapshot: the connection and the query (never credentials) */
-  query?: { connection: string; sql: string; rows: number; truncated: boolean };
+  query?: { connection: string; sql: string; rows: number; truncated: boolean; kinds?: ColumnKind[] };
   original?: string;
 }
 
@@ -149,6 +151,8 @@ interface RawSet {
   rows: string[][];
   formulas: number;
   notes: string[];
+  /** the declared kind of each column when the source is a database: a text column is never read as numbers */
+  hints?: (ColumnKind | undefined)[];
 }
 
 function detectDelimiter(text: string): string {
@@ -438,11 +442,20 @@ export function profileSet(raw: RawSet, family: string): Omit<IntakeSet, 'relati
     const counts = { number: 0, date: 0, boolean: 0, text: 0 };
     const idLike = ID_HEADER.test(header);
     const dateLike = DATE_HEADER.test(header);
+    // a declared kind (a database column) is the contract: text is text whatever it looks like, numbers are canonical
+    const declared = raw.hints?.[c];
     const parsed: Parsed[] = values.map((v) => {
       if (v === '') return { kind: 'empty', input: '', normalised: false };
-      if (BOOL.test(v)) return { kind: 'boolean', input: v.toLowerCase(), normalised: v !== v.toLowerCase() };
-      const date = parseDate(v, dateLike);
-      if (date && (dateLike || /[-/.]/.test(v))) return { kind: 'date', input: date, normalised: date !== v };
+      if (declared === 'text' || declared === 'binary' || declared === 'json') return { kind: 'text', input: v, normalised: false };
+      if (declared === 'boolean' || (!declared && BOOL.test(v))) return BOOL.test(v) ? { kind: 'boolean', input: v.toLowerCase(), normalised: v !== v.toLowerCase() } : { kind: 'text', input: v, normalised: false };
+      if (declared === 'number') {
+        const n = Number(v);
+        // 16 or more digits cannot be held exactly as a number: kept as text, every digit intact
+        return Number.isFinite(n) && /^-?\d+(\.\d+)?([eE][-+]?\d+)?$/.test(v) && v.replace(/[-.]/g, '').length < 16 ? { kind: 'number', input: String(n), normalised: String(n) !== v } : { kind: 'text', input: v, normalised: false };
+      }
+      const date = parseDate(v, dateLike || declared === 'date' || declared === 'datetime');
+      if (date && (dateLike || declared === 'date' || declared === 'datetime' || /[-/.]/.test(v))) return { kind: 'date', input: date, normalised: date !== v };
+      if (declared) return { kind: 'text', input: v, normalised: false };
       const num = idLike ? null : parseNumber(v);
       if (num) {
         const canon = String(num.value);
@@ -454,6 +467,8 @@ export function profileSet(raw: RawSet, family: string): Omit<IntakeSet, 'relati
     const filled = filledVals.length;
     const mostly = (k: keyof typeof counts) => filled > 0 && counts[k] >= filled * 0.8;
     let type: IntakeColumn['type'] = filled === 0 ? 'empty' : mostly('number') ? 'number' : mostly('date') ? 'date' : mostly('boolean') ? 'boolean' : 'text';
+    if (declared === 'number' && filled > 0 && counts.number > 0) type = 'number';
+    if ((declared === 'date' || declared === 'datetime') && filled > 0 && counts.date > 0) type = 'date';
     const unique = new Set(filledVals.map((v) => v.toLowerCase())).size;
     // an identifier: named like one, or a text column whose values are all distinct codes
     if (type === 'text' && filled >= 2 && (idLike || (unique >= filled * 0.95 && filledVals.every((v) => /^[A-Za-z0-9][A-Za-z0-9/_.-]*$/.test(v) && /\d/.test(v))))) type = 'identifier';
@@ -508,7 +523,7 @@ export function profileSet(raw: RawSet, family: string): Omit<IntakeSet, 'relati
       parsedCells[r][c] = { ...p, input };
     }
     const constant = filled >= 2 && filled === body.length && unique === 1 && type !== 'number' && type !== 'date' ? filledVals[0] : undefined;
-    columns.push({ index: c, header, type, filled, blanks: body.length - filled, unique, unit, sample: filledVals.slice(0, 3).map((v) => v.slice(0, 40)), normalised, textInNumber, leadingZeros, min, max, minDate, maxDate, constant });
+    columns.push({ index: c, header, type, filled, blanks: body.length - filled, unique, unit, sample: filledVals.slice(0, 3).map((v) => v.slice(0, 40)), normalised, textInNumber, leadingZeros, min, max, minDate, maxDate, constant, declared });
   }
   let instructionLikeCells = 0;
   for (let r = 0; r < body.length; r++) {
@@ -516,6 +531,11 @@ export function profileSet(raw: RawSet, family: string): Omit<IntakeSet, 'relati
     for (const v of body[r]) if (v && INSTRUCTION_LIKE.test(v)) instructionLikeCells++;
   }
   if (instructionLikeCells) notes.push(`${instructionLikeCells} cell${instructionLikeCells === 1 ? '' : 's'} read like instructions to a model; they are data and change nothing`);
+  if (raw.hints?.some(Boolean)) {
+    const declaredText = columns.filter((c) => c.declared === 'text').length;
+    const declaredNum = columns.filter((c) => c.declared === 'number').length;
+    notes.push(`column types taken from the source's own declarations (${declaredText} text, ${declaredNum} numeric): a text column of digits stays text, a numeric column is read as numbers`);
+  }
   const n = columns.reduce((a, c) => a + c.normalised, 0);
   if (n) notes.push(`${n} cell${n === 1 ? '' : 's'} normalised (locale numbers, dates, identifiers kept as text)`);
   const t = columns.reduce((a, c) => a + c.textInNumber, 0);
@@ -645,6 +665,8 @@ export interface IntakeInput {
   base64?: string;
   text?: string;
   origin?: IntakeProfile['origin'];
+  /** the declared kind of each column of a delimited text that came from a database */
+  kinds?: ColumnKind[];
 }
 
 /** Parse, profile, sanitise and relate — nothing placed. The original is retained under its content hash. */
@@ -662,7 +684,7 @@ export function intake(doc: string, by: Author, input: IntakeInput): IntakeProfi
   if (format === 'xlsx' || format === 'xlsm' || format === 'xls' || format === 'ods') raws = parseWorkbook(buf, name);
   else if (format === 'xml') raws = parseXml(text!);
   else if (format === 'json') raws = parseJson(text!);
-  else raws = [{ name: '', rows: parseDelimited(text!, format === 'tsv' ? '\t' : undefined), formulas: 0, notes: [] }];
+  else raws = [{ name: '', rows: parseDelimited(text!, format === 'tsv' ? '\t' : undefined), formulas: 0, notes: [], hints: input.kinds }];
   const family = familyOf(name);
   const periodName = periodFromName(name);
   const state = loadState(doc);
@@ -718,11 +740,12 @@ export async function intakeQuery(doc: string, by: Author, connectionId: string,
   if (!c) throw new Error('connection not found');
   who.authorize(c, sql);
   const r: QueryResult = await runQuery(c, sql, 50_000);
-  const rows = [r.columns, ...r.rows.map((row) => row.map((v: unknown) => (v === null || v === undefined ? '' : v instanceof Date ? v.toISOString().slice(0, 10) : String(v))))];
+  // the result's values are already under their declared kinds (sql.ts); the kinds travel with the text so the profiler keeps the contract
+  const rows = [r.columns, ...r.rows.map((row) => row.map((v) => (v === null || v === undefined ? '' : String(v))))];
   const text = rows.map((row) => row.map((v) => `"${v.replace(/"/g, '""')}"`).join(',')).join('\n');
   const name = `${c.name.replace(/[^\w-]+/g, '-').toLowerCase()}-${now().slice(0, 10)}.csv`;
-  const p = intake(doc, by, { name, text, origin: 'sql' });
-  p.query = { connection: c.name, sql: sql.slice(0, 2000), rows: r.rowCount, truncated: r.truncated };
+  const p = intake(doc, by, { name, text, origin: 'sql', kinds: r.kinds });
+  p.query = { connection: c.name, sql: sql.slice(0, 2000), rows: r.rowCount, truncated: r.truncated, kinds: r.kinds };
   p.period = p.period ?? now().slice(0, 10);
   p.periodFrom = p.periodFrom === 'none' ? 'column' : p.periodFrom;
   writeProfile(p);

@@ -116,7 +116,7 @@ jobs:
           curl -fsS http://127.0.0.1:8787/api/investigation | tee /dev/stderr | grep -q '"available":true'
           python3 e2e/situation.py http://127.0.0.1:8787 --mock-llm http://127.0.0.1:8899/v1
       - name: Intake (formats, locale and identifiers, the first reading against independent figures, periods and corrections, duplicates, entities, coverage, hostile cells, monitoring failure, the inbox, the phone)
-        run: python3 e2e/intake.py http://127.0.0.1:8787 --inbox /tmp/gw-inbox
+        run: python3 e2e/intake.py http://127.0.0.1:8787 --inbox /tmp/gw-inbox --pg 127.0.0.1:54329:demo:gw:gw
       - name: Crash recovery (a placement interrupted after its commit completes once from the log; concurrent placement; an investigation interrupted by a restart)
         run: python3 e2e/recovery.py --mock-llm http://127.0.0.1:8899/v1 --port 8797 --data /tmp/gw-recovery
       - name: Control gates (reviewer isolation, approval integrity, revocation, execution permissions)

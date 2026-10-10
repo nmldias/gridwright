@@ -368,6 +368,8 @@ export interface IntakeColumn {
   normalised: number;
   textInNumber: number;
   leadingZeros: number;
+  /** the kind the source declared (a database column type), when there is one */
+  declared?: 'number' | 'text' | 'date' | 'datetime' | 'boolean' | 'json' | 'binary' | 'unknown';
   min?: number;
   max?: number;
   minDate?: string;
