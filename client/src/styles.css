@@ -393,6 +393,20 @@ code {
   overflow: hidden;
   outline: none;
   min-width: 0;
+  /* the WebGL canvas gets its own stacking context at z 0: nothing it composites can rise above the overlays */
+  isolation: isolate;
+  z-index: 0;
+}
+/* menus and popovers live here, on <body>, above the app whatever the canvas or a panel does */
+#overlays {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  pointer-events: none;
+  transform: translateZ(0);
+}
+#overlays > * {
+  pointer-events: auto;
 }
 .canvas-host canvas {
   position: absolute;

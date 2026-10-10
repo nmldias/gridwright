@@ -1,3 +1,4 @@
+import { Overlay } from './overlay';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 
 export interface MenuItem {
@@ -49,8 +50,9 @@ export function Menu({ label, title, className, items, children, active, testId,
     // keyboard: the first item takes focus when the menu was opened from the keyboard; arrows move,
     // Home/End jump, Escape closes and returns focus to the trigger
     if (openedByKeyboard.current) focusables()[0]?.focus();
+    const inside = (n: Node | null) => !!n && (!!ref.current?.contains(n) || !!listRef.current?.contains(n));
     const onDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+      if (!inside(e.target as Node)) setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -58,7 +60,7 @@ export function Menu({ label, title, className, items, children, active, testId,
         close(true);
         return;
       }
-      if (!ref.current?.contains(document.activeElement)) return;
+      if (!inside(document.activeElement)) return;
       const items = focusables();
       if (!items.length) return;
       const i = items.indexOf(document.activeElement as HTMLElement);
@@ -119,6 +121,7 @@ export function Menu({ label, title, className, items, children, active, testId,
         <span className="caret">▾</span>
       </button>
       {open && (
+        <Overlay>
         <div className="menu" role="menu" ref={listRef} style={{ top: pos.top, left: pos.left }} onClick={(e) => e.stopPropagation()}>
           {children ??
             items?.map((it, i) =>
@@ -146,6 +149,7 @@ export function Menu({ label, title, className, items, children, active, testId,
               ),
             )}
         </div>
+        </Overlay>
       )}
     </div>
   );

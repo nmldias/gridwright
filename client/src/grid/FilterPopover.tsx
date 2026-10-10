@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { Overlay } from '../ui/overlay';
 import * as book from '../engine/book';
 import { colToLetters, type ColumnFilter } from '../engine/types';
 import { displayValue } from './format';
@@ -86,6 +87,7 @@ export function FilterPopover() {
   const stop = (e: React.KeyboardEvent) => e.stopPropagation();
 
   return (
+    <Overlay>
     <div className="filter-popover" style={{ left, top }} onPointerDown={(e) => e.stopPropagation()}>
       <div className="filter-head">
         <b>{header}</b>
@@ -167,5 +169,6 @@ export function FilterPopover() {
       )}
       {meta.hidden_rows.length > 0 && <div className="muted small">{meta.hidden_rows.length} rows hidden by filters</div>}
     </div>
+    </Overlay>
   );
 }

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { Overlay } from '../ui/overlay';
 import * as book from '../engine/book';
 import { getState, useStore } from '../state/store';
 import { autoFitColumns, clearSelection, copySelection, deleteSelectedTable, makeCodeCell, pasteFromClipboard, selectionToTsv, sortTableByColumn } from './actions';
@@ -77,6 +78,7 @@ export function ContextMenu({ host }: { host: HTMLElement | null }) {
   const left = Math.min(menu.x, window.innerWidth - 230);
   const top = Math.min(menu.y, window.innerHeight - 420);
   return (
+    <Overlay>
     <div className="context-menu" style={{ left, top }} onContextMenu={(e) => e.preventDefault()} onPointerDown={(e) => e.stopPropagation()}>
       {sel && tableId !== null && (
         <>
@@ -142,5 +144,6 @@ export function ContextMenu({ host }: { host: HTMLElement | null }) {
         if (id) useStore.setState({ selectedTable: id, selection: { table: id, r0: 0, c0: 0, r1: 0, c1: 0, ar: 0, ac: 0 } });
       })}
     </div>
+    </Overlay>
   );
 }
