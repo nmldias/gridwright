@@ -5,8 +5,9 @@ import init, { Book } from './pkg/gridwright_core';
 import wasmUrl from './pkg/gridwright_core_bg.wasm?url';
 import type { CellRef, CellValue, CellView, Changes, Chart, CheckView, NamedRange, Op, SignoffStatus, TableId, TableMeta, Trace } from './types';
 import { cellKey, isCodeKind } from './types';
-import { readOnly, useStore } from '../state/store';
+import { cellAt, readOnly, useStore } from '../state/store';
 import { clearRecords } from '../workers/runs';
+import { trust } from '../workers/trust';
 
 const SIGN_OPS = new Set<Op['type']>(['add_signoff', 'remove_signoff', 'set_signoff_locked']);
 
@@ -90,6 +91,7 @@ export async function loadBook(json: string | null, name = 'Untitled', fileId: s
     canUndo: false,
     canRedo: false,
     runs: new Map(),
+    blockedCode: [],
   });
   requestRedraw();
   // code cells need their outputs rebuilt after load
@@ -127,11 +129,29 @@ export function apply(op: Op, opts: { remote?: boolean; silent?: boolean; origin
   }
   applyChanges(changes);
   if (!opts.remote) {
+    trustTypedCode(op);
     useStore.setState({ dirty: true });
     const meta: ApplyMeta = { origin: opts.origin ?? 'user', note: opts.note };
     opListeners.forEach((l) => l(op, changes, meta));
   }
   return changes;
+}
+
+/** Code this person just wrote (typed, pasted, inserted) in this browser is theirs: it may run. */
+function trustTypedCode(op: Op) {
+  const cells: CellView[] = [];
+  if (op.type === 'set_cell') {
+    const c = cellAt(op.table, op.row, op.col);
+    if (c && isCodeKind(c.k)) cells.push(c);
+  } else if (op.type === 'set_cells') {
+    op.values.forEach((row, dr) =>
+      row.forEach((_v, dc) => {
+        const c = cellAt(op.table, op.row + dr, op.col + dc);
+        if (c && isCodeKind(c.k)) cells.push(c);
+      }),
+    );
+  }
+  if (cells.length) trust(cells);
 }
 
 /** Apply an op authored elsewhere (multiplayer): not recorded for local undo. */

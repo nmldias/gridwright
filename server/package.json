@@ -11,13 +11,14 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
     "express": "^4.21.2",
-    "fast-xml-parser": "^4.5.7",
+    "fast-xml-parser": "^5.11.2",
     "mssql": "^11.0.2",
     "mysql2": "^3.11.5",
     "pg": "^8.13.1",
     "pg-cursor": "^2.22.1",
+    "undici": "^7.30.0",
     "ws": "^8.18.0",
-    "xlsx": "^0.18.5",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz",
     "zod": "^3.25.76"
   },
   "devDependencies": {

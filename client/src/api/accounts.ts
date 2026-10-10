@@ -54,6 +54,50 @@ export interface AuditEntry {
   target?: string;
   detail?: string;
 }
+export interface Invitation {
+  id: string;
+  login: string;
+  role: Role;
+  createdAt: string;
+  createdBy: string;
+  expiresAt: string;
+}
+/** what inviting someone returns: the link (with its one-time code) to hand to them */
+export interface InvitationSent {
+  invited: true;
+  id: string;
+  login: string;
+  role: Role;
+  code: string;
+  link: string;
+  expiresAt: string;
+}
+export interface AiUsage {
+  month: string;
+  requests: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  estimated: boolean;
+}
+export interface AiBudget {
+  /** null: unlimited, 0: AI off */
+  tokens: number | null;
+  own: boolean;
+}
+export interface AiUsageView {
+  month: string;
+  budget: AiBudget;
+  usage: AiUsage;
+  history: AiUsage[];
+  limits: { perMinuteClient: number; perMinutePerson: number };
+}
+export interface PlatformAiUsage {
+  month: string;
+  defaultBudget: number | null;
+  limits: { perMinuteClient: number; perMinutePerson: number };
+  clients: { id: string; slug: string; name: string; budget: AiBudget; usage: AiUsage }[];
+}
 export interface AddedPerson {
   login: string;
   role: Role;
@@ -77,6 +121,8 @@ const enc = encodeURIComponent;
 export const accounts = {
   login: (login: string, password: string, tenant?: string) => call<{ ok: true; mustChangePassword: boolean; tenant: { id: string; slug: string; name: string } | null }>('POST', '/api/auth/login', { login, password, tenant }),
   logout: () => call<{ ok: true }>('POST', '/api/auth/logout', {}),
+  invitation: (code: string) => call<{ tenant: string; login: string; role: Role; expiresAt: string }>('GET', `/api/auth/invitation?code=${enc(code)}`),
+  acceptInvitation: (code: string, password: string, name?: string) => call<{ ok: true; tenant: { id: string; slug: string; name: string }; role: Role }>('POST', '/api/auth/invitation/accept', { code, password, name }),
   changePassword: (current: string, next: string) => call<{ ok: true }>('POST', '/api/auth/password', { current, next }),
   rename: (name: string) => call<{ login: string; name: string }>('PUT', '/api/account', { name }),
   tokens: {
@@ -89,7 +135,10 @@ export const accounts = {
     get: () => call<TenantInfo>('GET', '/api/tenant'),
     rename: (name: string) => call<TenantInfo>('PUT', '/api/tenant', { name }),
     members: () => call<Member[]>('GET', '/api/tenant/members'),
-    add: (p: { login: string; name?: string; role: Role; password?: string }) => call<AddedPerson>('POST', '/api/tenant/members', p),
+    invite: (p: { login: string; role: Role }) => call<InvitationSent>('POST', '/api/tenant/members', p),
+    invitations: () => call<Invitation[]>('GET', '/api/tenant/invitations'),
+    revokeInvitation: (id: string) => call<{ ok: true }>('DELETE', `/api/tenant/invitations/${enc(id)}`),
+    aiUsage: () => call<AiUsageView>('GET', '/api/tenant/ai-usage'),
     setRole: (login: string, role: Role) => call<{ ok: true }>('PUT', `/api/tenant/members/${enc(login)}`, { role }),
     remove: (login: string) => call<{ ok: true }>('DELETE', `/api/tenant/members/${enc(login)}`),
     resetPassword: (login: string) => call<{ login: string; temporaryPassword: string }>('POST', `/api/tenant/members/${enc(login)}/reset-password`, {}),
@@ -109,6 +158,8 @@ export const accounts = {
     createUser: (b: { login: string; name?: string; platformAdmin?: boolean }) => call<UserInfo & { temporaryPassword?: string }>('POST', '/api/platform/users', b),
     updateUser: (login: string, b: { name?: string; status?: 'active' | 'disabled'; platformAdmin?: boolean }) => call<UserInfo>('PUT', `/api/platform/users/${enc(login)}`, b),
     resetPassword: (login: string) => call<{ login: string; temporaryPassword: string }>('POST', `/api/platform/users/${enc(login)}/reset-password`, {}),
+    aiUsage: () => call<PlatformAiUsage>('GET', '/api/platform/ai-usage'),
+    setAiBudget: (id: string, monthlyTokens: number | null | 'default') => call<AiUsageView>('PUT', `/api/platform/tenants/${enc(id)}/ai-budget`, { monthlyTokens }),
     audit: (tenant?: string) => call<AuditEntry[]>('GET', `/api/platform/audit${tenant ? `?tenant=${enc(tenant)}` : ''}`),
     ai: () => call<{ baseUrl: string; model: string; hasKey: boolean; configured: boolean }>('GET', '/api/platform/ai'),
     saveAi: (b: { baseUrl?: string; model?: string; apiKey?: string }) => call<{ baseUrl: string; model: string; hasKey: boolean; configured: boolean }>('PUT', '/api/platform/ai', b),

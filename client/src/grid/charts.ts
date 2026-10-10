@@ -501,29 +501,32 @@ function drawWaterfall(P: Prim[], chart: Chart, data: ChartData, plot: Plot) {
 }
 
 // --- SVG backend -----------------------------------------------------------------------
-const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+// every attribute is escaped: series colours and labels are the author's input, and the SVG is also
+// written into the print document
+const esc = (s: unknown) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+const n = (v: unknown) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 
 export function chartSvg(chart: Chart, data: ChartData, W = chart.w, H = chart.h): string {
   const prims = chartLayout(chart, data, W, H);
-  const out: string[] = [`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="${esc(CHART_FONT)}">`];
+  const out: string[] = [`<svg xmlns="http://www.w3.org/2000/svg" width="${n(W)}" height="${n(H)}" viewBox="0 0 ${n(W)} ${n(H)}" font-family="${esc(CHART_FONT)}">`];
   for (const p of prims) {
     switch (p.k) {
       case 'rect':
-        out.push(`<rect x="${r(p.x)}" y="${r(p.y)}" width="${r(p.w)}" height="${r(p.h)}" fill="${p.fill}"${p.alpha !== undefined ? ` fill-opacity="${p.alpha}"` : ''}/>`);
+        out.push(`<rect x="${r(p.x)}" y="${r(p.y)}" width="${r(p.w)}" height="${r(p.h)}" fill="${esc(p.fill)}"${p.alpha !== undefined ? ` fill-opacity="${n(p.alpha)}"` : ''}/>`);
         break;
       case 'line':
-        out.push(`<polyline points="${p.pts.map(([x, y]) => `${r(x)},${r(y)}`).join(' ')}" fill="none" stroke="${p.stroke}" stroke-width="${p.width}"${p.dash ? ' stroke-dasharray="4 3"' : ''}${p.alpha !== undefined ? ` stroke-opacity="${p.alpha}"` : ''} stroke-linejoin="round" stroke-linecap="round"/>`);
+        out.push(`<polyline points="${p.pts.map(([x, y]) => `${r(x)},${r(y)}`).join(' ')}" fill="none" stroke="${esc(p.stroke)}" stroke-width="${n(p.width)}"${p.dash ? ' stroke-dasharray="4 3"' : ''}${p.alpha !== undefined ? ` stroke-opacity="${n(p.alpha)}"` : ''} stroke-linejoin="round" stroke-linecap="round"/>`);
         break;
       case 'area':
-        out.push(`<polygon points="${p.pts.map(([x, y]) => `${r(x)},${r(y)}`).join(' ')}" fill="${p.fill}" fill-opacity="${p.alpha}"/>`);
+        out.push(`<polygon points="${p.pts.map(([x, y]) => `${r(x)},${r(y)}`).join(' ')}" fill="${esc(p.fill)}" fill-opacity="${n(p.alpha)}"/>`);
         break;
       case 'circle':
-        out.push(`<circle cx="${r(p.cx)}" cy="${r(p.cy)}" r="${p.r}" fill="${p.fill}"/>`);
+        out.push(`<circle cx="${r(p.cx)}" cy="${r(p.cy)}" r="${n(p.r)}" fill="${esc(p.fill)}"/>`);
         break;
       case 'text': {
         const anchor = p.anchor === 'middle' ? 'middle' : p.anchor === 'end' ? 'end' : 'start';
         const baseline = p.baseline === 'top' ? 'hanging' : p.baseline === 'middle' ? 'middle' : 'auto';
-        out.push(`<text x="${r(p.x)}" y="${r(p.y)}" font-size="${p.size}" fill="${p.color}" text-anchor="${anchor}" dominant-baseline="${baseline}"${p.weight === 500 ? ' font-weight="500"' : ''}${p.spacing ? ` letter-spacing="${p.spacing}"` : ''}>${esc(p.text)}</text>`);
+        out.push(`<text x="${r(p.x)}" y="${r(p.y)}" font-size="${n(p.size)}" fill="${esc(p.color)}" text-anchor="${anchor}" dominant-baseline="${baseline}"${p.weight === 500 ? ' font-weight="500"' : ''}${p.spacing ? ` letter-spacing="${n(p.spacing)}"` : ''}>${esc(p.text)}</text>`);
         break;
       }
     }

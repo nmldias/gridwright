@@ -30,7 +30,7 @@ export interface Identity {
   /** accounts mode: signed in with a temporary password that must be changed first */
   mustChangePassword?: boolean;
   /** accounts mode: why the client asked for could not be entered */
-  denied?: 'suspended' | 'not-a-member';
+  denied?: 'suspended' | 'not-a-member' | 'token-client';
 }
 
 const TRUST = ['1', 'true', 'yes'].includes((process.env.GRIDWRIGHT_TRUST_TAILSCALE ?? '').toLowerCase());

@@ -17,6 +17,7 @@ import { SettingsPanel, prewarmEnabled } from './ui/SettingsPanel';
 import { SharePanel } from './ui/SharePanel';
 import { NavigatePanel } from './ui/NavigatePanel';
 import { StartCard } from './ui/StartCard';
+import { TrustBanner } from './ui/TrustBanner';
 import { SidePanel } from './ui/SidePanel';
 import { loadProposals } from './ui/proposals';
 import { loadCompanion } from './ui/companion';
@@ -162,7 +163,8 @@ export function App() {
     <div className="app">
       <TopBar />
       <FormulaBar />
-      <div className="main">
+      <main className="main" aria-label="Spreadsheet">
+        <TrustBanner />
         <GridCanvas />
         {start && panel !== 'admin' && <StartCard />}
         {panel !== 'none' && (
@@ -182,7 +184,7 @@ export function App() {
             {panel === 'admin' && <AdminPanel />}
           </SidePanel>
         )}
-      </div>
+      </main>
       <StatusBar />
     </div>
   );

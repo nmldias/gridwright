@@ -87,7 +87,9 @@ proc = None
 
 def start(env_extra):
     global proc
-    env = {**os.environ, "GRIDWRIGHT_DATA": DATA, "PORT": str(PORT), "HOST": "127.0.0.1", "GRIDWRIGHT_PYTHON": "off", "GRIDWRIGHT_INBOX": os.path.join(DATA, "inbox"), **env_extra}
+    env = {**os.environ, "GRIDWRIGHT_DATA": DATA, "PORT": str(PORT), "HOST": "127.0.0.1", "GRIDWRIGHT_PYTHON": "off", "GRIDWRIGHT_INBOX": os.path.join(DATA, "inbox"),
+           # the fake model endpoint runs on loopback: the operator allows it explicitly (the egress guard)
+           "GRIDWRIGHT_EGRESS_ALLOW": "127.0.0.1", **env_extra}
     for k in ("GRIDWRIGHT_TOKEN", "GRIDWRIGHT_TRUST_TAILSCALE", "AI_BASE_URL", "AI_MODEL", "AI_API_KEY"):
         env.pop(k, None) if k not in env_extra else None
     proc = subprocess.Popen(["node", SERVER], cwd=os.path.join(ROOT, "server"), env=env, stdout=open(os.path.join(DATA, "server.log"), "a"), stderr=subprocess.STDOUT)
@@ -276,7 +278,9 @@ st, files = alice.get("/api/files")
 ok(st == 200 and files == [], "Alice sees an empty Acme: nothing of the default client")
 
 bob = Client()
-ok(bob.login("bob@globex.test", "bob-password-2026")[0] == 200, "Bob signs in to Globex")
+st, r = bob.login("bob@globex.test", "bob-password-2026")
+ok(st == 200 and r["mustChangePassword"] is True, "a password an administrator chose must be changed at first sign-in too")
+ok(bob.post("/api/auth/password", {"current": "bob-password-2026", "next": "bob-own-password-2026"})[0] == 200, "Bob signs in to Globex and sets his own")
 
 # --- documents stay in their client
 st, a1 = alice.post("/api/files", {"name": "Acme Q3 forecast", "json": DOC})
@@ -304,11 +308,24 @@ ok(st == 403 and r.get("denied") == "not-a-member", "Bob asking for Acme is refu
 bob.tenant = None
 
 # --- people
-st, r = alice.post("/api/tenant/members", {"login": "carol@acme.test", "name": "Carol", "role": "editor"})
-ok(st == 200 and r["created"] and r["temporaryPassword"], "Alice adds a new editor (account made with a temporary password)")
-CAROL_TEMP = r["temporaryPassword"]
-st, r = alice.post("/api/tenant/members", {"login": "dave@acme.test", "role": "viewer", "password": "dave-password-2026"})
+st, r = alice.post("/api/tenant/members", {"login": "carol@acme.test", "role": "editor"})
+ok(st == 200 and r.get("invited") and r["code"].startswith("gwi_") and "temporaryPassword" not in r, "Alice invites a new editor: a link, no password")
+CAROL_CODE = r["code"]
+st, r = alice.post("/api/tenant/members", {"login": "dave@acme.test", "role": "viewer"})
 ok(st == 200 and r["role"] == "viewer", "…and a viewer")
+DAVE_CODE = r["code"]
+st, pend = alice.get("/api/tenant/invitations")
+ok(sorted(i["login"] for i in pend) == ["carol@acme.test", "dave@acme.test"], "both invitations are pending")
+st, inv = Client().get(f"/api/auth/invitation?code={CAROL_CODE}")
+ok(st == 200 and inv["tenant"] == "Acme Corp" and inv["role"] == "editor" and inv["login"] == "carol@acme.test", "the link says what it is for")
+carol = Client()
+st, r = carol.post("/api/auth/invitation/accept", {"code": CAROL_CODE, "password": "short"})
+ok(st == 400, "a weak password is refused when accepting")
+st, r = carol.post("/api/auth/invitation/accept", {"code": CAROL_CODE, "password": "carol-password-2026", "name": "Carol"})
+ok(st == 200 and r["tenant"]["id"] == ACME and carol.cookie, "Carol accepts with a password she chooses, and is signed in")
+st, _ = Client().post("/api/auth/invitation/accept", {"code": CAROL_CODE, "password": "carol-password-2026"})
+ok(st == 404, "an invitation works once")
+ok(Client().post("/api/auth/invitation/accept", {"code": DAVE_CODE, "password": "dave-password-2026"})[0] == 200, "Dave accepts his")
 st, members = alice.get("/api/tenant/members")
 ok(sorted(m["login"] for m in members) == sorted(["alice@acme.test", "carol@acme.test", "dave@acme.test", ROOT_LOGIN]), "the member list has exactly Acme's people")
 st, members = bob.get("/api/tenant/members")
@@ -318,9 +335,6 @@ ok(st == 200, "Bob manages Globex's people")
 st, _ = alice.put(f"/api/tenant/members/{'mallory@globex.test'}", {"role": "viewer"})
 ok(st == 400, "Alice cannot change roles in Globex")
 
-carol = Client()
-carol.login("carol@acme.test", CAROL_TEMP)
-carol.post("/api/auth/password", {"current": CAROL_TEMP, "next": "carol-password-2026"})
 ok([f["id"] for f in carol.get("/api/files")[1]] == [A1], "a new member sees the client's documents (shared within the client by default)")
 dave = Client()
 dave.login("dave@acme.test", "dave-password-2026")
@@ -404,7 +418,8 @@ ok(st == 200 and t["token"].startswith("gwk_"), "Alice makes an API token in Acm
 api = Client(bearer=t["token"])
 ok([f["id"] for f in api.get("/api/files")[1]] == [A1], "the token reads Acme")
 api.tenant = GLOBEX
-ok([f["id"] for f in api.get("/api/files")[1]] == [A1], "…and cannot be pointed at another client")
+st, r = api.get("/api/files")
+ok(st == 403 and r.get("denied") == "token-client", "…and naming another client with it is refused, not ignored")
 api.tenant = None
 alice.delete(f"/api/account/tokens/{t['id']}")
 ok(api.get("/api/files")[0] == 401, "a revoked token stops working")
@@ -422,6 +437,7 @@ st, ini = root.post("/api/platform/tenants", {"name": "Initech", "join": False, 
 INI = ini["tenant"]["id"]
 erin = Client()
 erin.login("erin@initech.test", "erin-password-2026")
+erin.post("/api/auth/password", {"current": "erin-password-2026", "next": "erin-own-password-2026"})
 st, r = erin.put("/api/tenant/members/erin@initech.test", {"role": "editor"})
 ok(st == 400 and "administrator" in r["error"], "a client keeps at least one administrator")
 st, r = root.post(f"/api/platform/tenants/{INI}/members", {"login": "x1@initech.test", "role": "editor"})

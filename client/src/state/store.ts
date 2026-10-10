@@ -102,6 +102,8 @@ interface State {
   status: string;
   presence: Map<string, Presence>;
   runs: Map<string, CodeRunState>;
+  /** code cells that wait for this person's approval before they run (see workers/trust.ts) */
+  blockedCode: CellRef[];
   zoom: number;
   pythonStatus: 'idle' | 'loading' | 'ready' | 'error';
   /** server-side Python as reported by /api/health (null = not available) */
@@ -171,6 +173,7 @@ export const useStore = create<State>((set) => ({
   pythonStatus: 'idle',
   serverPython: null,
   me: { login: '', name: '', role: 'admin', identity: false },
+  blockedCode: [],
   seq: 0,
   historyCell: null,
   filterPopover: null,

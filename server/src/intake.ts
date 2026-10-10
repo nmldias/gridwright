@@ -14,8 +14,6 @@
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, extname, join, resolve } from 'node:path';
-import { XMLParser } from 'fast-xml-parser';
-import * as XLSX from 'xlsx';
 import { addRecord, checkDocument, comparePeriods, loadState, noteEvent, type ContextRecord } from './companion.js';
 import { engineAvailable, errorMessage, openDocument, tableMetas, type CellViewJson, type TableMetaView } from './headless.js';
 import { appendEntry, readAll, type Author, type LogEntry } from './history.js';
@@ -24,11 +22,10 @@ import { runQuery, type ColumnKind, type QueryResult } from './sql.js';
 import { crashPoint, DATA_DIR, listConnections, readFile } from './storage.js';
 import { tenantOfDoc } from './access.js';
 import { ACCOUNTS, getTenant } from './tenancy.js';
+import { MAX_COLS, MAX_ROWS, type RawSet } from './parsers.js';
+import { parseIsolated } from './parsepool.js';
 
 export const MAX_INTAKE_BYTES = Number(process.env.GRIDWRIGHT_INTAKE_MAX_MB ?? 25) * 1024 * 1024;
-const MAX_CELLS = 1_000_000;
-const MAX_ROWS = 200_000;
-const MAX_COLS = 256;
 
 export type IntakeFormat = 'csv' | 'tsv' | 'text' | 'xlsx' | 'xlsm' | 'xls' | 'ods' | 'xml' | 'json' | 'sql';
 
@@ -150,14 +147,6 @@ export function familyOf(name: string): string {
 }
 
 // ------------------------------------------------------------------ parsing
-interface RawSet {
-  name: string;
-  rows: string[][];
-  formulas: number;
-  notes: string[];
-  /** the declared kind of each column when the source is a database: a text column is never read as numbers */
-  hints?: (ColumnKind | undefined)[];
-}
 
 function detectDelimiter(text: string): string {
   const head = text.split(/\r?\n/).slice(0, 20).filter((l) => l.trim());
@@ -210,86 +199,6 @@ export function parseDelimited(text: string, delimiter?: string): string[][] {
     rows.push(row);
   }
   return rows;
-}
-
-function parseWorkbook(buf: Buffer, name: string): RawSet[] {
-  const wb = XLSX.read(buf, { type: 'buffer', cellDates: false, cellFormula: true, sheetStubs: false, dense: false });
-  const out: RawSet[] = [];
-  let cells = 0;
-  for (const sheetName of wb.SheetNames) {
-    const sheet = wb.Sheets[sheetName];
-    if (!sheet || !sheet['!ref']) continue;
-    const range = XLSX.utils.decode_range(sheet['!ref']);
-    cells += (range.e.r - range.s.r + 1) * (range.e.c - range.s.c + 1);
-    if (cells > MAX_CELLS) throw new Error(`the workbook has more than ${MAX_CELLS.toLocaleString('en-GB')} cells; split it or import a sheet at a time`);
-    const grid: unknown[][] = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: true, defval: '' });
-    let formulas = 0;
-    for (const addr of Object.keys(sheet)) {
-      if (addr[0] === '!') continue;
-      if ((sheet[addr] as { f?: string }).f) formulas++;
-    }
-    const rows = grid.slice(0, MAX_ROWS).map((r) => r.slice(0, MAX_COLS).map((v) => (v === null || v === undefined ? '' : typeof v === 'number' ? String(v) : typeof v === 'boolean' ? (v ? 'TRUE' : 'FALSE') : String(v))));
-    const notes: string[] = [];
-    if (formulas) notes.push(`${formulas} formula cell${formulas === 1 ? '' : 's'} reduced to the values the file carried`);
-    out.push({ name: sheetName, rows, formulas, notes });
-  }
-  if (/\.xlsm$/i.test(name)) for (const s of out) s.notes.push('macros are not executed; values only');
-  return out;
-}
-
-type Json = null | boolean | number | string | Json[] | { [k: string]: Json };
-const isObj = (v: Json): v is { [k: string]: Json } => !!v && typeof v === 'object' && !Array.isArray(v);
-const scalar = (v: Json) => v === null || typeof v !== 'object';
-
-/** The largest list of records in a JSON/XML tree: an array of objects whose values are mostly scalars. */
-function recordLists(v: Json, path: string, out: { path: string; items: { [k: string]: Json }[] }[], depth = 0) {
-  if (depth > 6) return;
-  if (Array.isArray(v)) {
-    const items = v.filter(isObj);
-    if (items.length >= 1 && items.length >= v.length * 0.8) out.push({ path, items });
-    for (const x of v.slice(0, 50)) if (!scalar(x)) recordLists(x, path, out, depth + 1);
-  } else if (isObj(v)) {
-    for (const [k, x] of Object.entries(v)) if (!scalar(x)) recordLists(x, path ? `${path}.${k}` : k, out, depth + 1);
-  }
-}
-
-function flatten(o: { [k: string]: Json }, prefix = ''): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(o)) {
-    const key = prefix ? `${prefix}.${k}` : k;
-    if (scalar(v)) out[key.replace(/^@_/, '')] = v === null ? '' : String(v);
-    else if (isObj(v) && prefix.split('.').length < 2) Object.assign(out, flatten(v, key));
-    else out[key] = JSON.stringify(v).slice(0, 200);
-  }
-  return out;
-}
-
-function setsFromTree(tree: Json, label: string): RawSet[] {
-  const lists: { path: string; items: { [k: string]: Json }[] }[] = [];
-  recordLists(tree, '', lists);
-  if (!lists.length) throw new Error(`no list of records found in the ${label} (expected repeated elements or an array of objects)`);
-  lists.sort((a, b) => b.items.length - a.items.length);
-  const out: RawSet[] = [];
-  for (const l of lists.slice(0, 3)) {
-    const flat = l.items.slice(0, MAX_ROWS).map((it) => flatten(it));
-    const headers: string[] = [];
-    for (const f of flat) for (const k of Object.keys(f)) if (!headers.includes(k)) headers.push(k);
-    const rows = [headers.slice(0, MAX_COLS), ...flat.map((f) => headers.slice(0, MAX_COLS).map((h) => f[h] ?? ''))];
-    out.push({ name: l.path.split('.').pop() || label, rows, formulas: 0, notes: [`records read from ${label} path “${l.path || '(root)'}”`] });
-  }
-  return out;
-}
-
-function parseXml(text: string): RawSet[] {
-  if (/<!DOCTYPE|<!ENTITY/i.test(text.slice(0, 4000))) throw new Error('XML with a DOCTYPE or entity declarations is not accepted');
-  const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', parseTagValue: false, parseAttributeValue: false, trimValues: true, processEntities: false });
-  const tree = parser.parse(text) as Json;
-  return setsFromTree(tree, 'XML');
-}
-
-function parseJson(text: string): RawSet[] {
-  const tree = JSON.parse(text) as Json;
-  return setsFromTree(tree, 'JSON');
 }
 
 function formatOf(name: string, text?: string): IntakeFormat {
@@ -676,21 +585,23 @@ export interface IntakeInput {
 }
 
 /** Parse, profile, sanitise and relate — nothing placed. The original is retained under its content hash. */
-export function intake(doc: string, by: Author, input: IntakeInput): IntakeProfile {
+export async function intake(doc: string, by: Author, input: IntakeInput): Promise<IntakeProfile> {
   if (!safeId(doc) || !readFile(doc)) throw new Error('document not found');
   const name = basename(String(input.name ?? 'pasted.txt')).slice(0, 160) || 'pasted.txt';
   const buf = input.base64 ? Buffer.from(String(input.base64), 'base64') : Buffer.from(String(input.text ?? ''), 'utf8');
   if (!buf.length) throw new Error('the file is empty');
   if (buf.length > MAX_INTAKE_BYTES) throw new Error(`the file is larger than ${Math.round(MAX_INTAKE_BYTES / 1024 / 1024)} MB (GRIDWRIGHT_INTAKE_MAX_MB)`);
   const key = createHash('sha256').update(buf).digest('hex').slice(0, 32);
-  const existing = readProfile(doc, key);
   const text = /\.(xlsx|xlsm|xls|ods)$/i.test(name) ? undefined : buf.toString('utf8');
   const format = formatOf(name, text);
   let raws: RawSet[];
-  if (format === 'xlsx' || format === 'xlsm' || format === 'xls' || format === 'ods') raws = parseWorkbook(buf, name);
-  else if (format === 'xml') raws = parseXml(text!);
-  else if (format === 'json') raws = parseJson(text!);
+  // spreadsheets, XML and JSON are parsed in a worker thread under memory and time limits
+  if (format === 'xlsx' || format === 'xlsm' || format === 'xls' || format === 'ods') raws = await parseIsolated('workbook', buf, name, tenantOfDoc(doc));
+  else if (format === 'xml') raws = await parseIsolated('xml', buf, name, tenantOfDoc(doc), text);
+  else if (format === 'json') raws = await parseIsolated('json', buf, name, tenantOfDoc(doc), text);
   else raws = [{ name: '', rows: parseDelimited(text!, format === 'tsv' ? '\t' : undefined), formulas: 0, notes: [], hints: input.kinds }];
+  // read after the parse: another import of the same file may have finished meanwhile
+  const existing = readProfile(doc, key);
   const family = familyOf(name);
   const periodName = periodFromName(name);
   const state = loadState(doc);
@@ -754,7 +665,7 @@ export async function intakeQuery(doc: string, by: Author, connectionId: string,
   const from = /\bfrom\s+([a-zA-Z_][\w.]*)/i.exec(sql)?.[1]?.split('.').pop() ?? '';
   const base = (from || c.name).replace(/[^\w-]+/g, '-').toLowerCase();
   const name = `${base}.csv`;
-  const p = intake(doc, by, { name, text, origin: 'sql', kinds: r.kinds });
+  const p = await intake(doc, by, { name, text, origin: 'sql', kinds: r.kinds });
   p.query = { connection: c.name, sql: sql.slice(0, 2000), rows: r.rowCount, truncated: r.truncated, kinds: r.kinds };
   if (!p.period) p.period = now().slice(0, 10);
   writeProfile(p);
@@ -1072,7 +983,7 @@ export function listInbox(tenant?: string): InboxFile[] {
   return out.sort((a, b) => (a.modified < b.modified ? -1 : 1));
 }
 /** Take one file from the inbox into a document's intake (the file stays until it is placed, then moves to taken/). */
-export function intakeFromInbox(doc: string, by: Author, name: string): IntakeProfile {
+export async function intakeFromInbox(doc: string, by: Author, name: string): Promise<IntakeProfile> {
   const root = inboxRoot(tenantOfDoc(doc));
   if (!root) throw new Error('no inbox configured (GRIDWRIGHT_INBOX)');
   const safe = basename(name);

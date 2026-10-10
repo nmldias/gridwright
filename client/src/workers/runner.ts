@@ -7,9 +7,11 @@ import * as book from '../engine/book';
 import { isCodeKind, parseA1, type CellRef, type CellValue, type Rect } from '../engine/types';
 import { cellAt, getState, useStore } from '../state/store';
 import type { Plain, Snapshot } from './q';
-import JsWorker from './js.worker?worker';
-import PyWorker from './python.worker?worker';
+import jsWorkerUrl from './js.worker?worker&url';
+import pyWorkerUrl from './python.worker?worker&url';
+import { SandboxedWorker } from './sandbox';
 import { fnv, inputsHashFromSnapshot, outputHash, record as recordRun, type RunRecord, type RunRuntime } from './runs';
+import { isTrusted, noteBlocked } from './trust';
 
 const PY_INDEX_KEY = 'gridwright.pyodideIndexURL';
 export const DEFAULT_PYODIDE_INDEX = 'https://cdn.jsdelivr.net/pyodide/v0.27.5/full/';
@@ -34,8 +36,25 @@ export function setPyodideIndexURL(url: string) {
   }
 }
 
-let jsWorker: Worker | null = null;
-let pyWorker: Worker | null = null;
+/** what the runner needs from a worker; in a build it is always a SandboxedWorker */
+interface CodeWorker {
+  onmessage: ((e: MessageEvent) => void) | null;
+  onerror: ((e: { message: string }) => void) | null;
+  postMessage(data: unknown): void;
+  terminate(): void;
+}
+let jsWorker: CodeWorker | null = null;
+let pyWorker: CodeWorker | null = null;
+/**
+ * Browser code runs in the code sandbox (workers/sandbox.ts): an opaque origin without the person's
+ * session. The dev server's module workers cannot be moved into it, so `vite dev` runs them directly.
+ */
+function codeWorker(kind: 'js' | 'py'): CodeWorker {
+  const url = kind === 'js' ? jsWorkerUrl : pyWorkerUrl;
+  if (import.meta.env.DEV) return new Worker(url, { type: 'module' }) as unknown as CodeWorker;
+  const page = kind === 'js' ? '/sandbox/js.html' : `/sandbox/py.html?index=${encodeURIComponent(pyodideIndexURL())}`;
+  return new SandboxedWorker(page, url);
+}
 let nextId = 1;
 const pending = new Map<number, CellRef>();
 const started = new Map<number, number>();
@@ -205,18 +224,18 @@ async function runServerPython(ref: CellRef, id: number, code: string, gpu: bool
   }
 }
 
-function getJsWorker(): Worker {
+function getJsWorker(): CodeWorker {
   if (!jsWorker) {
-    jsWorker = new JsWorker();
+    jsWorker = codeWorker('js');
     jsWorker.onmessage = handleResult;
     jsWorker.onerror = (e) => useStore.setState({ status: `JavaScript worker error: ${e.message}` });
   }
   return jsWorker;
 }
 
-export function getPyWorker(): Worker {
+export function getPyWorker(): CodeWorker {
   if (!pyWorker) {
-    pyWorker = new PyWorker();
+    pyWorker = codeWorker('py');
     pyWorker.onmessage = handleResult;
     pyWorker.onerror = (e) => useStore.setState({ status: `Python worker error: ${e.message}`, pythonStatus: 'error' });
     useStore.setState({ pythonStatus: 'loading' });
@@ -250,6 +269,11 @@ export function buildSnapshot(current: CellRef): Snapshot {
 export function runCell(ref: CellRef) {
   const cell = cellAt(ref.table, ref.row, ref.col);
   if (!cell || !isCodeKind(cell.k)) return;
+  // code someone else wrote runs with *this* person's access: not until they have reviewed it
+  if (!isTrusted(cell)) {
+    noteBlocked(ref);
+    return;
+  }
   // loop guard: at most 6 runs per cell per 10 s
   const k = keyOf(ref);
   const now = Date.now();

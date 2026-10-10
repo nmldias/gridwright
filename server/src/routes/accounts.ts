@@ -44,6 +44,12 @@ import {
   setPassword,
   setSessionTenant,
   throttled,
+  acceptInvitation,
+  createInvitation,
+  invitationByCode,
+  listInvitations,
+  revokeInvitation,
+  waitText,
   updateTenant,
   updateUser,
   verifyLogin,
@@ -51,15 +57,10 @@ import {
 } from '../tenancy.js';
 import { requirePlatformAdmin, requireRole } from './common.js';
 
-const TRUST_PROXY = ['1', 'true', 'yes'].includes((process.env.GRIDWRIGHT_TRUST_PROXY ?? '').toLowerCase());
-const ipOf = (req: Request) => {
-  if (TRUST_PROXY) {
-    const xff = String(req.headers['x-forwarded-for'] ?? '').split(',')[0].trim();
-    if (xff) return xff;
-  }
-  return req.socket.remoteAddress ?? '';
-};
-const secureOf = (req: Request) => ['1', 'true', 'yes'].includes((process.env.GRIDWRIGHT_COOKIE_SECURE ?? '').toLowerCase()) || req.secure || String(req.headers['x-forwarded-proto'] ?? '') === 'https';
+// the client address and HTTPS come from Express, which reads X-Forwarded-For / -Proto only from a
+// proxy named in GRIDWRIGHT_TRUST_PROXY (index.ts); otherwise the socket itself decides
+const ipOf = (req: Request) => req.ip || req.socket.remoteAddress || '';
+const secureOf = (req: Request) => ['1', 'true', 'yes'].includes((process.env.GRIDWRIGHT_COOKIE_SECURE ?? '').toLowerCase()) || req.secure;
 const fail = (res: Response, e: unknown, status = 400) => res.status(status).json({ error: errorMessage(e) });
 
 /** Documents and connections per client (from the access metadata only — no document is read). */
@@ -102,7 +103,7 @@ export function registerAccountRoutes(app: Express) {
     const wait = throttled(ip, login);
     if (wait) {
       res.setHeader('retry-after', String(wait));
-      return res.status(429).json({ error: `too many attempts — try again in ${Math.ceil(wait / 60)} minute${wait > 60 ? 's' : ''}` });
+      return res.status(429).json({ error: `too many attempts — try again in ${waitText(wait)}` });
     }
     const user = verifyLogin(login, String(b.password ?? ''));
     if (!user) {
@@ -110,7 +111,7 @@ export function registerAccountRoutes(app: Express) {
       audit(login || '(empty)', 'auth.failed', { detail: ip });
       return res.status(401).json({ error: 'wrong e-mail or password' });
     }
-    clearFailures(login);
+    clearFailures(ip, login);
     const memberships = membershipsOf(user.login);
     const asked = typeof b.tenant === 'string' ? b.tenant : '';
     const first = memberships.find((m) => m.tenant.id === asked || m.tenant.slug === asked) ?? memberships.find((m) => m.tenant.status === 'active') ?? memberships[0];
@@ -140,6 +141,41 @@ export function registerAccountRoutes(app: Express) {
       fail(res, e);
     }
   });
+  // invitations: anyone holding the code sees what it is for, and accepts it with the password of
+  // their existing account or the one they choose now (the same form either way)
+  app.get('/api/auth/invitation', (req, res) => {
+    const inv = invitationByCode(String(req.query.code ?? ''));
+    if (!inv) return res.status(404).json({ error: 'this invitation is no longer valid — ask for a new one' });
+    res.json({ tenant: inv.tenantName, login: inv.login, role: inv.role, expiresAt: inv.expiresAt });
+  });
+  app.post('/api/auth/invitation/accept', (req, res) => {
+    const b = req.body ?? {};
+    const inv = invitationByCode(String(b.code ?? ''));
+    if (!inv) return res.status(404).json({ error: 'this invitation is no longer valid — ask for a new one' });
+    const ip = ipOf(req);
+    const wait = throttled(ip, inv.login);
+    if (wait) {
+      res.setHeader('retry-after', String(wait));
+      return res.status(429).json({ error: `too many attempts — try again in ${waitText(wait)}` });
+    }
+    try {
+      const r = acceptInvitation(String(b.code), String(b.password ?? ''), typeof b.name === 'string' ? b.name : undefined);
+      clearFailures(ip, r.login);
+      const token = createSession(r.login, r.tenant.id);
+      res.setHeader('set-cookie', sessionCookie(token, secureOf(req)));
+      audit(r.login, 'auth.signed-in', { tenant: r.tenant.id, detail: ip });
+      res.json({ ok: true, tenant: { id: r.tenant.id, slug: r.tenant.slug, name: r.tenant.name }, role: r.role });
+    } catch (e) {
+      const msg = errorMessage(e);
+      if (/wrong password/.test(msg)) {
+        noteFailure(ip, inv.login);
+        audit(inv.login, 'auth.failed', { detail: `${ip} (invitation)` });
+        return res.status(401).json({ error: 'wrong password — if you already have an account, use its password' });
+      }
+      fail(res, e);
+    }
+  });
+
   // the client a new tab opens in (each tab names its own with the x-gridwright-tenant header)
   app.post('/api/auth/switch', (req, res) => {
     const who = identityOf(req);
@@ -206,14 +242,29 @@ export function registerAccountRoutes(app: Express) {
     if (!tenant) return res.status(404).json({ error: 'no client' });
     res.json(membersOf(tenant.id));
   });
+  // adding someone is an invitation they accept — the same answer whether or not they have an
+  // account (no probing which e-mails exist), and nobody is put into a client without consenting
   app.post('/api/tenant/members', requireRole('admin'), (req, res) => {
     const { who, tenant } = currentTenant(req);
     if (!tenant || who.agent) return res.status(403).json({ error: 'not allowed' });
     try {
-      res.json(addPerson(tenant.id, req.body ?? {}, who.login));
+      const b = req.body ?? {};
+      const inv = createInvitation(tenant.id, normaliseLogin(b.login), isRole(b.role) ? b.role : 'editor', who.login);
+      res.json({ invited: true, id: inv.id, login: inv.login, role: inv.role, code: inv.code, link: `/?invite=${encodeURIComponent(inv.code)}`, expiresAt: inv.expiresAt });
     } catch (e) {
       fail(res, e);
     }
+  });
+  app.get('/api/tenant/invitations', requireRole('admin'), (req, res) => {
+    const { tenant } = currentTenant(req);
+    if (!tenant) return res.status(404).json({ error: 'no client' });
+    res.json(listInvitations(tenant.id));
+  });
+  app.delete('/api/tenant/invitations/:id', requireRole('admin'), (req, res) => {
+    const { who, tenant } = currentTenant(req);
+    if (!tenant || who.agent) return res.status(403).json({ error: 'not allowed' });
+    if (!revokeInvitation(tenant.id, req.params.id, who.login)) return res.status(404).json({ error: 'not found' });
+    res.json({ ok: true });
   });
   app.put('/api/tenant/members/:login', requireRole('admin'), (req, res) => {
     const { who, tenant } = currentTenant(req);

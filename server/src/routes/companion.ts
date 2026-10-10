@@ -195,6 +195,7 @@ export function registerCompanionRoutes(app: Express) {
         ],
         1200,
         tenantOfDoc(req.params.id),
+        identityOf(req).login,
       );
       const out = setInterpretation(req.params.id, issue.id, { text: r.text.slice(0, 2000), model: r.model, at: new Date().toISOString(), revision: issue.revision });
       notifyCompanion(req.params.id, { attention: companionBrief(req.params.id).health.attention });

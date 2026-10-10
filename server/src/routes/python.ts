@@ -11,7 +11,7 @@ import { appendEntry } from '../history.js';
 import { authMode, identityEnabled, identityOf } from '../identity.js';
 import { ACCOUNTS, membershipsOf } from '../tenancy.js';
 import { admissionState, probeGpu, probePython, pythonStatus, QUEUE_MAX, runPython, type Snapshot } from '../pyrun.js';
-import { readFile } from '../storage.js';
+import { DEFAULT_TENANT, readFile } from '../storage.js';
 import { brief as companionBrief } from '../companion.js';
 import { probeStack, runAgentCell } from '../investigate.js';
 import { notifyCompanion } from '../multiplayer.js';
@@ -83,7 +83,7 @@ app.post('/api/python/run', requireRole('editor'), async (req, res) => {
     const code = typeof b.code === 'string' ? b.code : '';
     const snapshot = b.snapshot && Array.isArray(b.snapshot.tables) ? (b.snapshot as Snapshot) : { tables: [], current: { table: 0, row: 0, col: 0 } };
     const startedAt = new Date().toISOString();
-    const r = await runPython(code, snapshot, b.gpu === true);
+    const r = await runPython(code, snapshot, b.gpu === true, requester.tenant ?? DEFAULT_TENANT);
     if (r.busy) return res.status(429).json(r);
     const cell = b.cell && typeof b.cell === 'object' ? (b.cell as { file?: unknown; table?: unknown; row?: unknown; col?: unknown; kind?: unknown; startedAt?: unknown; client?: unknown }) : null;
     const fileId = cell && typeof cell.file === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(cell.file) ? cell.file : null;

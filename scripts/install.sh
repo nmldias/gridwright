@@ -33,7 +33,19 @@
 #                      The first platform administrator is GW_ADMIN_EMAIL; a temporary password is
 #                      written to <data>/initial-admin.txt on the first start. GW_TOKEN is not used.
 #                      Combined with --tailscale, Tailscale only provides HTTPS; identity is the accounts'.
+#   --https[=DOMAIN]   serve over HTTPS on the public internet: installs Caddy (sudo, apt) in front with a
+#                      Let's Encrypt certificate for DOMAIN — by default <public-ip>.sslip.io, a name that
+#                      resolves to this machine without registering anything. The server then binds to
+#                      127.0.0.1 and trusts the forwarded headers of that local proxy only
+#                      (GRIDWRIGHT_TRUST_PROXY=1). Ports 80 and 443 must be open to the internet (80 for
+#                      the certificate and the redirect); with ufw active they are allowed and the plain
+#                      port is closed. Use it for any public address with --accounts: passwords and the
+#                      session cookie must not travel over plain HTTP.
 #   --no-backup        do not install the nightly backup timer.
+#
+# Install from a folder of its own (the release tarball, or `git clone -b release`): the service runs
+# that folder's server/dist, so switching branches or rebuilding in a development checkout would
+# change the live server.
 #
 # Environment:
 #   GW_PORT      listen port (default 8787)
@@ -71,6 +83,8 @@ SANDBOX=0
 COMPANION=0
 BACKUP=1
 ACCOUNTS=0
+HTTPS=0
+HTTPS_DOMAIN=""
 for a in "$@"; do
   case "$a" in
     --tailscale) TAILSCALE=1 ;;
@@ -80,6 +94,8 @@ for a in "$@"; do
     --sandbox) SANDBOX=1 ;;
     --no-backup) BACKUP=0 ;;
     --accounts) ACCOUNTS=1 ;;
+    --https) HTTPS=1 ;;
+    --https=*) HTTPS=1; HTTPS_DOMAIN="${a#--https=}" ;;
     -h|--help) sed -n '2,/^# Re-running/p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
@@ -91,6 +107,11 @@ die() { printf '\033[31mERROR\033[0m %s\n' "$*" >&2; exit 1; }
 [ -f server/dist/index.js ] && [ -f client/dist/index.html ] || die "this is not the prebuilt release (server/dist or client/dist missing) — run scripts/build.sh first"
 [ -f server/engine/gridwright_core.js ] || echo "note: server/engine is missing, so the MCP server and proposals will be off (rebuild with scripts/build.sh or fetch a newer release)" >&2
 command -v curl >/dev/null 2>&1 || die "curl is required"
+if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 && ! git -C "$ROOT" log -1 --format=%s 2>/dev/null | grep -q '^release: prebuilt'; then
+  echo "note: $ROOT is a development checkout — the service will run this folder's server/dist, so a branch" >&2
+  echo "      switch, pull or rebuild here changes the live server. For production install from a folder of its own:" >&2
+  echo "      git clone -b release https://github.com/nmldias/gridwright ~/gridwright-live && ~/gridwright-live/scripts/install.sh ..." >&2
+fi
 
 # --- Node ≥ 22.13 (node:sqlite, the companion's store, is unflagged from there) ----------------
 node_ok() { "$1" -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a>22||(a===22&&b>=13)?0:1)' 2>/dev/null; }
@@ -119,6 +140,10 @@ say "node $("$NODE_BIN" -v) at $NODE_BIN"
 say "installing server dependencies"
 (cd server && npm ci --omit=dev --no-audit --no-fund --loglevel=error)
 mkdir -p "$DATA"
+# the data directory holds the encryption key, the accounts database and every client's documents:
+# only the service user may read it (the service also runs with UMask=0077 so new files stay private)
+chmod 700 "$DATA" 2>/dev/null || true
+chmod -R go-rwx "$DATA" 2>/dev/null || true
 
 # --- optional: self-hosted Pyodide ----------------------------------------------------
 if [ "$PYODIDE" = 1 ]; then
@@ -139,6 +164,19 @@ fi
 # --- optional: tailscale serve ------------------------------------------------------------
 HOST_BIND=0.0.0.0
 TRUST=0
+TRUST_PROXY=""
+if [ "$HTTPS" = 1 ]; then
+  [ "$TAILSCALE" = 1 ] && die "--https and --tailscale both terminate HTTPS; choose one"
+  command -v sudo >/dev/null 2>&1 || die "--https needs sudo (to install Caddy and bind ports 80/443)"
+  if [ -z "$HTTPS_DOMAIN" ]; then
+    pub="$(curl -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+    [[ "$pub" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "could not find this machine's public IPv4 address; pass --https=your.domain"
+    HTTPS_DOMAIN="${pub//./-}.sslip.io"
+  fi
+  [[ "$HTTPS_DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] || die "--https: not a domain name: $HTTPS_DOMAIN"
+  HOST_BIND=127.0.0.1
+  TRUST_PROXY=1
+fi
 if [ "$TAILSCALE" = 1 ]; then
   command -v tailscale >/dev/null 2>&1 || die "tailscale is not installed on this host"
   HOST_BIND=127.0.0.1
@@ -221,6 +259,7 @@ Environment=GRIDWRIGHT_TOKEN=${GW_TOKEN:-}
 Environment=GRIDWRIGHT_AUTH=$GW_AUTH
 Environment=GRIDWRIGHT_ADMIN_EMAIL=${GW_ADMIN_EMAIL:-}
 Environment=GRIDWRIGHT_TRUST_TAILSCALE=$TRUST
+Environment=GRIDWRIGHT_TRUST_PROXY=${TRUST_PROXY:-${GW_TRUST_PROXY:-}}
 Environment=GRIDWRIGHT_ADMINS=${GW_ADMINS:-}
 Environment=GRIDWRIGHT_READONLY=${GW_READONLY:-}
 Environment=GRIDWRIGHT_DEFAULT_SHARING=${GW_DEFAULT_SHARING:-}
@@ -241,11 +280,11 @@ EOF
 start_nohup() {
   pkill -f "$ROOT/server/dist/index.js" 2>/dev/null || true
   (cd server && PORT="$PORT" HOST="$HOST_BIND" GRIDWRIGHT_DATA="$DATA" CLIENT_DIR="$ROOT/client/dist" \
-    GRIDWRIGHT_TOKEN="${GW_TOKEN:-}" GRIDWRIGHT_AUTH="$GW_AUTH" GRIDWRIGHT_ADMIN_EMAIL="${GW_ADMIN_EMAIL:-}" GRIDWRIGHT_TRUST_TAILSCALE="$TRUST" GRIDWRIGHT_ADMINS="${GW_ADMINS:-}" GRIDWRIGHT_READONLY="${GW_READONLY:-}" GRIDWRIGHT_DEFAULT_SHARING="${GW_DEFAULT_SHARING:-}" \
+    GRIDWRIGHT_TOKEN="${GW_TOKEN:-}" GRIDWRIGHT_AUTH="$GW_AUTH" GRIDWRIGHT_ADMIN_EMAIL="${GW_ADMIN_EMAIL:-}" GRIDWRIGHT_TRUST_TAILSCALE="$TRUST" GRIDWRIGHT_TRUST_PROXY="${TRUST_PROXY:-${GW_TRUST_PROXY:-}}" GRIDWRIGHT_ADMINS="${GW_ADMINS:-}" GRIDWRIGHT_READONLY="${GW_READONLY:-}" GRIDWRIGHT_DEFAULT_SHARING="${GW_DEFAULT_SHARING:-}" \
     GRIDWRIGHT_PYTHON="${GW_PYTHON:-}" GRIDWRIGHT_PYTHON_SANDBOX="${GW_PYTHON_SANDBOX:-}" GRIDWRIGHT_PYTHON_TIMEOUT_MS="${GW_PYTHON_TIMEOUT_MS:-}" GRIDWRIGHT_PYTHON_MEMORY_MB="${GW_PYTHON_MEMORY_MB:-}" GRIDWRIGHT_PYTHON_CONCURRENCY="${GW_PYTHON_CONCURRENCY:-}" GRIDWRIGHT_PYTHON_THREADS="${GW_PYTHON_THREADS:-}" \
     GRIDWRIGHT_INBOX="${GW_INBOX:-}" GRIDWRIGHT_INTAKE_MAX_MB="${GW_INTAKE_MAX_MB:-}" \
     AI_BASE_URL="${AI_BASE_URL:-}" AI_MODEL="${AI_MODEL:-}" AI_API_KEY="${AI_API_KEY:-}" \
-    setsid -f nohup "$NODE_BIN" "$ROOT/server/dist/index.js" > "$DATA/server.log" 2>&1 < /dev/null)
+    umask 077 && setsid -f nohup "$NODE_BIN" "$ROOT/server/dist/index.js" > "$DATA/server.log" 2>&1 < /dev/null)
   say "started with nohup (no systemd user session); log: $DATA/server.log"
 }
 
@@ -257,7 +296,7 @@ if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/d
   {
     printf '[Unit]\nDescription=Gridwright spreadsheet server\nAfter=network-online.target\n\n[Service]\nWorkingDirectory=%s/server\n' "$ROOT"
     unit_env
-    printf 'ExecStart=%s %s/server/dist/index.js\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n' "$NODE_BIN" "$ROOT"
+    printf 'UMask=0077\nExecStart=%s %s/server/dist/index.js\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n' "$NODE_BIN" "$ROOT"
   } > "$unit_dir/gridwright.service"
   systemctl --user daemon-reload
   systemctl --user enable gridwright.service >/dev/null 2>&1
@@ -276,10 +315,13 @@ fi
 if [ "$BACKUP" = 1 ]; then
   BACKUP_DIR="${GW_BACKUP_DIR:-$HOME/gridwright-backups}"
   mkdir -p "$BACKUP_DIR"
+  # backups contain the encryption key: private to the service user
+  chmod 700 "$BACKUP_DIR" && chmod -R go-rwx "$BACKUP_DIR" 2>/dev/null || true
   cat > "$DATA/backup.sh" <<EOF
 #!/usr/bin/env bash
 # Nightly backup of the Gridwright data directory (documents, history, connections, settings).
 set -euo pipefail
+umask 077
 stamp="\$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BACKUP_DIR"
 tar -czf "$BACKUP_DIR/gridwright-\$stamp.tar.gz" -C "$DATA" --exclude=./pyodide --exclude=./pyenv --exclude=./pycache --exclude=./server.log --exclude=./backup.sh .
@@ -295,6 +337,7 @@ Description=Gridwright nightly backup
 
 [Service]
 Type=oneshot
+UMask=0077
 ExecStart=$DATA/backup.sh
 EOF
     cat > "$HOME/.config/systemd/user/gridwright-backup.timer" <<EOF
@@ -344,7 +387,35 @@ else
 fi
 say "server-side Python cells: $py_line"
 
-if [ "$TAILSCALE" = 1 ]; then
+if [ "$HTTPS" = 1 ]; then
+  if ! command -v caddy >/dev/null 2>&1; then
+    say "installing Caddy (sudo apt)"
+    sudo apt-get install -y -qq caddy >/dev/null || die "apt-get install caddy failed"
+  fi
+  CADDYFILE=/etc/caddy/Caddyfile
+  if [ -f "$CADDYFILE" ] && ! grep -q "written by gridwright" "$CADDYFILE" && grep -vE '^\s*(#|$)' "$CADDYFILE" | grep -qvE '^\s*(:80 \{|root \* /usr/share/caddy|file_server|\})\s*$'; then
+    die "$CADDYFILE has a configuration of its own; add this site to it and re-run without --https:
+  $HTTPS_DOMAIN {
+    reverse_proxy 127.0.0.1:$PORT
+  }"
+  fi
+  printf '# written by gridwright scripts/install.sh --https — re-running the installer replaces this file\n%s {\n\tencode zstd gzip\n\treverse_proxy 127.0.0.1:%s\n}\n' "$HTTPS_DOMAIN" "$PORT" | sudo tee "$CADDYFILE" >/dev/null
+  sudo caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1 || die "caddy rejected $CADDYFILE"
+  sudo systemctl enable caddy >/dev/null 2>&1 || true
+  sudo systemctl reload-or-restart caddy || die "caddy did not start: sudo journalctl -u caddy -n 50"
+  if command -v ufw >/dev/null 2>&1 && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
+    sudo ufw allow 80/tcp comment 'Gridwright HTTPS (certificate + redirect)' >/dev/null
+    sudo ufw allow 443/tcp comment 'Gridwright HTTPS' >/dev/null
+    sudo ufw delete allow "$PORT/tcp" >/dev/null 2>&1 || true
+  fi
+  say "waiting for the certificate for $HTTPS_DOMAIN (Let's Encrypt, up to two minutes)"
+  for i in $(seq 1 60); do
+    curl -fsS --max-time 5 "https://$HTTPS_DOMAIN/api/health" >/dev/null 2>&1 && break
+    sleep 2
+    [ "$i" -eq 60 ] && echo "warning: https://$HTTPS_DOMAIN/ does not answer yet — are ports 80 and 443 open to the internet? sudo journalctl -u caddy -n 50" >&2
+  done
+  say "Gridwright is up: https://$HTTPS_DOMAIN/   (HTTPS by Caddy; the server itself listens on 127.0.0.1:$PORT only)"
+elif [ "$TAILSCALE" = 1 ]; then
   if tailscale serve --bg --https=443 "http://127.0.0.1:$PORT" >/dev/null 2>&1; then
     fqdn="$(tailscale status --json 2>/dev/null | "$NODE_BIN" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s);process.stdout.write((j.Self.DNSName||"").replace(/\.$/,""))}catch{}})')"
     say "Gridwright is up on the tailnet: https://${fqdn:-<this-machine>.<tailnet>.ts.net}/  (identity from Tailscale; admins: ${GW_ADMINS:-everyone})"

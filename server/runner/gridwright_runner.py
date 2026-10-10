@@ -514,6 +514,11 @@ def serve():
             _, status_code = os.waitpid(pid, 0)
         except Exception:
             status_code = 0
+        # nothing of a run may outlive it: stop anything it left running in its process group
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except Exception:
+            pass
         result = None
         if chunks and not timed_out:
             try:

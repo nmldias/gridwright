@@ -4,8 +4,10 @@
 // the user sees exactly what the assistant looked at.
 
 import type { Request, Response } from 'express';
+import { clientNetError, fetchFor } from './netguard.js';
 import { identityOf } from './identity.js';
 import { aiKeyOf, readAiConfig } from './storage.js';
+import { admit, record, refused } from './aiquota.js';
 import { ACCOUNTS } from './tenancy.js';
 import { runTool, TOOL_DEFS } from './tools.js';
 
@@ -21,7 +23,26 @@ interface Round {
   text: string;
   toolCalls: ToolCall[];
   finish: string;
+  usage?: { prompt_tokens?: number; completion_tokens?: number };
 }
+
+// Ask for the token count in the stream (OpenAI's stream_options); an endpoint that rejects the
+// option is remembered and asked without it from then on.
+const noStreamOptions = new Set<string>();
+async function postChat(go: typeof fetch, baseUrl: string, headers: Record<string, string>, body: Record<string, unknown>, signal: AbortSignal): Promise<globalThis.Response> {
+  const withUsage = !noStreamOptions.has(baseUrl);
+  const send = (b: Record<string, unknown>) => go(`${baseUrl}/chat/completions`, { method: 'POST', headers, body: JSON.stringify(b), signal });
+  const r = await send(withUsage ? { ...body, stream_options: { include_usage: true } } : body);
+  if (withUsage && (r.status === 400 || r.status === 422)) {
+    const text = await r.clone().text().catch(() => '');
+    if (/stream_options|include_usage/i.test(text)) {
+      noStreamOptions.add(baseUrl);
+      return send(body);
+    }
+  }
+  return r;
+}
+const charsOf = (messages: unknown) => JSON.stringify(messages ?? '').length;
 
 export async function chat(req: Request, res: Response) {
   // the settings of the caller's client (accounts mode), else the server's
@@ -37,6 +58,8 @@ export async function chat(req: Request, res: Response) {
     return;
   }
   const identity = identityOf(req);
+  // the client's AI rate and monthly budget (accounts mode)
+  if (refused(res, admit(identity.tenant, identity.login))) return;
   // viewers may chat, but the tools reach databases and the audit log: editors only
   let useTools = !!req.body?.tools && identity.role !== 'viewer';
   const fileId = typeof req.body?.file === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(req.body.file) ? req.body.file : undefined;
@@ -63,31 +86,30 @@ export async function chat(req: Request, res: Response) {
     res.write(`data: ${JSON.stringify(obj)}\n\n`);
   };
 
+  // an endpoint a client typed in goes through the egress guard (no private networks, no redirects)
+  const go = fetchFor(!!cfg.clientEndpoint);
+  const unreachable = (e: unknown) => (cfg.clientEndpoint ? clientNetError(e, 'the model endpoint') : `cannot reach ${baseUrl}: ${(e as Error).message}`);
   const request = async (withTools: boolean): Promise<globalThis.Response> =>
-    fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        model: cfg.model,
-        messages,
-        stream: true,
-        temperature: 0.2,
-        max_tokens: 4096,
-        ...(withTools ? { tools: TOOL_DEFS, tool_choice: 'auto' } : {}),
-      }),
-      signal: controller.signal,
-    });
+    postChat(go as typeof fetch, baseUrl, headers, { model: cfg.model, messages, stream: true, temperature: 0.2, max_tokens: 4096, ...(withTools ? { tools: TOOL_DEFS, tool_choice: 'auto' } : {}) }, controller.signal);
 
   for (let round = 0; round <= MAX_ROUNDS; round++) {
+    // each further tool round is another model call: still within the month's budget?
+    if (round > 0) {
+      const more = admit(identity.tenant, identity.login, { rate: false });
+      if (!more.ok) {
+        send({ error: more.error });
+        break;
+      }
+    }
     let upstream: globalThis.Response;
     try {
       upstream = await request(useTools);
     } catch (e) {
       if (!started) {
-        res.status(502).json({ error: `cannot reach ${baseUrl}: ${(e as Error).message}` });
+        res.status(502).json({ error: unreachable(e) });
         return;
       }
-      send({ error: `cannot reach ${baseUrl}: ${(e as Error).message}` });
+      send({ error: unreachable(e) });
       break;
     }
     if (!upstream.ok || !upstream.body) {
@@ -107,12 +129,15 @@ export async function chat(req: Request, res: Response) {
       break;
     }
     let r: Round;
+    const inChars = charsOf(messages);
     try {
       r = await readRound(upstream.body, send);
     } catch (e) {
+      record(identity.tenant, null, { inChars, outChars: 0 });
       if (!controller.signal.aborted) send({ error: (e as Error).message });
       break;
     }
+    record(identity.tenant, r.usage, { inChars, outChars: r.text.length + r.toolCalls.reduce((n, c) => n + c.name.length + c.args.length, 0) });
     if (!r.toolCalls.length || round === MAX_ROUNDS) break;
     // tool round: run every call, feed the results back, and ask again
     messages.push({
@@ -147,8 +172,10 @@ export async function chat(req: Request, res: Response) {
 }
 
 /** One non-interactive completion (the companion's interpretation of an issue): text and model id, or an error. */
-export async function completeOnce(messages: { role: string; content: string }[], maxTokens = 1200, tenant?: string): Promise<{ text: string; model: string }> {
+export async function completeOnce(messages: { role: string; content: string }[], maxTokens = 1200, tenant?: string, login?: string): Promise<{ text: string; model: string }> {
   const cfg = readAiConfig(ACCOUNTS ? tenant : undefined);
+  const a = admit(tenant, login);
+  if (!a.ok) throw new Error(a.error);
   const baseUrl = (cfg.baseUrl || '').replace(/\/+$/, '');
   if (!baseUrl || !cfg.model) throw new Error('AI endpoint not configured — open the assistant settings (⚙) and set the base URL and model');
   const apiKey = aiKeyOf(cfg);
@@ -161,13 +188,14 @@ export async function completeOnce(messages: { role: string; content: string }[]
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 120_000);
   try {
-    const upstream = await fetch(`${baseUrl}/chat/completions`, { method: 'POST', headers, body: JSON.stringify({ model: cfg.model, messages, stream: true, temperature: 0.2, max_tokens: maxTokens }), signal: controller.signal });
+    const upstream = await postChat(fetchFor(!!cfg.clientEndpoint) as typeof fetch, baseUrl, headers, { model: cfg.model, messages, stream: true, temperature: 0.2, max_tokens: maxTokens }, controller.signal);
     if (!upstream.ok || !upstream.body) throw new Error(`model endpoint returned ${upstream.status}: ${(await upstream.text().catch(() => '')).slice(0, 300)}`);
     let err = '';
     const r = await readRound(upstream.body, (o) => {
       const e = (o as { error?: string }).error;
       if (e) err = e;
     });
+    record(tenant, r.usage, { inChars: charsOf(messages), outChars: r.text.length });
     if (!r.text && err) throw new Error(err);
     return { text: r.text.trim(), model: cfg.model };
   } finally {
@@ -183,6 +211,7 @@ async function readRound(body: ReadableStream<Uint8Array>, send: (o: unknown) =>
   const out: Round = { text: '', toolCalls: [], finish: '' };
   const calls = new Map<number, ToolCall>();
   const handle = (obj: any) => {
+    if (obj?.usage && typeof obj.usage === 'object') out.usage = obj.usage;
     const choice = obj.choices?.[0];
     if (!choice) {
       if (obj.error) send({ error: typeof obj.error === 'string' ? obj.error : obj.error.message ?? 'model error' });

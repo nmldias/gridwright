@@ -15,5 +15,7 @@ export default defineConfig({
     sourcemap: false,
     chunkSizeWarningLimit: 2000,
   },
-  worker: { format: 'es' },
+  // classic workers: code cells run in a worker created from a blob inside an opaque-origin frame
+  // (workers/sandbox.ts), where module workers cannot start
+  worker: { format: 'iife' },
 });

@@ -8,6 +8,7 @@ import { brief as companionBrief } from '../companion.js';
 import { IntakeRequestSchema, PlacementSchema } from '../contracts.js';
 import { identityOf } from '../identity.js';
 import { applyIntake, declineIntake, inboxRoot, inboxTaken, intake, intakeFromInbox, intakeQuery, listInbox, listProfiles, originalPath, readingOf, readProfile, MAX_INTAKE_BYTES } from '../intake.js';
+import { ImportBusy } from '../parsepool.js';
 import { heldReason } from '../sources.js';
 import { broadcastEntries, notifyCompanion } from '../multiplayer.js';
 import { SqlRefused, authorizeQuery, canSeeConnection } from '../sqlpolicy.js';
@@ -45,15 +46,15 @@ export function registerIntakeRoutes(app: Express) {
     if (!b) return;
     const who = identityOf(req);
     try {
-      if ('inbox' in b) return res.json(intakeFromInbox(req.params.id, authorOf(req), b.inbox));
+      if ('inbox' in b) return res.json(await intakeFromInbox(req.params.id, authorOf(req), b.inbox));
       if ('connection' in b) {
         const p = await intakeQuery(req.params.id, authorOf(req), b.connection, b.sql, { visible: (c) => canSeeConnection(c as StoredConnection, who), authorize: (c, sql) => authorizeQuery(c as StoredConnection, who, sql) });
         return res.json(p);
       }
       if (typeof b.base64 === 'string' && b.base64.length > (MAX_INTAKE_BYTES * 4) / 3 + 4) return res.status(413).json({ error: `the file is larger than ${Math.round(MAX_INTAKE_BYTES / 1024 / 1024)} MB` });
-      res.json(intake(req.params.id, authorOf(req), { name: b.name ?? 'pasted.txt', base64: b.base64, text: b.text, origin: who.agent ? 'agent' : 'user' }));
+      res.json(await intake(req.params.id, authorOf(req), { name: b.name ?? 'pasted.txt', base64: b.base64, text: b.text, origin: who.agent ? 'agent' : 'user' }));
     } catch (e) {
-      fail(res, e, e instanceof SqlRefused ? e.status : 400);
+      fail(res, e, e instanceof SqlRefused ? e.status : e instanceof ImportBusy ? 429 : 400);
     }
   });
   app.get('/api/files/:id/intake/:key', (req, res) => {

@@ -206,6 +206,8 @@ export interface AiConfig {
   scope?: 'platform' | 'client';
   /** whether AI_API_KEY from the environment may be used for this endpoint */
   envKey?: boolean;
+  /** the endpoint was typed in by a client (not the platform's): outbound requests are guarded */
+  clientEndpoint?: boolean;
 }
 
 const AI_PATH = () => join(DATA_DIR, 'ai.json');
@@ -253,6 +255,7 @@ export function readAiConfig(tenant?: string): AiConfig {
     apiKeyEnc: t.apiKeyEnc ?? (platformEndpoint ? platform.apiKeyEnc : undefined),
     scope: 'client',
     envKey: !t.apiKeyEnc && platformEndpoint,
+    clientEndpoint: !platformEndpoint,
   };
 }
 
