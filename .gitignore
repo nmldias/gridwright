@@ -6,3 +6,4 @@ data/
 .env
 client/src/engine/pkg/
 server/engine/
+__pycache__/

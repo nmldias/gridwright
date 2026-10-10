@@ -19,7 +19,8 @@
 #                      ~/gridwright-data/pyenv/bin/pip install --extra-index-url=https://pypi.nvidia.com "cudf-cu13"
 #                      (pick the cuXX that matches `nvidia-smi`; see rapids.ai/start).
 #   --companion        install the companion's investigation stack (LangChain, DeepAgents, LangGraph,
-#                      SQLite checkpoints) into the --python venv (created if missing), so *Investigate*
+#                      SQLite checkpoints, at the tested versions in integrations/companion/requirements.lock.txt)
+#                      into the --python venv (created if missing), so *Investigate*
 #                      in Ask works; the stack runs as a separate process and calls the server back over
 #                      the loopback interface with a short-lived token for the requesting person.
 #   --sandbox          strongest isolation for server-side Python cells: installs bubblewrap and, on
@@ -41,6 +42,9 @@
 #   GW_PYTHON_TIMEOUT_MS, GW_PYTHON_MEMORY_MB, GW_PYTHON_CONCURRENCY, GW_PYTHON_THREADS
 #                       per-run limits: wall clock (60000 ms), memory (default a quarter of RAM, at most half of
 #                       what is free at start), parallel runs (2), BLAS threads per run (4)
+#   GW_INBOX            one directory the companion lists on request as an inbound source for intake
+#                       (CSV, Excel, XML, JSON); nothing is watched, taken files move to its taken/ subfolder
+#   GW_INTAKE_MAX_MB    largest file intake accepts (default 25)
 #   GW_BACKUP_DIR    where nightly backups go (default ~/gridwright-backups, 14 kept)
 #   GW_BACKUP_TARGET optional rsync destination for the backups, e.g. nmldias@100.78.161.2:gridwright-backups/
 #   AI_BASE_URL, AI_MODEL, AI_API_KEY   defaults for the assistant (also editable in the UI)
@@ -147,7 +151,7 @@ if [ "$PYVENV" = 1 ]; then
   say "venv ready: $("$DATA/pyenv/bin/python" --version) with pandas $("$DATA/pyenv/bin/python" -c 'import pandas; print(pandas.__version__)')"
   if [ "${COMPANION:-0}" = 1 ]; then
     say "installing the companion's investigation stack into the venv (LangChain, DeepAgents, LangGraph)"
-    "$DATA/pyenv/bin/pip" install -q -r "$ROOT/integrations/companion/requirements.txt" || die "pip install of the investigation stack failed (is the internet reachable?)"
+    "$DATA/pyenv/bin/pip" install -q -r "$ROOT/integrations/companion/requirements.lock.txt" || die "pip install of the investigation stack failed (is the internet reachable?)"
     say "investigation stack: $("$DATA/pyenv/bin/python" "$ROOT/integrations/companion/investigate.py" --probe)"
   fi
 fi
@@ -207,6 +211,8 @@ Environment=GRIDWRIGHT_PYTHON_TIMEOUT_MS=${GW_PYTHON_TIMEOUT_MS:-}
 Environment=GRIDWRIGHT_PYTHON_MEMORY_MB=${GW_PYTHON_MEMORY_MB:-}
 Environment=GRIDWRIGHT_PYTHON_CONCURRENCY=${GW_PYTHON_CONCURRENCY:-}
 Environment=GRIDWRIGHT_PYTHON_THREADS=${GW_PYTHON_THREADS:-}
+Environment=GRIDWRIGHT_INBOX=${GW_INBOX:-}
+Environment=GRIDWRIGHT_INTAKE_MAX_MB=${GW_INTAKE_MAX_MB:-}
 Environment=AI_BASE_URL=${AI_BASE_URL:-}
 Environment=AI_MODEL=${AI_MODEL:-}
 Environment=AI_API_KEY=${AI_API_KEY:-}
@@ -218,6 +224,7 @@ start_nohup() {
   (cd server && PORT="$PORT" HOST="$HOST_BIND" GRIDWRIGHT_DATA="$DATA" CLIENT_DIR="$ROOT/client/dist" \
     GRIDWRIGHT_TOKEN="${GW_TOKEN:-}" GRIDWRIGHT_TRUST_TAILSCALE="$TRUST" GRIDWRIGHT_ADMINS="${GW_ADMINS:-}" GRIDWRIGHT_READONLY="${GW_READONLY:-}" GRIDWRIGHT_DEFAULT_SHARING="${GW_DEFAULT_SHARING:-}" \
     GRIDWRIGHT_PYTHON="${GW_PYTHON:-}" GRIDWRIGHT_PYTHON_SANDBOX="${GW_PYTHON_SANDBOX:-}" GRIDWRIGHT_PYTHON_TIMEOUT_MS="${GW_PYTHON_TIMEOUT_MS:-}" GRIDWRIGHT_PYTHON_MEMORY_MB="${GW_PYTHON_MEMORY_MB:-}" GRIDWRIGHT_PYTHON_CONCURRENCY="${GW_PYTHON_CONCURRENCY:-}" GRIDWRIGHT_PYTHON_THREADS="${GW_PYTHON_THREADS:-}" \
+    GRIDWRIGHT_INBOX="${GW_INBOX:-}" GRIDWRIGHT_INTAKE_MAX_MB="${GW_INTAKE_MAX_MB:-}" \
     AI_BASE_URL="${AI_BASE_URL:-}" AI_MODEL="${AI_MODEL:-}" AI_API_KEY="${AI_API_KEY:-}" \
     setsid -f nohup "$NODE_BIN" "$ROOT/server/dist/index.js" > "$DATA/server.log" 2>&1 < /dev/null)
   say "started with nohup (no systemd user session); log: $DATA/server.log"

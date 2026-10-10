@@ -10,12 +10,12 @@ import { execFile, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { finishInvestigation, recordRun, startInvestigation, type Investigation } from './companion.js';
+import { finishInvestigation, recordRun, requestCancel, startInvestigation, type Investigation } from './companion.js';
 import { fnv } from './evidence.js';
 import { openDocument, snapshotOf } from './headless.js';
 import { issueAgentToken, revokeAgentToken, type Identity } from './identity.js';
 import { runPython } from './pyrun.js';
-import { DATA_DIR, decrypt, readAiConfig } from './storage.js';
+import { crashPoint, DATA_DIR, decrypt, readAiConfig } from './storage.js';
 import type { Author } from './history.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -104,6 +104,28 @@ export function setInvestigationNotifier(fn: typeof notifyDone) {
   notifyDone = fn;
 }
 
+const running = new Map<string, import('node:child_process').ChildProcess>();
+/** Stop a running investigation: the record is marked, the process is told to stop (then killed), its late result is fenced. */
+export function cancelInvestigation(doc: string, id: string, by: Author): Investigation {
+  const inv = requestCancel(doc, id, by);
+  const child = running.get(id);
+  if (child) {
+    try {
+      child.kill('SIGTERM');
+      setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* gone */
+        }
+      }, 5000).unref();
+    } catch {
+      /* gone */
+    }
+  }
+  return inv;
+}
+
 /**
  * Start a bounded investigation as a separate process. It gets: the base URL (loopback), a
  * short-lived agent token for the requesting identity, the model endpoint the server is
@@ -135,6 +157,8 @@ export function startInvestigationProcess(fileId: string, who: Identity, by: Aut
   const args = ['-E', SCRIPT, fileId, '--investigation', inv.id, '--thread', inv.thread, '--question', inv.question, '--json'];
   if (inv.issue) args.push('--issue', inv.issue);
   const child = spawn(st.python, args, { env, stdio: ['ignore', 'pipe', 'pipe'], cwd: resolve(dirname(SCRIPT)) });
+  running.set(inv.id, child);
+  crashPoint('investigation:dispatched');
   let out = '';
   let err = '';
   child.stdout.on('data', (b: Buffer) => {
@@ -146,6 +170,7 @@ export function startInvestigationProcess(fileId: string, who: Identity, by: Aut
   const timer = setTimeout(() => child.kill('SIGKILL'), TIMEOUT_MS);
   child.on('close', (code) => {
     clearTimeout(timer);
+    running.delete(inv.id);
     revokeAgentToken(token);
     try {
       const line = out.trim().split('\n').filter((l) => l.startsWith('{')).pop();

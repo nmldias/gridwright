@@ -7,11 +7,11 @@ import { joinFile } from '../api/ws';
 import * as book from '../engine/book';
 import { addTable } from '../grid/actions';
 import { cellAt, getState, setStatus, useStore } from '../state/store';
-import { parseCsv } from './files';
 import { recordImport } from './companion';
 import { familyOf, periodFromName } from './snapshots';
+import { intakeFile } from './intake';
 
-export const IMPORT_ACCEPT = '.csv,.tsv,.txt,.json,.xlsx,.xlsm,.xls,.ods';
+export const IMPORT_ACCEPT = '.csv,.tsv,.txt,.json,.xml,.xlsx,.xlsm,.xls,.ods';
 
 const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, ' ');
 
@@ -76,62 +76,79 @@ async function placeRows(f: File, suggestedName: string, values: string[][]): Pr
   if (typeof tid === 'number') await recordImport(f.name, tid, suggestedName, dataRows, fields, { period });
 }
 
-export async function importFile(f: File): Promise<void> {
-  useStore.setState({ start: false });
-  if (/\.(xlsx|xlsm|xls|ods)$/i.test(f.name)) {
-    const XLSX = await import('xlsx');
-    const wb = XLSX.read(await f.arrayBuffer(), { type: 'array', cellDates: false, cellFormula: true, sheetStubs: true });
-    let n = 0;
-    for (const name of wb.SheetNames) {
-      const sheet = wb.Sheets[name];
-      const rows: (string | number | boolean | null)[][] = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: true, defval: '' });
-      if (!rows.length) continue;
-      const values = rows.map((r) => r.map((v) => (v === null || v === undefined ? '' : String(v))));
-      // formulas are imported as their cached values; SheetJS exposes formulas via cell.f when present
-      for (const addr of Object.keys(sheet)) {
-        if (addr[0] === '!') continue;
-        const cell = sheet[addr] as { f?: string };
-        if (cell.f) {
-          const p = XLSX.utils.decode_cell(addr);
-          if (values[p.r]) values[p.r][p.c] = '=' + cell.f;
-        }
-      }
-      const tname = wb.SheetNames.length > 1 ? `${familyOf(f.name)} ${name}` : familyOf(f.name);
-      await placeRows(f, tname, values);
-      n++;
-    }
-    if (n > 1) setStatus(`Imported ${n} sheets from ${f.name}`);
-    return;
+/** A JSON file that is a Gridwright document (tables on a canvas), as opposed to data records. */
+function looksLikeDocument(text: string): boolean {
+  try {
+    const j = JSON.parse(text) as { tables?: unknown; name?: unknown };
+    return !!j && typeof j === 'object' && !Array.isArray(j) && Array.isArray(j.tables);
+  } catch {
+    return false;
   }
-  const text = await f.text();
-  if (f.name.toLowerCase().endsWith('.json')) {
-    try {
-      JSON.parse(text);
-      await book.loadBook(text, f.name.replace(/\.gridwright\.json$|\.json$/i, ''), null);
-      joinFile(null);
-      setStatus(`Loaded ${f.name}`);
-    } catch (e) {
-      setStatus(`Not a Gridwright document: ${(e as Error).message}`);
-    }
-    return;
-  }
-  const rows = parseCsv(text);
-  if (!rows.length) {
-    setStatus('The file is empty.');
-    return;
-  }
-  await placeRows(f, familyOf(f.name), rows);
 }
 
-/** Open the file picker and import what is chosen. */
-export function pickAndImport() {
+/**
+ * Bring a file in. Data files (CSV, TSV, Excel, ODS, XML, JSON records) go through intake: parsed and
+ * profiled on the server, placed only once the person decides in Ask. A Gridwright JSON document
+ * replaces the open document. `formulas` keeps an Excel workbook's formulas (the workbook route: each
+ * sheet becomes a table as it is, nothing profiled).
+ */
+export async function importFile(f: File, opts: { formulas?: boolean } = {}): Promise<void> {
+  useStore.setState({ start: false });
+  if (f.name.toLowerCase().endsWith('.json')) {
+    const text = await f.text();
+    if (looksLikeDocument(text)) {
+      try {
+        await book.loadBook(text, f.name.replace(/\.gridwright\.json$|\.json$/i, ''), null);
+        joinFile(null);
+        setStatus(`Loaded ${f.name}`);
+      } catch (e) {
+        setStatus(`Not a Gridwright document: ${(e as Error).message}`);
+      }
+      return;
+    }
+  }
+  if (opts.formulas && /\.(xlsx|xlsm|xls|ods)$/i.test(f.name)) {
+    await importWorkbookWithFormulas(f);
+    return;
+  }
+  await intakeFile(f);
+}
+
+/** The workbook route: every sheet becomes a table with its formulas kept; a sheet with the same columns as a table offers to update it. */
+export async function importWorkbookWithFormulas(f: File): Promise<void> {
+  const XLSX = await import('xlsx');
+  const wb = XLSX.read(await f.arrayBuffer(), { type: 'array', cellDates: false, cellFormula: true, sheetStubs: true });
+  let n = 0;
+  for (const name of wb.SheetNames) {
+    const sheet = wb.Sheets[name];
+    const rows: (string | number | boolean | null)[][] = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: true, defval: '' });
+    if (!rows.length) continue;
+    const values = rows.map((r) => r.map((v) => (v === null || v === undefined ? '' : String(v))));
+    // formulas are imported as their cached values; SheetJS exposes formulas via cell.f when present
+    for (const addr of Object.keys(sheet)) {
+      if (addr[0] === '!') continue;
+      const cell = sheet[addr] as { f?: string };
+      if (cell.f) {
+        const p = XLSX.utils.decode_cell(addr);
+        if (values[p.r]) values[p.r][p.c] = '=' + cell.f;
+      }
+    }
+    const tname = wb.SheetNames.length > 1 ? `${familyOf(f.name)} ${name}` : familyOf(f.name);
+    await placeRows(f, tname, values);
+    n++;
+  }
+  if (n > 1) setStatus(`Imported ${n} sheets from ${f.name}`);
+}
+
+/** Open the file picker and bring in what is chosen. */
+export function pickAndImport(opts: { formulas?: boolean } = {}) {
   const input = document.createElement('input');
   input.type = 'file';
-  input.accept = IMPORT_ACCEPT;
+  input.accept = opts.formulas ? '.xlsx,.xlsm,.xls,.ods' : IMPORT_ACCEPT;
   input.style.display = 'none';
   input.onchange = () => {
     const f = input.files?.[0];
-    if (f) void importFile(f);
+    if (f) void importFile(f, opts);
     input.remove();
   };
   document.body.appendChild(input);

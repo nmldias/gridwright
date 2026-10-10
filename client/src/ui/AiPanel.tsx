@@ -6,7 +6,7 @@ import { applyActions } from './ai';
 import { docKey, patchConversation, sendMessage, stopMessage, updateMessage, useChat, type ToolRun } from './chat';
 import { PanelHeader } from './PanelHeader';
 import { CompanionBrief } from './CompanionPanel';
-import { remember, statementOf } from './companion';
+import { remember, statementsOf } from './companion';
 
 const AUTO_KEY = 'gridwright.ai.autoApply';
 const TOOLS_KEY = 'gridwright.ai.tools';
@@ -95,12 +95,17 @@ export function AiPanel() {
   }, [messages]);
 
   const send = () => {
-    // a statement to keep ("Objective: …", "Exclude: …") is recorded, not asked
-    const st = statementOf(input);
-    if (st) {
-      patchConversation(key, { input: '' });
-      void remember(st.kind, st.text, st.extra);
-      return;
+    // statements are recorded, not asked — "Preserve replacement-cost margin. Leave out vehicles reserved for customers." — with a
+    // correctable acknowledgement; what is left (a question, a concern to think about) goes to the model as well
+    const { statements, rest } = statementsOf(input);
+    if (statements.length) {
+      void (async () => {
+        for (const st of statements) await remember(st.kind, st.text, st.extra);
+      })();
+      if (!rest.length && !statements.some((st) => st.extra.inferred)) {
+        patchConversation(key, { input: '' });
+        return;
+      }
     }
     void sendMessage(key, { tools, autoApply, file: fileId });
   };
@@ -199,7 +204,7 @@ export function AiPanel() {
       <div className="chat">
         {messages.length === 0 && (
           <div className="muted small">
-            Ask about the data, for formulas, Python/JavaScript/SQL analysis, or new tables. Start a line with <b>Objective:</b>, <b>Constraint:</b>, <b>Exclude:</b>, <b>Decision:</b> (… — because …; reconsider if …), <b>Question:</b> (… — bears on …), <b>Expect:</b> (… by 2026-10-20 in invoices) or <b>Private:</b> to record it in the context without asking. Every proposed change is shown as a before → after diff; nothing is written until you apply it (Ctrl+Z reverts).
+            Ask about the data, or say what matters in your own words — <i>Preserve replacement-cost margin. Leave out vehicles reserved for customers.</i> — and it is kept, shown back for correction, not sent to a model. <i>Suppose…</i> opens a scenario, not a policy; <i>Before X, check Y</i> changes direction. Every proposed change is shown as a before → after diff; nothing is written until you apply it (Ctrl+Z reverts).
           </div>
         )}
         {messages.map((m, i) => (
@@ -266,7 +271,7 @@ export function AiPanel() {
         <textarea
           value={input}
           rows={3}
-          placeholder="Ask, or state what matters (Objective: …, Exclude: …, Decision: …, Question: …)  ·  Enter to send"
+          placeholder="Ask, or say what matters in your own words  ·  Enter to send"
           onKeyDown={(e) => {
             e.stopPropagation();
             if (e.key === 'Enter' && !e.shiftKey) {

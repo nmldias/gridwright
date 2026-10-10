@@ -57,14 +57,14 @@ def main():
             return page.evaluate("(op) => window.__gw.book.apply(op)", op)
 
         # ------------------------------------------------------------------ first use
-        check("a fresh document offers the start choices: import, template, blank — and the example stays on the canvas", page.locator(".start-card .start-choice").count() == 3 and "Import Excel" in page.text_content(".start-card") and state()["tables"][0]["name"] == "Table 1", "")
+        check("a fresh document offers the start choices: import, template, blank — and the example stays on the canvas", page.locator(".start-card .start-choice").count() == 3 and "Bring a file in" in page.text_content(".start-card") and state()["tables"][0]["name"] == "Table 1", "")
         bar = [b for b in page.evaluate("() => [...document.querySelectorAll('.topbar > button, .topbar > .menu-wrap > button')].map((b) => b.textContent.trim().replace(/▾$/, '').trim())") if b]
         check("the primary bar: document · Save · Add · Python · Ask · Review · Share (+ Format with a selection, More)", bar[0] == "Untitled" and bar[1] == "Save" and bar[4:9] == ["Add", "Python", "Ask", "Review", "Share"] and bar[-1] == "More", str(bar))
 
         # ------------------------------------------------------------------ document menu
         page.click(".topbar button[data-menu='doc']")
         items = page.locator(".menu .menu-item").all_text_contents()
-        check("the document title opens a document menu: rename, new, import, templates, recent, downloads, print", all(any(k in it for it in items) for k in ("Rename", "New document", "Import Excel", "Finance templates", "All documents", "Download .xlsx", "Print")), str(items)[:200])
+        check("the document title opens a document menu: rename, new, import, templates, recent, downloads, print", all(any(k in it for it in items) for k in ("Rename", "New document", "Add a file", "Import a workbook with its formulas", "Finance templates", "All documents", "Download .xlsx", "Print")), str(items)[:200])
         page.click(".menu .menu-item:has-text('Rename')")
         page.wait_for_selector(".topbar .filename-input", timeout=3000)
         page.fill(".topbar .filename-input", "Round seven")

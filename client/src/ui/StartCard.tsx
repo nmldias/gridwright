@@ -23,8 +23,8 @@ export function StartCard() {
           pickAndImport();
         }}
       >
-        <span>Import Excel / CSV</span>
-        <span className="muted small">each sheet becomes a table; formulas are kept</span>
+        <span>Bring a file in — CSV, Excel, XML, JSON</span>
+        <span className="muted small">read and checked first; you decide where it goes</span>
       </button>
       <button
         className="start-choice"

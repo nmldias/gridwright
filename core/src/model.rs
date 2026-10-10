@@ -131,6 +131,11 @@ impl Value {
         if t.is_empty() {
             return Value::Empty;
         }
+        // a leading apostrophe keeps the rest as text, as in Excel: identifiers such as "000123" or
+        // a 20-digit reference survive import with their leading zeros and every digit
+        if let Some(text) = t.strip_prefix('\'') {
+            return Value::Text(text.to_string());
+        }
         match t.to_ascii_lowercase().as_str() {
             "true" => return Value::Bool(true),
             "false" => return Value::Bool(false),
@@ -1027,6 +1032,8 @@ mod tests {
 
     #[test]
     fn literal_parsing() {
+        assert_eq!(Value::parse_literal("'000123"), Value::Text("000123".into()));
+        assert_eq!(Value::parse_literal("'12345678901234567890"), Value::Text("12345678901234567890".into()));
         assert_eq!(Value::parse_literal("12"), Value::Number(12.0));
         assert_eq!(Value::parse_literal("1,234.5"), Value::Number(1234.5));
         assert_eq!(Value::parse_literal("1,5"), Value::Number(1.5));

@@ -19,8 +19,8 @@ import { currentSeq, onAppend, readAll, type Author, type LogEntry } from './his
 import { engineAvailable, errorMessage, openDocument, tableByName, tableMetas, type CellViewJson, type TableMetaView } from './headless.js';
 import { DATA_DIR, listConnections, newId, readFile } from './storage.js';
 
-export type RecordKind = 'fact' | 'source' | 'objective' | 'constraint' | 'hypothesis' | 'contradiction' | 'decision' | 'exclusion' | 'question' | 'expectation';
-export const RECORD_KINDS: RecordKind[] = ['fact', 'source', 'objective', 'constraint', 'hypothesis', 'contradiction', 'decision', 'exclusion', 'question', 'expectation'];
+export type RecordKind = 'fact' | 'source' | 'objective' | 'constraint' | 'hypothesis' | 'contradiction' | 'decision' | 'exclusion' | 'question' | 'expectation' | 'scenario';
+export const RECORD_KINDS: RecordKind[] = ['fact', 'source', 'objective', 'constraint', 'hypothesis', 'contradiction', 'decision', 'exclusion', 'question', 'expectation', 'scenario'];
 /** kinds that frame every conclusion: changing one makes earlier conclusions provisional */
 const ASSUMPTION_KINDS: RecordKind[] = ['objective', 'constraint', 'exclusion'];
 export type RecordStatus = 'stated' | 'proposed' | 'confirmed' | 'observed' | 'resolved' | 'retired' | 'superseded';
@@ -73,6 +73,13 @@ export interface ContextRecord {
   resolution?: string;
   /** dedupe key for records a check observes (conflicts, rejections) */
   key?: string;
+  /** a source: the retained original (intake key = content hash) and what the snapshot covers */
+  intake?: string;
+  coverage?: { rows: number; identifiers?: number; idColumn?: string; entity?: string };
+  /** a source kept as history: an older period than the current snapshot of the same series */
+  historical?: boolean;
+  /** the companion's reading of what the person said (not a prefix, not a form): shown as such until confirmed or corrected */
+  inferred?: boolean;
 }
 
 export type WatchKind = 'threshold' | 'check' | 'change' | 'worsening';
@@ -101,6 +108,14 @@ export interface WatchDef {
   complement?: string;
 }
 
+export type Invalid = 'blank' | 'text' | 'error' | 'unavailable';
+
+/**
+ * One observation per (definition, period): the figure a snapshot gives. A later check of the same
+ * period revises it (a correction, an edit) rather than adding a second observation; a new period
+ * adds one even when the value is unchanged. Without a period (tables edited by hand, no snapshot)
+ * there is one current observation, revised on every change — no trend can be read from edits.
+ */
 export interface Observation {
   at: string;
   seq: number;
@@ -114,6 +129,16 @@ export interface Observation {
   fresh: boolean;
   /** hash of the definition that produced it: observations are comparable only within one definition */
   def: string;
+  /** data rows of the tables read: a trend needs a comparable population */
+  population?: number;
+  /** typed invalid state: the formula gave no usable value — never "within bounds" */
+  invalid?: Invalid;
+  /** false when the comparison with the previous snapshot was suspended (coverage changed) */
+  comparable?: false;
+  note?: string;
+  /** how many times this period's evidence was revised, and what it read before */
+  revisions?: number;
+  previous?: { value: number | boolean | string | null; at: string };
 }
 
 export interface Interpretation {
@@ -139,7 +164,7 @@ export interface Issue {
   interpretation?: Interpretation;
 }
 
-export type Health = 'ok' | 'baseline' | 'attention' | 'stale' | 'error' | 'unchecked' | 'proposed';
+export type Health = 'ok' | 'baseline' | 'attention' | 'stale' | 'error' | 'invalid' | 'unchecked' | 'proposed';
 
 export interface Watch {
   id: string;
@@ -163,7 +188,7 @@ export interface Watch {
 export interface Event {
   at: string;
   /** trace: bookkeeping kept in the activity but left out of the brief */
-  kind: 'record' | 'watch' | 'check' | 'issue' | 'decision' | 'source' | 'trace' | 'expectation' | 'conflict' | 'pattern' | 'assumption' | 'investigation';
+  kind: 'record' | 'watch' | 'check' | 'issue' | 'decision' | 'source' | 'trace' | 'expectation' | 'conflict' | 'pattern' | 'assumption' | 'investigation' | 'reading' | 'intake';
   text: string;
   by?: string;
   level: 'quiet' | 'watch' | 'attention';
@@ -172,7 +197,10 @@ export interface Event {
 export interface SourceStatus {
   name: string;
   kind: 'table';
+  /** when the data last changed — values, rows, imports, code results; formatting, saving and notes do not count */
   lastChange?: string;
+  /** the period the data describes (from the live source record), kept apart from when it arrived */
+  asOf?: string;
   /** manually supplied (import), live (SQL cell with a connection), or edited by hand */
   supply: 'import' | 'live' | 'manual' | 'unknown';
   rows: number;
@@ -210,7 +238,10 @@ export interface Investigation {
   thread: string;
   startedAt: string;
   finishedAt?: string;
-  status: 'running' | 'done' | 'failed';
+  /** running · done · failed · cancelled (stopped by a person) · superseded (the direction changed while it ran: its results are fenced) */
+  status: 'running' | 'done' | 'failed' | 'cancelled' | 'superseded';
+  cancelRequested?: string;
+  superseded?: string;
   answer?: string;
   model?: string;
   error?: string;
@@ -269,13 +300,27 @@ export interface Understanding {
   attention: number;
   assumptionsSeq: number;
   investigations: Investigation[];
+  /** monitoring, truthfully: not configured · awaiting history · checked, no material issue · source stale · cannot assess · partially assessed · action needed */
+  monitoring: { state: string; text: string; cannotAssess: number };
+  /** each exclusion and whether the watches apply it: recorded is not applied */
+  scope: ScopeState[];
+}
+
+export interface ScopeState {
+  record: string;
+  text: string;
+  /** the yes/no column that marks what is left out, when one was found */
+  column?: string;
+  table?: string;
+  state: 'applied' | 'partly' | 'recorded' | 'no-column';
+  watches: { id: string; purpose: string; applicable: boolean; applied: boolean }[];
 }
 
 export interface Brief {
   changed: string[];
   matters: string[];
   next: string[];
-  health: { checked?: string; ok: number; baseline: number; attention: number; stale: number; error: number; unchecked: number; proposed: number };
+  health: { checked?: string; ok: number; baseline: number; attention: number; stale: number; error: number; invalid: number; unchecked: number; proposed: number };
   sources: SourceStatus[];
   stance: Stance;
   lead: string;
@@ -348,9 +393,20 @@ const short = (t: string, n = 160) => (t.length > n ? t.slice(0, n - 1) + '…' 
 /** A changed frame: everything concluded before it is provisional until re-checked. */
 function bumpAssumptions(s: CompanionState, r: ContextRecord, how: 'added' | 'changed' | 'retired' | 'removed', by: Author) {
   s.assumptionsSeq = (s.assumptionsSeq ?? 0) + 1;
+  fenceRunning(s, `${r.kind} “${short(r.text, 80)}” ${how}`);
   if (how === 'added') return; // "Kept what matters" is already in the activity
   const had = (s.investigations ?? []).filter((i) => i.status === 'done' && i.assumptionsSeq < (s.assumptionsSeq ?? 0)).length;
   event(s, { kind: 'assumption', text: `Assumption ${how}: ${r.kind} “${short(r.text, 100)}” — ${had ? `${had} earlier investigation${had === 1 ? ' is' : 's are'} now provisional; ` : ''}conclusions reached before it are provisional until re-checked`, by: who(by), level: 'watch' });
+}
+
+/** A running investigation under a direction that just changed: its result, when it comes, is superseded — kept as history, never current. */
+function fenceRunning(s: CompanionState, why: string) {
+  for (const i of s.investigations ?? []) {
+    if (i.status === 'running' && !i.superseded) {
+      i.superseded = now();
+      event(s, { kind: 'investigation', text: `The investigation “${short(i.question, 80)}” was overtaken (${why}): whatever it finds is kept as history, not applied`, level: 'quiet' });
+    }
+  }
 }
 
 // ------------------------------------------------------------------ records
@@ -369,6 +425,11 @@ export interface RecordInput {
   private?: boolean;
   derivative?: boolean;
   key?: string;
+  intake?: string;
+  coverage?: ContextRecord['coverage'];
+  inferred?: boolean;
+  /** a change of direction: what came before is provisional, running work is superseded */
+  steer?: boolean;
 }
 const str = (v: unknown, n: number) => (v === undefined || v === null ? undefined : String(v).trim().slice(0, n) || undefined);
 const isoDate = (v: unknown) => {
@@ -421,20 +482,44 @@ export function addRecord(doc: string, by: Author, origin: 'user' | 'agent' | 's
     key: str(input.key, 200),
   };
   if (r.kind === 'source' && !r.derivative && looksDerivative(r.source ?? '')) r.derivative = true;
-  // a newer snapshot of the same source supersedes the earlier one — authority is by source, not by date
+  if (input.inferred) r.inferred = true;
+  r.intake = str(input.intake, 80);
+  if (input.coverage && typeof input.coverage === 'object') r.coverage = { rows: Number(input.coverage.rows) || 0, identifiers: input.coverage.identifiers, idColumn: str(input.coverage.idColumn, 80), entity: str(input.coverage.entity, 120) };
+  // a newer period of the same series supersedes the earlier one — authority is by source and period, not by arrival:
+  // an older period arriving later is kept as history, and an agent's snapshot never displaces what a person supplied
+  let historyNote = '';
   if (r.kind === 'source' && r.source) {
-    for (const old of s.records) {
-      if (old.kind === 'source' && old.source === r.source && old.status !== 'retired' && old.status !== 'superseded') {
-        old.status = 'superseded';
-        old.supersededBy = r.id;
+    // the current snapshot is the latest one a person supplied or confirmed; an agent's proposal is never current
+    const current = [...s.records].reverse().find((old) => old.kind === 'source' && old.source === r.source && LIVE(old) && old.status !== 'proposed');
+    // an agent's proposed snapshot that a person's delivery overtakes is superseded with it
+    if (origin !== 'agent') for (const old of s.records) if (old.kind === 'source' && old.source === r.source && old.status === 'proposed' && (!old.period || !r.period || (comparePeriods(old.period, r.period) ?? -1) <= 0)) { old.status = 'superseded'; old.supersededBy = r.id; }
+    if (current) {
+      const order = r.period && current.period ? comparePeriods(r.period, current.period) : null;
+      if (origin === 'agent' && current.origin !== 'agent') {
+        historyNote = ` — proposed by an agent: ${current.period ? `the ${current.period} snapshot` : 'the current snapshot'} stays current until a person confirms this one`;
+      } else if (order !== null && order < 0) {
+        r.historical = true;
+        r.status = 'superseded';
+        r.supersededBy = current.id;
+        historyNote = ` — older than the current ${current.period} snapshot: kept as history, the current one stands`;
+      } else {
+        current.status = 'superseded';
+        current.supersededBy = r.id;
+        if (order === 0) historyNote = ` — a re-delivery of ${r.period}: the earlier version of that period is replaced, not counted twice`;
       }
     }
   }
   s.records.push(r);
-  const label = r.kind === 'objective' ? 'what matters' : r.kind === 'exclusion' ? 'what to leave out' : r.kind === 'expectation' ? 'what is expected' : r.kind;
-  const shown = r.kind === 'source' ? text.replace(/\s*\(.*\)\s*$/, '') + (r.period ? ` (period ${r.period})` : '') + (r.derivative ? ' — generated material, not independent evidence' : '') : `${origin === 'agent' ? 'Proposed' : origin === 'system' ? 'Found' : 'Kept'} ${label}: ${short(text)}${r.kind === 'expectation' && r.due ? ` (by ${r.due}${r.source ? ` in ${r.source}` : ''})` : ''}`;
+  const label = r.kind === 'objective' ? 'what matters' : r.kind === 'exclusion' ? 'what to leave out' : r.kind === 'expectation' ? 'what is expected' : r.kind === 'scenario' ? 'a scenario (not a policy)' : r.kind;
+  const shown = r.kind === 'source' ? text.replace(/\s*\(.*\)\s*$/, '') + (r.period ? ` (period ${r.period})` : '') + (r.derivative ? ' — generated material, not independent evidence' : '') + historyNote : `${origin === 'agent' ? 'Proposed' : origin === 'system' ? 'Found' : 'Kept'} ${label}: ${short(text)}${r.kind === 'expectation' && r.due ? ` (by ${r.due}${r.source ? ` in ${r.source}` : ''})` : ''}`;
   event(s, { kind: r.kind === 'source' ? 'source' : r.kind === 'expectation' ? 'expectation' : r.kind === 'contradiction' && origin === 'system' ? 'conflict' : 'record', text: shown, by: who(by), level: 'quiet' });
   if (ASSUMPTION_KINDS.includes(r.kind) && origin === 'user') bumpAssumptions(s, r, 'added', by);
+  if (input.steer && origin === 'user') {
+    // a change of direction: the next investigation changes; what was concluded under the earlier direction is provisional
+    s.assumptionsSeq = (s.assumptionsSeq ?? 0) + 1;
+    fenceRunning(s, 'direction changed');
+    event(s, { kind: 'assumption', text: `Direction changed: ${short(text, 120)} — running work is superseded; earlier results are kept as history, not as current`, by: who(by), level: 'watch' });
+  }
   saveState(s);
   return r;
 }
@@ -456,6 +541,8 @@ export interface RecordPatch {
   resolution?: string;
   /** expectation: what the person says happened */
   expected?: 'met' | 'didnt' | 'open';
+  /** the companion's reading, confirmed (false) by the person */
+  inferred?: boolean;
 }
 
 export function updateRecord(doc: string, id: string, by: Author, patch: RecordPatch): ContextRecord {
@@ -499,6 +586,10 @@ export function updateRecord(doc: string, id: string, by: Author, patch: RecordP
   }
   if (patch.private !== undefined) r.private = patch.private ? true : undefined;
   if (patch.derivative !== undefined) r.derivative = patch.derivative ? true : undefined;
+  if (patch.inferred === false && r.inferred) {
+    r.inferred = undefined;
+    event(s, { kind: 'record', text: `Confirmed the reading: ${r.kind} “${short(r.text, 100)}”`, by: who(by), level: 'quiet' });
+  }
   if (patch.resolution !== undefined) r.resolution = str(patch.resolution, 1000);
   if (patch.expected) {
     const text = patch.expected === 'met' ? `Arrived — ${who(by)} said so` : patch.expected === 'didnt' ? `Did not happen — ${who(by)} said so` : `Open again`;
@@ -648,7 +739,10 @@ export function removeWatch(doc: string, id: string, by: Author): boolean {
 
 // ------------------------------------------------------------------ sources and freshness
 /** What the document's tables are fed by, and when each last changed — from the audit log, not from anyone's say-so. */
-export function sourceStatus(doc: string, entries?: LogEntry[]): SourceStatus[] {
+/** Operations that change what a table says — not how it looks, where it sits or what it is called. */
+const DATA_OPS = new Set(['set_cell', 'set_cells', 'clear_range', 'resize_table', 'insert_rows', 'delete_rows', 'insert_cols', 'delete_cols', 'add_table', 'delete_table', 'code_result', 'set_header_rows', 'set_pivot']);
+
+export function sourceStatus(doc: string, entries?: LogEntry[], state?: CompanionState): SourceStatus[] {
   if (!engineAvailable() || !readFile(doc)) return [];
   const log = entries ?? readAll(doc);
   const last = new Map<number, string>();
@@ -656,20 +750,31 @@ export function sourceStatus(doc: string, entries?: LogEntry[]): SourceStatus[] 
   for (const e of log) {
     const t = typeof e.op?.table === 'number' ? (e.op.table as number) : e.run ? e.run.table : undefined;
     if (t === undefined) continue;
+    // formatting, moving, renaming, widths, notes and saves do not make data current
+    const isData = !!e.run || (e.op && DATA_OPS.has(String(e.op.type)));
+    if (!isData) continue;
     last.set(t, e.ts);
     if (e.origin === 'import') supply.set(t, 'import');
     else if (e.origin === 'sql' || (e.run && e.run.kind === 'sql')) supply.set(t, 'live');
     else if (e.origin === 'user' && !supply.has(t)) supply.set(t, 'manual');
   }
-  // a table with no logged change of its own is as fresh as the document's last logged entry (its save)
-  const docLast = log.length ? log[log.length - 1].ts : undefined;
+  // a table with no logged data change of its own is as fresh as the document's birth (its first save), not its last save
+  const birth = (log.find((e) => e.checkpoint && e.note === 'created') ?? log[0])?.ts;
+  const periods = state ? periodsOf(state) : periodsOf(loadStateQuiet(doc));
   const { book } = openDocument(doc);
   try {
-    return tableMetas(book).map((t) => ({ name: t.name, kind: 'table' as const, lastChange: last.get(t.id) ?? docLast, supply: supply.get(t.id) ?? 'unknown', rows: t.rows }));
+    return tableMetas(book).map((t) => ({ name: t.name, kind: 'table' as const, lastChange: last.get(t.id) ?? birth, asOf: periods.get(t.id), supply: supply.get(t.id) ?? 'unknown', rows: t.rows }));
   } finally {
     book.free();
   }
 }
+const loadStateQuiet = (doc: string): CompanionState => {
+  try {
+    return loadState(doc);
+  } catch {
+    return { doc, records: [], watches: [], events: [] };
+  }
+};
 
 const hoursSince = (iso?: string) => (iso ? (Date.now() - Date.parse(iso)) / 3_600_000 : Infinity);
 
@@ -681,6 +786,14 @@ function periodsOf(s: CompanionState): Map<number, string> {
     for (const l of r.links ?? []) if (typeof l.table === 'number' && r.period) periodOfTable.set(l.table, r.period);
   }
   return periodOfTable;
+}
+/** Order of two periods when both are dates, months or ISO weeks (2026-10-06 < 2026-10-13, 2026-09 < 2026-10, W40 < W41); null when they cannot be compared. */
+export function comparePeriods(a: string, b: string): number | null {
+  const norm = (p: string) => (/^\d{4}-\d{2}(-\d{2})?$/.test(p) ? p : /^W\d{1,2}$/i.test(p) ? `W${p.slice(1).padStart(2, '0')}` : /^\d{8}$/.test(p) ? `${p.slice(0, 4)}-${p.slice(4, 6)}-${p.slice(6)}` : null);
+  const x = norm(a);
+  const y = norm(b);
+  if (x === null || y === null || (x.startsWith('W') !== y.startsWith('W'))) return null;
+  return x < y ? -1 : x > y ? 1 : 0;
 }
 /** Whether a snapshot period reaches a date: 2026-10-13 ≥ 2026-10-12, 2026-10 ≥ 2026-10-12 (same month); null when the period is not a date. */
 function periodReaches(period: string | undefined, date: string): boolean | null {
@@ -733,7 +846,7 @@ export function checkDocument(doc: string, reason = 'change', changedTables: num
   const s = loadState(doc);
   const seq = currentSeq(doc);
   const log = readAll(doc);
-  const sources = sourceStatus(doc, log);
+  const sources = sourceStatus(doc, log, s);
   let changed = false;
   let attention = 0;
   const at = now();
@@ -761,13 +874,21 @@ export function checkDocument(doc: string, reason = 'change', changedTables: num
       if (!cache.has(id)) cache.set(id, JSON.parse(book.cells(id)) as CellViewJson[]);
       return cache.get(id)!;
     };
+    const sortKey = (o: Observation) => o.period ?? '\uffff';
+    const byPeriod = (a: Observation, b: Observation) => (sortKey(a) < sortKey(b) ? -1 : sortKey(a) > sortKey(b) ? 1 : a.at < b.at ? -1 : a.at > b.at ? 1 : 0);
     for (const w of s.watches) {
       if (w.authority !== 'approved') continue;
       const { value, error } = evaluate(doc, w.def);
       const complement = w.def.complement ? evaluate(doc, w.def, w.def.complement) : null;
       const complementValue = complement && !complement.error && typeof complement.value === 'number' ? complement.value : complement ? null : undefined;
       const readTables = tablesReferenced(w.def.formula, metas);
-      const period = readTables.map((t) => periodOfTable.get(t)).find(Boolean);
+      const ctxTable = !readTables.length && w.def.table ? metas.find((m) => m.name.toLowerCase() === w.def.table!.toLowerCase()) : undefined;
+      const tablesRead = readTables.length ? readTables : ctxTable ? [ctxTable.id] : metas[0] ? [metas[0].id] : [];
+      const period = tablesRead.map((t) => periodOfTable.get(t)).find(Boolean);
+      const population = tablesRead.reduce((n, id) => {
+        const m = metas.find((x) => x.id === id);
+        return n + (m ? Math.max(0, m.rows - m.header_rows) : 0);
+      }, 0);
       // freshness: an essential source older than allowed means no conclusion is presented
       let fresh = true;
       if (w.def.freshnessHours && w.def.sources?.length) {
@@ -776,35 +897,67 @@ export function checkDocument(doc: string, reason = 'change', changedTables: num
           if (!src || hoursSince(src.lastChange) > w.def.freshnessHours) fresh = false;
         }
       }
-      const prev = w.observations[w.observations.length - 1];
-      let breach = false;
-      if (!error) {
-        if (w.def.kind === 'threshold') breach = typeof value === 'number' && compare(value, w.def.op ?? '>', w.def.value ?? 0);
-        else if (w.def.kind === 'check') breach = value === false;
-        else if (w.def.kind === 'change') breach = !!prev && prev.def === w.defHash && prev.value !== value;
-        else if (w.def.kind === 'worsening') {
-          const prevComparable = [...w.observations].reverse().find((o) => o.def === w.defHash && !o.error && typeof o.value === 'number');
-          breach = !!prevComparable && typeof value === 'number' && (w.def.bad === 'down' ? value < (prevComparable.value as number) : value > (prevComparable.value as number));
+      // typed invalid states: a blank, a text or an error is never "within bounds"
+      let invalid: Invalid | undefined;
+      if (error) invalid = 'error';
+      else if (w.def.kind === 'check') invalid = typeof value === 'boolean' ? undefined : value === null ? 'blank' : 'text';
+      else invalid = typeof value === 'number' ? undefined : value === null ? 'blank' : 'text';
+      // observation identity: one per (definition, period); the same period is revised, never counted twice
+      const key = period ?? '';
+      const mine = w.observations.filter((o) => o.def === w.defHash);
+      let obs = [...mine].reverse().find((o) => (o.period ?? '') === key);
+      const earlier = mine.filter((o) => o !== obs).sort(byPeriod);
+      const prevOrdered = [...earlier].reverse().find((o) => sortKey(o) <= (period ?? '\uffff') && !o.error && !o.invalid);
+      let comparable: boolean = true;
+      let note: string | undefined;
+      if (prevOrdered && typeof prevOrdered.population === 'number' && prevOrdered.population > 0 && population > 0) {
+        const ratio = Math.min(prevOrdered.population, population) / Math.max(prevOrdered.population, population);
+        if (ratio < 0.5) {
+          comparable = false;
+          note = `coverage changed (${prevOrdered.population} → ${population} rows): not compared with the previous snapshot`;
         }
       }
-      const novel = !prev || prev.seq !== seq || prev.value !== value || !!prev.error !== !!error || prev.fresh !== fresh || prev.def !== w.defHash || prev.period !== period || prev.complement !== complementValue;
-      if (novel) {
-        w.observations.push({ at, seq, period, value, complement: complementValue, error, breach, fresh, def: w.defHash });
-        changed = true;
+      let breach = false;
+      if (!invalid) {
+        if (w.def.kind === 'threshold') breach = typeof value === 'number' && compare(value, w.def.op ?? '>', w.def.value ?? 0);
+        else if (w.def.kind === 'check') breach = value === false;
+        else if (w.def.kind === 'change') breach = (!!prevOrdered && comparable && prevOrdered.value !== value) || (!!obs && obs.value !== value && !obs.invalid && !obs.error);
+        else if (w.def.kind === 'worsening') breach = !!prevOrdered && comparable && typeof value === 'number' && typeof prevOrdered.value === 'number' && (w.def.bad === 'down' ? value < prevOrdered.value : value > prevOrdered.value);
       }
+      let novel = false;
+      let revised = false;
+      if (obs) {
+        const changedObs = obs.value !== value || !!obs.error !== !!error || obs.fresh !== fresh || obs.complement !== complementValue || obs.invalid !== invalid || obs.breach !== breach || obs.population !== population;
+        if (changedObs) {
+          obs.previous = { value: obs.value, at: obs.at };
+          obs.revisions = (obs.revisions ?? 0) + 1;
+          Object.assign(obs, { at, seq, value, complement: complementValue, error, breach, fresh, invalid, population, comparable: comparable ? undefined : false, note });
+          novel = true;
+          revised = true;
+        } else obs.seq = seq;
+      } else {
+        obs = { at, seq, period, value, complement: complementValue, error, breach, fresh, def: w.defHash, population, invalid, comparable: comparable ? undefined : false, note };
+        w.observations.push(obs);
+        novel = true;
+      }
+      if (novel) changed = true;
       w.lastChecked = at;
-      // comparable run: consecutive observations under this definition, newest first
-      const comparable = w.observations.filter((o) => o.def === w.defHash);
+      // the ordered periods under this definition; the sustained run is counted over them, newest first
+      const ordered = w.observations.filter((o) => o.def === w.defHash).sort(byPeriod);
       let run = 0;
-      for (let i = comparable.length - 1; i >= 0 && comparable[i].breach && !comparable[i].error; i--) run++;
+      for (let i = ordered.length - 1; i >= 0 && ordered[i].breach && !ordered[i].error && !ordered[i].invalid; i--) run++;
       const prevHealth = w.health;
-      // a worsening watch needs one more observation than its sustain: the one it worsens from
+      // a worsening watch needs one more period than its sustain: the one it worsens from
       const needed = w.def.kind === 'worsening' ? w.def.sustain + 1 : w.def.sustain;
-      if (error) {
+      if (invalid === 'error') {
         w.health = 'error';
+      } else if (invalid) {
+        w.health = 'invalid';
       } else if (!fresh) {
         w.health = 'stale';
-      } else if (comparable.length < needed) {
+      } else if (!comparable) {
+        w.health = 'baseline';
+      } else if (ordered.length < needed) {
         w.health = 'baseline';
       } else if (run >= w.def.sustain) {
         w.health = 'attention';
@@ -812,13 +965,13 @@ export function checkDocument(doc: string, reason = 'change', changedTables: num
         w.health = 'ok';
       }
       // one issue per watch: opened when the breach is sustained, strengthened or revised while it lasts,
-      // resolved after two comparable observations back within bounds
+      // resolved when the period that breached is corrected, or after two later periods within bounds
       if (w.health === 'attention') {
         attention++;
-        const trail = comparable.slice(-Math.max(needed, 3));
-        const evidence = trail.map((o) => `${whenOf(o)}: ${fmt(o.value)}`);
+        const trail = ordered.slice(-Math.max(needed, 3));
+        const evidence = trail.map((o) => `${whenOf(o)}: ${fmt(o.value)}${o.revisions ? ' (revised)' : ''}`);
         const before = trail.length > 1 ? trail[trail.length - 2] : undefined;
-        const movement = before && typeof before.value === 'number' && typeof value === 'number' && before.value !== value ? ` (was ${fmt(before.value)} on ${whenOf(before)})` : '';
+        const movement = revised && obs.previous && obs.previous.value !== value ? ` (revised from ${fmt(obs.previous.value)}, same snapshot${period ? ` ${period}` : ''})` : before && typeof before.value === 'number' && typeof value === 'number' && before.value !== value ? ` (was ${fmt(before.value)} on ${whenOf(before)})` : '';
         const summary =
           w.def.kind === 'worsening'
             ? `${w.def.purpose}: ${fmt(value)}${movement} — ${w.def.bad === 'down' ? 'falling' : 'rising'} ${run === 1 ? 'since the last snapshot' : `for ${run} snapshots running`}`
@@ -827,6 +980,7 @@ export function checkDocument(doc: string, reason = 'change', changedTables: num
               : `${w.def.purpose}: ${fmt(value)}${movement} — ${ruleText(w.def)}${run > 1 ? `, ${run} snapshots running` : ''}`;
         const uncertainty: string[] = [];
         if (w.def.scope) uncertainty.push(`Scope as defined: ${w.def.scope}`);
+        if (!period) uncertainty.push('No snapshot period: the figure is the table as edited, not a dated observation');
         const staleOthers = (w.def.sources ?? []).map((n) => sources.find((x) => x.name.toLowerCase() === n.toLowerCase())).filter((x) => x && x.supply === 'import');
         if (staleOthers.length) uncertainty.push(`${staleOthers.map((x) => x!.name).join(', ')}: manually supplied snapshot${staleOthers.length > 1 ? 's' : ''}; a newer version may exist`);
         const next = w.def.response === 'case' ? 'Open a decision case: investigate and propose options; nothing is changed by the watch itself.' : w.def.response === 'note' ? 'Noted in the activity; no decision requested.' : 'Investigate before the next decision that depends on this figure; the watch changes nothing by itself.';
@@ -835,7 +989,7 @@ export function checkDocument(doc: string, reason = 'change', changedTables: num
           event(s, { kind: 'issue', text: `Needs attention — ${summary}`, level: 'attention' });
           changed = true;
         } else if (novel) {
-          const moved = prev && typeof prev.value === 'number' && typeof value === 'number' ? (w.def.op === '<' || w.def.op === '<=' ? value < prev.value : value > prev.value) : false;
+          const moved = obs.previous && typeof obs.previous.value === 'number' && typeof value === 'number' ? (w.def.op === '<' || w.def.op === '<=' ? value < obs.previous.value : value > obs.previous.value) : before && typeof before.value === 'number' && typeof value === 'number' ? (w.def.op === '<' || w.def.op === '<=' ? value < before.value : value > before.value) : false;
           w.issue.revision++;
           w.issue.updatedAt = at;
           w.issue.summary = summary;
@@ -846,31 +1000,38 @@ export function checkDocument(doc: string, reason = 'change', changedTables: num
           changed = true;
         }
       } else if (w.issue && w.issue.status === 'open' && w.health === 'ok') {
-        const backWithin = comparable.slice(-2).every((o) => !o.breach && !o.error);
-        if (backWithin && comparable.length >= 2) {
+        const last = ordered[ordered.length - 1];
+        const byRevision = revised && last === obs && !last.breach;
+        const backWithin = ordered.length >= 2 && ordered.slice(-2).every((o) => !o.breach && !o.error && !o.invalid);
+        if (byRevision || backWithin) {
           w.issue.status = 'resolved';
           w.issue.resolvedAt = at;
           w.issue.updatedAt = at;
-          w.issue.next = `Back within bounds (${fmt(value)}) on two snapshots.`;
+          w.issue.next = byRevision ? `Revised: the ${whenOf(last)} snapshot now reads ${fmt(value)}, within bounds.` : `Back within bounds (${fmt(value)}) on two snapshots.`;
           w.history.push(w.issue);
           if (w.history.length > 20) w.history = w.history.slice(-20);
-          event(s, { kind: 'issue', text: `Resolved — ${w.def.purpose} is back within bounds (${fmt(value)})`, level: 'watch' });
+          event(s, { kind: 'issue', text: `Resolved — ${w.def.purpose} is back within bounds (${fmt(value)})${byRevision ? ' after a revision of the same snapshot' : ''}`, level: 'watch' });
           w.issue = undefined;
           changed = true;
         }
       }
-      const prevComparable = comparable.length > 1 ? comparable[comparable.length - 2] : undefined;
+      const prevComparable = prevOrdered;
       if (w.health !== prevHealth && !(w.health === 'attention' && prevHealth !== 'attention')) {
         if (w.health === 'stale') event(s, { kind: 'check', text: `Not checked: ${w.def.purpose} — ${(w.def.sources ?? []).join(', ')} older than ${w.def.freshnessHours} h`, level: 'watch' });
         else if (w.health === 'error') event(s, { kind: 'check', text: `Cannot evaluate “${w.def.purpose}”: ${error}`, level: 'watch' });
-        else if (w.health === 'baseline' && prevHealth === 'unchecked') event(s, { kind: 'check', text: `${w.def.purpose}: ${fmt(value)} now — watching for the next snapshot before saying more`, level: 'quiet' });
+        else if (w.health === 'invalid') event(s, { kind: 'check', text: `Cannot assess “${w.def.purpose}”: the formula gives ${invalid === 'blank' ? 'no value (blank)' : 'text, not a number'} — neither within bounds nor out of them`, level: 'watch' });
+        else if (w.health === 'baseline' && !comparable) event(s, { kind: 'check', text: `${w.def.purpose}: ${fmt(value)} — ${note}; the trend starts again from here`, level: 'watch' });
+        else if (w.health === 'baseline' && prevHealth === 'unchecked') event(s, { kind: 'check', text: `${w.def.purpose}: ${fmt(value)} now${period ? ` (${period})` : ''} — watching for the next snapshot before saying more`, level: 'quiet' });
         changed = true;
-      } else if (novel && prevComparable && !error && prevComparable.value !== value && w.health !== 'attention') {
+      } else if (novel && !invalid && !error && revised && obs.previous && obs.previous.value !== value && w.health !== 'attention') {
+        // the same snapshot read again after a correction or an edit: a revision, not a movement between periods
+        event(s, { kind: 'check', text: `${w.def.purpose}: ${fmt(value)} (revised from ${fmt(obs.previous.value)}, same snapshot${period ? ` ${period}` : ''})`, level: breach ? 'watch' : 'quiet' });
+      } else if (novel && !invalid && !error && !revised && prevComparable && prevComparable.value !== value && w.health !== 'attention' && comparable) {
         // a movement that is not (yet) an issue is worth a look, in plain words
         const worse = w.def.kind === 'worsening' ? breach : w.def.kind === 'threshold' && typeof value === 'number' && typeof prevComparable.value === 'number' ? (w.def.op === '<' || w.def.op === '<=' ? value < prevComparable.value : value > prevComparable.value) : false;
         const tail = w.health === 'baseline' && breach ? ' — watching for another snapshot before raising it' : '';
         event(s, { kind: 'check', text: `${w.def.purpose}: ${fmt(value)} (was ${fmt(prevComparable.value)} on ${whenOf(prevComparable)})${worse ? ', worse' : ''}${tail}`, level: worse || w.def.kind === 'change' ? 'watch' : 'quiet' });
-      } else if (novel && prevComparable && !error && prevComparable.value === value && typeof complementValue === 'number' && typeof prevComparable.complement === 'number' && complementValue !== prevComparable.complement) {
+      } else if (novel && !invalid && !error && !revised && prevComparable && prevComparable.value === value && typeof complementValue === 'number' && typeof prevComparable.complement === 'number' && complementValue !== prevComparable.complement) {
         // the headline is flat but the population the scope leaves out moved: the definition, not the business, is what is quiet
         const worse = w.def.bad === 'down' ? complementValue < prevComparable.complement : complementValue > prevComparable.complement;
         const leftOut = /\(excluding ([^)]+)\)/i.exec(w.def.scope)?.[1] ?? 'the exclusion';
@@ -1006,6 +1167,9 @@ function crossCheck(s: CompanionState, metas: TableMetaView[], cellsOf: ((id: nu
   if (!cellsOf) return false;
   const tables = metas.filter((t) => !t.pivot && t.header_rows >= 1 && t.rows - t.header_rows >= 1);
   if (tables.length < 2) return false;
+  // two snapshots of one series (the current one and a historical one) are the same source at two times, not two sources
+  const seriesOf = new Map<number, string>();
+  for (const r of s.records) if (r.kind === 'source' && r.source && r.status !== 'retired') for (const l of r.links ?? []) if (typeof l.table === 'number') seriesOf.set(l.table, r.source.replace(/\s*\(history\)$/, '').toLowerCase());
   const seen = new Set<string>();
   let changed = false;
   const watchesReading = (header: string, names: string[]) => s.watches.filter((w) => names.some((n) => w.def.formula.toLowerCase().includes(`${n.toLowerCase()}[${header.toLowerCase()}]`) || w.def.formula.toLowerCase().includes(`'${n.toLowerCase()}'[${header.toLowerCase()}]`))).map((w) => w.def.purpose);
@@ -1013,6 +1177,7 @@ function crossCheck(s: CompanionState, metas: TableMetaView[], cellsOf: ((id: nu
     for (let j = i + 1; j < tables.length; j++) {
       const a = tables[i];
       const b = tables[j];
+      if (seriesOf.get(a.id) && seriesOf.get(a.id) === seriesOf.get(b.id)) continue;
       const ca = columnsOf(cellsOf(a.id), a);
       const cb = columnsOf(cellsOf(b.id), b);
       const idA = ca.find((c) => ID_HEADER.test(c.header) && cb.some((d) => d.key === c.key));
@@ -1235,7 +1400,7 @@ export function understandingOf(doc: string, s = loadState(doc)): Understanding 
   const objective = [...live].reverse().find((r) => r.kind === 'objective' && r.status !== 'proposed');
   const constraints = live.filter((r) => r.kind === 'constraint' && r.status !== 'proposed');
   const exclusions = live.filter((r) => r.kind === 'exclusion' && r.status !== 'proposed');
-  const sources = sourceStatus(doc);
+  const sources = sourceStatus(doc, undefined, s);
   const periodOfTable = periodsOf(s);
   let metas: TableMetaView[] = [];
   let cellsOf: ((id: number) => CellViewJson[]) | null = null;
@@ -1265,6 +1430,7 @@ export function understandingOf(doc: string, s = loadState(doc)): Understanding 
       .filter((r) => r.kind === 'decision' && !r.key?.startsWith('rejected:'))
       .map((r) => ({ record: r, conditions: (r.conditions ?? []).map((c) => ({ ...c, purpose: c.watch ? s.watches.find((w) => w.id === c.watch)?.def.purpose : undefined })), revisit: r.revisit }));
     const expectations = live.filter((r) => r.kind === 'expectation');
+    const scope = cellsOf ? scopeStates(s, exclusions, metas, cellsOf) : [];
     const uncertain: Uncertainty[] = [];
     for (const r of live) {
       if (r.kind === 'question') uncertain.push({ kind: 'question', text: r.text, bearing: r.bearing, record: r.id, rank: r.bearing ? 1 : 3 });
@@ -1288,6 +1454,21 @@ export function understandingOf(doc: string, s = loadState(doc)): Understanding 
     const since = s.seenAt ? Date.parse(s.seenAt) : 0;
     const worthALook = s.events.some((e) => e.level === 'watch' && Date.parse(e.at) > since);
     const material = uncertain.find((u) => u.rank <= 2);
+    // monitoring, truthfully: a failed or impossible check is never "all quiet"
+    const approved = s.watches.filter((w) => w.authority === 'approved');
+    const cannot = approved.filter((w) => w.health === 'error' || w.health === 'invalid' || w.health === 'stale');
+    const awaiting = approved.filter((w) => w.health === 'baseline' || w.health === 'unchecked');
+    const monitoring = !approved.length
+      ? { state: 'not configured', text: 'Nothing is being watched yet.', cannotAssess: 0 }
+      : issues.length || revisit
+        ? { state: 'action needed', text: `${attention} need${attention === 1 ? 's' : ''} attention${cannot.length ? `; ${cannot.length} cannot be assessed` : ''}.`, cannotAssess: cannot.length }
+        : cannot.length === approved.length
+          ? { state: cannot.every((w) => w.health === 'stale') ? 'source stale' : 'cannot assess', text: `${cannot.length} watch${cannot.length === 1 ? '' : 'es'} cannot be assessed: ${cannot.map((w) => `${w.def.purpose} (${w.health === 'stale' ? 'source stale' : w.health === 'error' ? 'formula error' : 'blank or text where a number should be'})`).join('; ')}.`, cannotAssess: cannot.length }
+          : cannot.length
+            ? { state: 'partially assessed', text: `${approved.length - cannot.length} of ${approved.length} watches assessed; ${cannot.length} cannot be assessed: ${cannot.map((w) => `${w.def.purpose} (${w.health === 'stale' ? 'source stale' : w.health === 'error' ? 'formula error' : 'blank or text'})`).join('; ')}.`, cannotAssess: cannot.length }
+            : awaiting.length === approved.length
+              ? { state: 'awaiting history', text: `${awaiting.length} watch${awaiting.length === 1 ? '' : 'es'} waiting for the next snapshot — no conclusion yet, which is a valid state.`, cannotAssess: 0 }
+              : { state: 'checked, no material issue', text: `${approved.length} watch${approved.length === 1 ? '' : 'es'} checked, no material issue${awaiting.length ? `; ${awaiting.length} still building a baseline` : ''}.`, cannotAssess: 0 };
     let stance: Stance;
     let lead: string;
     let next: string;
@@ -1303,6 +1484,11 @@ export function understandingOf(doc: string, s = loadState(doc)): Understanding 
       stance = 'question';
       lead = material.kind === 'expectation' ? 'Something expected has not arrived' : material.kind === 'contradiction' ? 'Two sources disagree' : 'One question could change the decision';
       next = material.kind === 'expectation' ? `Chase it: ${material.text}` : material.kind === 'contradiction' ? `Settle which source is right — ${material.text}${material.bearing ? ` (${material.bearing})` : ''}.` : `Resolve first: ${material.text}${material.bearing ? ` — ${material.bearing}` : ''}.`;
+    } else if (cannot.length) {
+      stance = 'question';
+      lead = `${cannot.length} cannot be assessed`;
+      const first = cannot[0];
+      next = first.health === 'stale' ? `Refresh ${(first.def.sources ?? []).join(', ') || 'the source'} before relying on “${first.def.purpose}”.` : first.health === 'error' ? `Fix the formula of “${first.def.purpose}”.` : `Check the data behind “${first.def.purpose}”: a blank or text where a number should be — nothing can be concluded from it.`;
     } else if (worthALook) {
       stance = 'observation';
       lead = 'Worth a look';
@@ -1323,16 +1509,107 @@ export function understandingOf(doc: string, s = loadState(doc)): Understanding 
     if (uncertain.length) parts.push(`${uncertain.length} open uncertaint${uncertain.length === 1 ? 'y' : 'ies'}, first: ${short(uncertain[0].text, 100)}`);
     const statement = parts.join('. ') + '.';
     const investigations = (s.investigations ?? []).map((i) => ({ ...i, stale: i.status === 'done' && i.assumptionsSeq !== (s.assumptionsSeq ?? 0) ? true : undefined }));
-    return { objective, constraints, exclusions, coverage, decisions, expectations, uncertain, stance, lead, next, statement, attention, assumptionsSeq: s.assumptionsSeq ?? 0, investigations };
+    return { objective, constraints, exclusions, coverage, decisions, expectations, uncertain, stance, lead, next, statement, attention, assumptionsSeq: s.assumptionsSeq ?? 0, investigations, monitoring, scope };
   } finally {
     book?.free();
   }
 }
 
+// ------------------------------------------------------------------ applied scope
+// An exclusion recorded is not an exclusion applied: the watches say what population they count.
+// "Leave out vehicles reserved for customers" names a yes/no column (Reserved); a watch applies it
+// when its formula carries that column = "no". The state is shown, and applying it is one tap.
+const FILTERABLE = /^=\s*(COUNTIF|COUNTIFS|SUM|SUMIFS|AVERAGEIF|AVERAGEIFS)\s*\(/i;
+const esc = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function flagColumnFor(text: string, metas: TableMetaView[], cellsOf: (id: number) => CellViewJson[]): { table: TableMetaView; header: string } | null {
+  const words = text.toLowerCase();
+  for (const t of metas) {
+    if (t.pivot || t.header_rows < 1) continue;
+    const cols = profileTable(cellsOf(t.id), t);
+    const dataRows = Math.max(0, t.rows - t.header_rows);
+    const flags = cols.filter((p) => p.yesNo >= Math.max(1, (dataRows - p.blanks) * 0.8));
+    // the column named in the text, else a reservation-like column when the text speaks of reservations
+    const named = flags.find((p) => new RegExp(`\\b${esc(p.header.toLowerCase())}`).test(words) || new RegExp(`\\b${esc(p.header.toLowerCase().replace(/e?d$/, ''))}`).test(words));
+    const byMeaning = /reserv/.test(words) ? flags.find((p) => /reserv/i.test(p.header)) : /sold|vendid/.test(words) ? flags.find((p) => /sold|vendid/i.test(p.header)) : undefined;
+    const f = named ?? byMeaning;
+    if (f) return { table: t, header: f.header };
+  }
+  return null;
+}
+const appliesFlag = (formula: string, header: string) => new RegExp(`\\[${esc(header)}\\]\\s*,\\s*"no"`, 'i').test(formula);
+function withFlag(formula: string, table: string, header: string, value: 'no' | 'yes'): string | null {
+  const cond = `, ${col(table, header)}, "${value}"`;
+  const m = /^=\s*(COUNTIF|COUNTIFS|SUM|SUMIFS|AVERAGEIF|AVERAGEIFS)\s*\(([\s\S]*)\)\s*$/i.exec(formula);
+  if (!m) return null;
+  const fn = m[1].toUpperCase();
+  const args = m[2];
+  if (fn === 'COUNTIF' || fn === 'COUNTIFS') return `=COUNTIFS(${args}${cond})`;
+  if (fn === 'SUM') return `=SUMIFS(${args}${cond})`;
+  if (fn === 'SUMIFS') return `=SUMIFS(${args}${cond})`;
+  if (fn === 'AVERAGEIF' || fn === 'AVERAGEIFS') return `=AVERAGEIFS(${args}${cond})`;
+  return null;
+}
+function scopeStates(s: CompanionState, exclusions: ContextRecord[], metas: TableMetaView[], cellsOf: (id: number) => CellViewJson[]): ScopeState[] {
+  const out: ScopeState[] = [];
+  for (const r of exclusions) {
+    const flag = flagColumnFor(r.text, metas, cellsOf);
+    if (!flag) {
+      out.push({ record: r.id, text: r.text, state: 'no-column', watches: [] });
+      continue;
+    }
+    const reads = s.watches.filter((w) => w.authority === 'approved' && tablesReferenced(w.def.formula, metas).includes(flag.table.id));
+    const watches = reads.map((w) => ({ id: w.id, purpose: w.def.purpose, applicable: FILTERABLE.test(w.def.formula), applied: appliesFlag(w.def.formula, flag.header) }));
+    const applicable = watches.filter((w) => w.applicable);
+    const state: ScopeState['state'] = !applicable.length ? 'recorded' : applicable.every((w) => w.applied) ? 'applied' : applicable.some((w) => w.applied) ? 'partly' : 'recorded';
+    out.push({ record: r.id, text: r.text, column: flag.header, table: flag.table.name, state, watches });
+  }
+  return out;
+}
+
+/** Apply an exclusion to the watches that read the population: their formulas carry the column = "no" from now on (baselines restart, as the population changed). */
+export function applyExclusion(doc: string, by: Author, recordId: string): { applied: string[]; skipped: string[]; column?: string } {
+  const s = loadState(doc);
+  const r = s.records.find((x) => x.id === recordId && x.kind === 'exclusion');
+  if (!r) throw new Error('exclusion not found');
+  const { book } = openDocument(doc);
+  let flag: { table: TableMetaView; header: string } | null = null;
+  let metas: TableMetaView[] = [];
+  try {
+    metas = tableMetas(book);
+    const cache = new Map<number, CellViewJson[]>();
+    const cellsOf = (id: number) => {
+      if (!cache.has(id)) cache.set(id, JSON.parse(book.cells(id)) as CellViewJson[]);
+      return cache.get(id)!;
+    };
+    flag = flagColumnFor(r.text, metas, cellsOf);
+  } finally {
+    book.free();
+  }
+  if (!flag) throw new Error('no yes/no column marks what to leave out — say which column (e.g. "Reserved = yes")');
+  const applied: string[] = [];
+  const skipped: string[] = [];
+  for (const w of s.watches) {
+    if (w.authority !== 'approved' || !tablesReferenced(w.def.formula, metas).includes(flag.table.id)) continue;
+    if (appliesFlag(w.def.formula, flag.header)) continue;
+    const next = withFlag(w.def.formula, flag.table.name, flag.header, 'no');
+    if (!next) {
+      skipped.push(w.def.purpose);
+      continue;
+    }
+    const complement = withFlag(w.def.formula, flag.table.name, flag.header, 'yes') ?? undefined;
+    updateWatch(doc, w.id, by, { def: { formula: next, complement, scope: `${w.def.scope || flag.table.name} (excluding ${flag.header} = yes)` }, reason: `exclusion applied: ${r.text}` });
+    applied.push(w.def.purpose);
+  }
+  const s2 = loadState(doc);
+  event(s2, { kind: 'record', text: `Applied “${short(r.text, 80)}” to ${applied.length} watch${applied.length === 1 ? '' : 'es'} (${flag.header} = yes left out)${skipped.length ? `; not applicable to ${skipped.join(', ')}` : ''}`, by: who(by), level: 'quiet' });
+  saveState(s2);
+  return { applied, skipped, column: flag.header };
+}
+
 // ------------------------------------------------------------------ brief
 export function brief(doc: string): Brief {
   const s = loadState(doc);
-  const sources = sourceStatus(doc);
+  const sources = sourceStatus(doc, undefined, s);
   const u = understandingOf(doc, s);
   const since = s.seenAt ? Date.parse(s.seenAt) : 0;
   const recent = s.events.filter((e) => Date.parse(e.at) > since);
@@ -1343,7 +1620,7 @@ export function brief(doc: string): Brief {
     .slice(-8);
   const matters: string[] = [];
   const next: string[] = [];
-  const health: Brief['health'] = { ok: 0, baseline: 0, attention: 0, stale: 0, error: 0, unchecked: 0, proposed: 0 };
+  const health: Brief['health'] = { ok: 0, baseline: 0, attention: 0, stale: 0, error: 0, invalid: 0, unchecked: 0, proposed: 0 };
   // a decision to revisit names the issue behind it: that issue is not listed a second time
   const named = new Set<string>();
   for (const d of u.decisions) {
@@ -1364,6 +1641,10 @@ export function brief(doc: string): Brief {
       const last = w.observations[w.observations.length - 1];
       matters.push(`Cannot evaluate “${w.def.purpose}”: ${last?.error ?? 'error'}`);
       next.push(`Fix the formula of “${w.def.purpose}”.`);
+    } else if (w.health === 'invalid') {
+      const last = [...w.observations].reverse().find((o) => o.def === w.defHash);
+      matters.push(`Cannot assess “${w.def.purpose}”: the formula gives ${last?.invalid === 'blank' ? 'no value' : 'text, not a number'} — not within bounds, not out of them`);
+      next.push(`Check the data behind “${w.def.purpose}” (a blank or text where a number should be).`);
     }
   }
   health.attention += u.decisions.filter((d) => d.revisit).length;
@@ -1383,6 +1664,13 @@ export function brief(doc: string): Brief {
   }
   if (!next.length) next.push(s.watches.length ? 'Nothing to decide.' : 'Tell the companion what matters (Objective: …, Exclude: …) and what to watch.');
   return { changed, matters, next: next.filter((t, i, arr) => arr.indexOf(t) === i), health, sources, stance: u.stance, lead: u.lead, statement: u.statement };
+}
+
+/** An event from another module (an intake, a first reading): kept in the same activity. */
+export function noteEvent(doc: string, e: Omit<Event, 'at'>) {
+  const s = loadState(doc);
+  event(s, e);
+  saveState(s);
 }
 
 export function markSeen(doc: string) {
@@ -1622,11 +1910,25 @@ export function startInvestigation(doc: string, by: Author, input: { question: s
   return inv;
 }
 
+/** A person stops a running investigation: the process is told to stop; the record says so when it has. */
+export function requestCancel(doc: string, id: string, by: Author): Investigation {
+  const s = loadState(doc);
+  const inv = s.investigations!.find((i) => i.id === id);
+  if (!inv) throw new Error('investigation not found');
+  if (inv.status !== 'running') throw new Error(`the investigation is ${inv.status}`);
+  inv.cancelRequested = now();
+  event(s, { kind: 'investigation', text: `Stopping the investigation “${short(inv.question, 80)}”`, by: who(by), level: 'quiet' });
+  saveState(s);
+  return inv;
+}
+
 export function finishInvestigation(doc: string, id: string, result: { status: 'done' | 'failed'; answer?: string; model?: string; error?: string; steps?: { tool: string; summary: string }[]; records?: string[]; proposals?: string[] }): Investigation {
   const s = loadState(doc);
   const inv = s.investigations!.find((i) => i.id === id);
   if (!inv) throw new Error('investigation not found');
-  inv.status = result.status;
+  // fenced results: stopped by a person, or overtaken by a change of direction — what it proposed is set aside, never current
+  const fenced = inv.cancelRequested ? 'cancelled' : inv.superseded ? 'superseded' : null;
+  inv.status = fenced ?? result.status;
   inv.finishedAt = now();
   inv.answer = result.answer ? result.answer.slice(0, 8000) : undefined;
   inv.model = result.model;
@@ -1634,10 +1936,59 @@ export function finishInvestigation(doc: string, id: string, result: { status: '
   if (result.steps) inv.steps = result.steps.slice(0, 60).map((x) => ({ tool: String(x.tool).slice(0, 60), summary: String(x.summary).slice(0, 200) }));
   if (result.records) inv.records = result.records.filter(safeId).slice(0, 50);
   if (result.proposals) inv.proposals = result.proposals.filter(safeId).slice(0, 50);
+  if (fenced) {
+    let aside = 0;
+    for (const rid of inv.records) {
+      const r = s.records.find((x) => x.id === rid);
+      if (r && r.status === 'proposed') {
+        r.status = 'retired';
+        r.resolution = fenced === 'cancelled' ? 'set aside: the investigation was stopped before it finished' : 'set aside: the direction changed while the investigation ran';
+        aside++;
+      }
+    }
+    event(s, { kind: 'investigation', text: fenced === 'cancelled' ? `Investigation stopped: ${short(inv.question, 80)}${aside ? ` — ${aside} proposed record${aside === 1 ? '' : 's'} set aside` : ''}` : `Investigation superseded: ${short(inv.question, 80)} finished under the earlier direction — kept as history${aside ? `, ${aside} proposed record${aside === 1 ? '' : 's'} set aside` : ''}${inv.proposals.length ? `; ${inv.proposals.length} proposal${inv.proposals.length === 1 ? '' : 's'} in Review still need${inv.proposals.length === 1 ? 's' : ''} a decision` : ''}`, level: 'quiet' });
+    saveState(s);
+    return inv;
+  }
   const made = [inv.runs.length ? `${inv.runs.length} sandboxed run${inv.runs.length === 1 ? '' : 's'}` : '', inv.records.length ? `${inv.records.length} proposed record${inv.records.length === 1 ? '' : 's'}` : '', inv.proposals.length ? `${inv.proposals.length} proposal${inv.proposals.length === 1 ? '' : 's'} to review` : ''].filter(Boolean).join(', ');
   event(s, { kind: 'investigation', text: result.status === 'done' ? `Investigation finished: ${short(inv.question, 80)} — ${made || 'nothing proposed'}; its findings are its own words, beside the evidence` : `Investigation failed: ${short(result.error ?? 'error', 160)}`, level: result.status === 'done' ? 'watch' : 'watch' });
   saveState(s);
   return inv;
+}
+
+/**
+ * After a restart: an investigation the previous process left running is interrupted — said in the
+ * activity, its proposed records set aside — never 'running' for ever and never current.
+ */
+export function interruptRunningInvestigations(reason: string): number {
+  if (!existsSync(DIR())) return 0;
+  let n = 0;
+  for (const f of readdirSync(DIR())) {
+    if (!f.endsWith('.json')) continue;
+    const doc = f.slice(0, -5);
+    if (!safeId(doc)) continue;
+    const s = loadState(doc);
+    const open = s.investigations!.filter((i) => i.status === 'running');
+    if (!open.length) continue;
+    for (const inv of open) {
+      inv.status = 'failed';
+      inv.finishedAt = now();
+      inv.error = `interrupted: ${reason}`;
+      let aside = 0;
+      for (const rid of inv.records) {
+        const r = s.records.find((x) => x.id === rid);
+        if (r && r.status === 'proposed') {
+          r.status = 'retired';
+          r.resolution = 'set aside: the investigation was interrupted before it finished';
+          aside++;
+        }
+      }
+      event(s, { kind: 'investigation', text: `Investigation interrupted: ${short(inv.question, 80)} — ${reason}${aside ? `; ${aside} proposed record${aside === 1 ? '' : 's'} set aside` : ''}. Nothing it proposed became current; start it again when ready`, level: 'watch' });
+      n++;
+    }
+    saveState(s);
+  }
+  return n;
 }
 
 export function getInvestigation(doc: string, id: string): Investigation | null {

@@ -1707,3 +1707,71 @@ details.evidence > div {
 .companion-section > button.link {
   align-self: flex-start;
 }
+
+/* ---- intake: a file brought in, profiled, and the decision ---- */
+.intake-card {
+  border: 1px solid var(--border);
+  border-left: 3px solid #0c447c;
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.intake-set {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 0;
+  border-top: 1px dashed var(--border);
+}
+.intake-card .intake-set:first-of-type {
+  border-top: 0;
+}
+.intake-set.rel-duplicate {
+  opacity: 0.8;
+}
+.intake-card .period {
+  width: 110px;
+}
+.intake-columns {
+  border-collapse: collapse;
+  width: 100%;
+  table-layout: fixed;
+}
+.intake-columns th,
+.intake-columns td {
+  text-align: left;
+  padding: 2px 4px;
+  border-bottom: 1px dashed var(--border);
+  vertical-align: top;
+}
+.intake-columns th {
+  white-space: nowrap;
+}
+.intake-columns td {
+  overflow-wrap: anywhere; /* a 20-digit reference or a long VIN wraps instead of running past the card */
+}
+.intake-columns th:nth-child(1) { width: 20%; }
+.intake-columns th:nth-child(2) { width: 19%; }
+.intake-columns th:nth-child(3) { width: 13%; }
+.intake-columns th:nth-child(4) { width: 12%; }
+
+/* ---- phone: the decisions on a card are touch targets ---- */
+@media (max-width: 760px), (pointer: coarse) {
+  .intake-card button.small,
+  .intake-card button.primary,
+  .companion .issue button.small,
+  .next-move button {
+    min-height: 44px;
+    padding: 8px 12px;
+  }
+}
+.scope-recorded,
+.scope-partly {
+  color: var(--amber);
+}
+.scope-applied {
+  color: var(--green);
+}

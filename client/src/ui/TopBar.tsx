@@ -80,7 +80,8 @@ export function TopBar() {
   const docItems: MenuEntry[] = [
     { label: 'Rename', title: 'Rename this document', onClick: () => (setNameDraft(fileName), setRenaming(true)), disabled: readOnly && !!fileId },
     { label: 'New document', title: 'Start an empty document (the current one stays on the server if it was saved)', onClick: () => void newFile() },
-    { label: 'Import Excel / CSV / JSON…', title: 'Sheets and CSV files become tables in this document; a Gridwright JSON file replaces it', onClick: () => pickAndImport() },
+    { label: 'Add a file (CSV, Excel, XML, JSON)…', title: 'Profiled first — columns, period, how it relates to what is here — then placed as you decide in Ask; a Gridwright JSON file replaces the document', onClick: () => pickAndImport() },
+    { label: 'Import a workbook with its formulas…', title: 'Every sheet becomes a table as it is, formulas kept; nothing profiled', onClick: () => pickAndImport({ formulas: true }) },
     { label: 'Finance templates…', title: 'Reference workbooks and templates', onClick: () => useStore.setState({ panel: 'files', filesView: 'templates' }) },
     'sep',
     { head: recent.length ? 'Open recent' : 'Documents' },
@@ -95,7 +96,7 @@ export function TopBar() {
     { label: 'Table', title: 'Add a new table to the canvas', onClick: () => addTable() },
     { label: 'Chart from selection', title: 'Insert a chart built from the selection (exhibit style)', onClick: () => void insertChart(), disabled: !selection },
     'sep',
-    { label: 'Import file…', title: 'Excel, CSV or JSON', onClick: () => pickAndImport() },
+    { label: 'Add a file…', title: 'CSV, Excel, XML or JSON — profiled, then placed as you decide in Ask', onClick: () => pickAndImport() },
   ];
   // code cells: Python is one click (the common case); JavaScript, SQL and the panel sit under its caret
   const codeItems: MenuEntry[] = [

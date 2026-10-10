@@ -90,6 +90,7 @@ def main():
         errors = []
         page.on("pageerror", lambda e: errors.append(str(e)))
         dialogs = []
+        cards = []
         prompt_answer = {"text": ""}
 
         def on_dialog(d):
@@ -125,10 +126,18 @@ def main():
                 c = companion()
             return c
 
-        def import_file(name):
+        def import_file(name, action=None):
+            # intake: the file is profiled on the server and a card appears in Ask; the person places it (the suggested action by default)
             set_panel("files")
             page.set_input_files(".panel input[type=file]", paths[name])
-            page.wait_for_timeout(1800)
+            page.wait_for_selector(".intake-card", timeout=15000)
+            cards.append(page.text_content(".intake-card") or "")
+            if action:
+                page.locator(f".intake-card button:has-text('{action}')").first.click()
+            else:
+                page.locator(".intake-card button.primary").first.click()
+            page.wait_for_selector(".intake-card", state="detached", timeout=15000)
+            page.wait_for_timeout(600)
 
         def say(text):
             set_panel("ai")
@@ -172,6 +181,25 @@ def main():
         check("   the situation at the top of Ask shows the understanding element by element, each correctable", "Working toward" in st and "release cash tied up in stock" in st and "Within" in st and "Leaving out" in st and "customer-reserved" in st and "Based on" in st and "not the complete position" in st, st[:220])
         page.screenshot(path=f"{OUT}/situation-00-first-reading.png")
 
+        # ================================================================ 1b. ordinary language: no prefixes, no form
+        before_msgs = page.locator(".ai-panel .msg").count()
+        say("Preserve replacement-cost margin on disposals. Leave out vehicles reserved for customers.")
+        c = wait_companion(lambda c: rec(c, "constraint", "margin on disposals") and rec(c, "exclusion", "reserved for customers"))
+        check("1b. two plain sentences are kept as a constraint and an exclusion — no prefix, no form, nothing sent to the model", rec(c, "constraint", "margin on disposals")["status"] == "stated" and rec(c, "exclusion", "reserved for customers")["status"] == "stated" and not rec(c, "exclusion", "reserved for customers").get("inferred") and page.locator(".ai-panel .msg").count() == before_msgs, "")
+        page.wait_for_selector(".companion .reflection", timeout=5000)
+        refl = page.text_content(".companion .reflection") or ""
+        check("   the acknowledgement says the exclusion is recorded, not yet applied, and that no yes/no column marks it on this table yet or which watches still count everyone", "Recorded exclusion" in refl and ("not yet applied" in refl or "no yes/no column" in refl or "will be left out" in refl), refl[:240])
+        say("I'm worried about how much cash is sitting in vehicles.")
+        c = wait_companion(lambda c: rec(c, "objective", "cash is sitting"))
+        inferred = rec(c, "objective", "cash is sitting")
+        check("   a concern is the companion's reading, marked as such (confirm or correct), and the message still goes to the model for an answer", inferred and inferred.get("inferred") is True and page.locator(".ai-panel .msg").count() > before_msgs, str(inferred and inferred.get("inferred")))
+        page.locator(".companion .reflection button:has-text(\"yes, that's it\")").first.click()
+        c = wait_companion(lambda c: not rec(c, "objective", "cash is sitting").get("inferred"))
+        check("   confirmed with one tap: the reading becomes the person's statement", not rec(c, "objective", "cash is sitting").get("inferred"), "")
+        say("Suppose we discount the Creta by 10%.")
+        c = wait_companion(lambda c: rec(c, "scenario", "discount the Creta"))
+        check("   'suppose…' opens a scenario, not a policy: no decision, no assumption changed", rec(c, "scenario", "discount the Creta") is not None and not rec(c, "decision", "discount") and not any(e["kind"] == "assumption" and "scenario" in e["text"] for e in c["events"]), "")
+
         # ================================================================ 2. one tap on a suggestion; a decision with the conditions behind it
         page.click(".companion button:has-text('Watching')")
         page.wait_for_selector(".suggestion", timeout=8000)
@@ -181,6 +209,17 @@ def main():
         check("2. the ageing watch carries its complement: the population the exclusion leaves out is watched alongside (2 available, 1 reserved over 90)", ageing["def"].get("complement") and ageing["observations"][-1]["value"] == 2 and ageing["observations"][-1]["complement"] == 1, str(ageing["observations"][-1]))
         over120 = rest("POST", f"/api/files/{fid}/companion/watches", {"purpose": "Vehicles over 120 days", "formula": '=COUNTIF(inventory[Days in stock], ">120")', "kind": "threshold", "op": ">", "value": 0, "sustain": 1, "scope": "inventory", "sources": ["inventory"]})
         check("   a second watch (over 120 days) is fine on the first snapshot: nothing over 120 yet", over120["health"] == "ok" and over120["observations"][-1]["value"] == 0, over120["health"])
+        u = understanding()
+        sc = next((x for x in u["scope"] if "reserved for customers" in x["text"]), None)
+        check("   applied scope: the exclusion names the Reserved column; the ageing watch already leaves it out, the over-120 watch still counts everyone — recorded is not applied", sc and sc["column"] == "Reserved" and sc["state"] == "partly" and any(w["id"] == over120["id"] and not w["applied"] for w in sc["watches"]) and any(w["id"] == ageing["id"] and w["applied"] for w in sc["watches"]), json.dumps(sc)[:240])
+        page.click(".companion button:has-text('Context')")
+        page.wait_for_selector(".ctx-item.exclusion button:has-text('apply to the watches')", timeout=5000)
+        page.locator(".ctx-item.exclusion button:has-text('apply to the watches')").first.click()
+        c = wait_companion(lambda c: '"no"' in next(w for w in c["watches"] if w["id"] == over120["id"])["def"]["formula"])
+        over120 = next(w for w in c["watches"] if w["id"] == over120["id"])
+        u = understanding()
+        sc = next((x for x in u["scope"] if "reserved for customers" in x["text"]), None)
+        check("   one tap applies it: the over-120 formula now carries Reserved = \"no\" (and its complement the reserved ones), its baseline restarts, the exclusion reads 'applied'", 'inventory[Reserved], "no"' in over120["def"]["formula"] and over120["def"].get("complement") and sc and sc["state"] == "applied", over120["def"]["formula"])
         say("Decision: hold the Creta until the December campaign — because a customer order is expected; reconsider if the order lapses")
         c = wait_companion(lambda c: rec(c, "decision", "Creta"))
         dec = rec(c, "decision", "Creta")
@@ -310,6 +349,26 @@ def main():
             except Exception:
                 j1, j2 = {}, {}
             check("   durable state: the second investigation on the same thread continues from the first (the thread grew, checkpointed in SQLite)", r1.returncode == 0 and r2.returncode == 0 and j2.get("messages_in_thread", 0) > j1.get("messages_in_thread", 0) > 0, f"{j1.get('messages_in_thread')} → {j2.get('messages_in_thread')} {(r1.stderr or r2.stderr)[-160:]}")
+            # real steering: a running investigation can be stopped, and one overtaken by a change of direction is fenced
+            slow = rest("POST", f"/api/files/{fid}/companion/investigate", {"question": "Investigate slowly whether the ageing is concentrated in one model"})
+            time.sleep(1.0)
+            open_ask()
+            page.click(".companion button:has-text('Watching')")
+            page.wait_for_selector(".investigation.running button:has-text('Stop')", timeout=8000)
+            page.locator(".investigation.running button:has-text('Stop')").first.click()
+            c = wait_companion(lambda c: next((i for i in c["investigations"] if i["id"] == slow["id"]), {}).get("status") == "cancelled", timeout=40)
+            stopped = next(i for i in c["investigations"] if i["id"] == slow["id"])
+            check("   Stop is real: the process is ended and the investigation reads 'stopped', said in the activity", stopped["status"] == "cancelled" and any(e["text"].startswith("Investigation stopped") for e in c["events"]), stopped["status"])
+            slow2 = rest("POST", f"/api/files/{fid}/companion/investigate", {"question": "Investigate slowly the capital tied up"})
+            time.sleep(1.0)
+            say("Before discounts, see whether another branch could use the Creta and the Tucson.")
+            c = wait_companion(lambda c: rec(c, "question", "another branch"))
+            q = rec(c, "question", "another branch")
+            check("   'Before discounts, see whether…' changes direction: a question with what it bears on, and the running investigation is overtaken", q and q["bearing"] == "before discounts" and any(e["text"].startswith("Direction changed") for e in c["events"]) and next(i for i in c["investigations"] if i["id"] == slow2["id"]).get("superseded"), str(q and q.get("bearing")))
+            c = wait_companion(lambda c: next((i for i in c["investigations"] if i["id"] == slow2["id"]), {}).get("status") not in (None, "running"), timeout=60)
+            over = next(i for i in c["investigations"] if i["id"] == slow2["id"])
+            aside = [r for r in c["records"] if r["id"] in over["records"]]
+            check("   when it finishes, its result is superseded: kept as history, the hypothesis it proposed set aside, never current", over["status"] == "superseded" and aside and all(r["status"] == "retired" and "direction changed" in (r.get("resolution") or "") for r in aside), f"{over['status']} {[r['status'] for r in aside]}")
             # the agent may propose, not ratify: without the loopback token it is simply a caller; with it, confirming is refused (exercised in controls)
         else:
             print(f"SKIP investigation ({'no --mock-llm' if not MOCK else stack.get('reason')})")
@@ -323,7 +382,7 @@ def main():
         changed = [e for e in c["events"] if e["kind"] == "assumption" and e["text"].startswith("Assumption changed")]
         check("8. correcting the exclusion is an assumption change: said once, in the activity, with what it makes provisional", len(changed) == 1 and "exclusion" in changed[0]["text"] and "provisional" in changed[0]["text"], changed and changed[0]["text"][:160])
         if inv1:
-            check("   the investigation made under the earlier assumption is marked provisional, in the brief and on the record — not silently current", u["investigations"][-1].get("stale") is True and any("made under earlier assumptions" in n for n in rest("GET", f"/api/files/{fid}/companion/brief")["next"]), str(rest("GET", f"/api/files/{fid}/companion/brief")["next"]))
+            check("   the investigation made under the earlier assumption is marked provisional, in the brief and on the record — not silently current", next(i for i in u["investigations"] if i["id"] == inv1["id"]).get("stale") is True and any("made under earlier assumptions" in n for n in rest("GET", f"/api/files/{fid}/companion/brief")["next"]), str(rest("GET", f"/api/files/{fid}/companion/brief")["next"]))
             open_ask()
             page.click(".companion button:has-text('Watching')")
             page.wait_for_selector(".investigation.stale", timeout=8000)
@@ -382,7 +441,7 @@ def main():
         st = situation_text()
         lead = page.text_content(".companion-lead") or ""
         nxt = page.text_content(".next-move .next-text") or ""
-        check("12. after a reload the situation is there — objective, constraints, exclusions, what it rests on, decisions standing, the next move — with no chat to reread", "release cash tied up in stock" in st and "demonstrator" in st and "Based on" in st and "decision" in st and lead and nxt and page.locator(".ai-panel .msg").count() == 0, f"{lead} | {nxt[:80]}")
+        check("12. after a reload the situation is there — objective, constraints, exclusions, what it rests on, decisions standing, the next move — above the chat, nothing to reread", ("release cash tied up in stock" in st or "cash is sitting in vehicles" in st) and "demonstrator" in st and "Based on" in st and "decision" in st and lead and nxt and page.evaluate("() => document.querySelector('.companion .situation').getBoundingClientRect().top < document.querySelector('.ai-panel .chat').getBoundingClientRect().top"), f"{lead} | {nxt[:80]}")
         page.screenshot(path=f"{OUT}/situation-04-return.png")
 
         # ================================================================ the measures

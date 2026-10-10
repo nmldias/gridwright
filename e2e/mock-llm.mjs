@@ -45,10 +45,15 @@ function jsonReply(res, model, { text = null, toolCalls = [] } = {}) {
 }
 
 /** The investigation the DeepAgents stack runs: what the mock answers depends only on how many tool results it has seen. */
-function investigationStep(msgs) {
+function investigationStep(all) {
+  // the durable thread carries earlier turns: only this turn's calls count
+  const lastUser = all.map((m) => m.role).lastIndexOf('user');
+  const msgs = all.slice(lastUser);
   const toolResults = msgs.filter((m) => m.role === 'tool');
   const names = (m) => (m.tool_calls ?? []).map((c) => c.function?.name);
   const called = msgs.filter((m) => m.role === 'assistant').flatMap(names);
+  // a follow-up question on the thread is answered from what the thread already holds
+  if (/what did you find/i.test(String(msgs[0]?.content ?? ''))) return { text: 'Earlier on this thread: the independent count agreed with the watch; the landed cost of one vehicle was provisional.' };
   if (!called.includes('read_context')) return { toolCalls: [{ id: 'inv_1', name: 'read_context', args: {} }] };
   if (!called.includes('run_python')) return { toolCalls: [{ id: 'inv_2', name: 'run_python', args: { code: 'import pandas as pd\ndf = q.table("inventory")\nint((pd.to_numeric(df["Days in stock"], errors="coerce") > 90).sum())', purpose: 'count vehicles over 90 days independently of the watch formula' } }] };
   if (!called.includes('remember')) {
@@ -81,6 +86,12 @@ createServer((req, res) => {
     console.log('mock-llm: model', parsed.model, 'messages', msgs.length, 'tools', Array.isArray(parsed.tools) ? parsed.tools.length : 0, 'tool results', toolResults.length, 'stream', parsed.stream !== false);
     if (Array.isArray(parsed.tools) && /companion investigation/i.test(systemText)) {
       const step = investigationStep(msgs);
+      // "slowly" in the question: the first answer waits, so that a person can stop or overtake the investigation meanwhile
+      const slow = msgs.some((m) => m.role === 'user' && /slowly/i.test(String(m.content ?? ''))) && toolResults.length === 0;
+      if (slow) {
+        setTimeout(() => (parsed.stream === false ? jsonReply(res, parsed.model, step) : streamToolCall(res, step.toolCalls[0].id, step.toolCalls[0].name, step.toolCalls[0].args)), 7000);
+        return;
+      }
       if (parsed.stream === false) return jsonReply(res, parsed.model, step);
       if (step.toolCalls) return streamToolCall(res, step.toolCalls[0].id, step.toolCalls[0].name, step.toolCalls[0].args);
       return streamText(res, step.text);

@@ -84,6 +84,7 @@ def main():
         errors = []
         page.on("pageerror", lambda e: errors.append(str(e)))
         dialogs = []
+        cards = []
         page.on("dialog", lambda d: (dialogs.append(d.message), d.accept()))
         page.goto(BASE, wait_until="networkidle")
         page.wait_for_selector(".canvas-host canvas", timeout=30000)
@@ -110,11 +111,18 @@ def main():
                 c = companion()
             return c
 
-        def import_file(name):
+        def import_file(name, action=None):
+            # intake: the file is profiled on the server and a card appears in Ask; the person places it (the suggested action by default)
             set_panel("files")
             page.set_input_files(".panel input[type=file]", paths[name])
-            # a Playwright wait (not time.sleep) so the confirm dialog is delivered to the handler meanwhile
-            page.wait_for_timeout(1500)
+            page.wait_for_selector(".intake-card", timeout=15000)
+            cards.append(page.text_content(".intake-card") or "")
+            if action:
+                page.locator(f".intake-card button:has-text('{action}')").first.click()
+            else:
+                page.locator(".intake-card button.primary").first.click()
+            page.wait_for_selector(".intake-card", state="detached", timeout=15000)
+            page.wait_for_timeout(600)
 
         def watch_named(c, part):
             return next((w for w in c["watches"] if part in w["def"]["purpose"]), None)
@@ -134,7 +142,7 @@ def main():
         set_panel("ai")
         page.wait_for_selector(".companion .brief", timeout=8000)
         refl = page.text_content(".companion .reflection") or ""
-        check("the reflection says what was linked and for which period", "linked to inventory" in refl and "period 2026-10-06" in refl, refl[:140])
+        check("the reflection says what was added, for which period, and gives the first reading with its figures", "added as inventory" in refl and "period 2026-10-06" in refl and "5 vehicles" in refl and "2 vehicles over 90 days" in refl and "a trend needs the next one" in refl, refl[:200])
 
         # ------------------------------------------------------------------ one tap: the companion proposes what to watch
         page.click(".companion button:has-text('Watching')")
@@ -156,7 +164,7 @@ def main():
 
         # ------------------------------------------------------------------ drop next week's file: same table, formulas and watches kept
         import_file("inventory-2026-10-13.csv")
-        check("a file with the same columns asks to update the table (OK = same table, formulas and watches kept)", len(dialogs) == 1 and "update inventory" in dialogs[0] and "period 2026-10-13" in dialogs[0], str(dialogs))
+        check("a file with the same columns and the same vehicles is offered as the next snapshot of the table (same table, formulas and watches kept)", "Next snapshot" in cards[-1] and "same table, formulas and watches kept" in cards[-1] and "2026-10-13 after 2026-10-06" in cards[-1], cards[-1][:200])
         st = state()
         check("the table was updated in place: same id, new values, still one table", len(st["tables"]) == 1 and st["tables"][0]["id"] == inv["id"] and cell(inv["id"], 5, 2) == "91", str(st["tables"]))
         c = wait_companion(lambda c: len([o for o in watch_named(c, "over 90 days")["observations"]]) >= 2)

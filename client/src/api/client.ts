@@ -93,8 +93,8 @@ export interface Proposal {
 }
 
 // --- the companion ---------------------------------------------------------------------------
-export type RecordKind = 'fact' | 'source' | 'objective' | 'constraint' | 'hypothesis' | 'contradiction' | 'decision' | 'exclusion' | 'question' | 'expectation';
-export const RECORD_KINDS: RecordKind[] = ['objective', 'constraint', 'exclusion', 'decision', 'question', 'expectation', 'contradiction', 'hypothesis', 'fact', 'source'];
+export type RecordKind = 'fact' | 'source' | 'objective' | 'constraint' | 'hypothesis' | 'contradiction' | 'decision' | 'exclusion' | 'question' | 'expectation' | 'scenario';
+export const RECORD_KINDS: RecordKind[] = ['objective', 'constraint', 'exclusion', 'decision', 'question', 'expectation', 'scenario', 'contradiction', 'hypothesis', 'fact', 'source'];
 export type RecordStatus = 'stated' | 'proposed' | 'confirmed' | 'observed' | 'resolved' | 'retired' | 'superseded';
 export interface Condition {
   text: string;
@@ -126,6 +126,10 @@ export interface ContextRecord {
   derivative?: boolean;
   resolution?: string;
   key?: string;
+  intake?: string;
+  coverage?: { rows: number; identifiers?: number; idColumn?: string; entity?: string };
+  historical?: boolean;
+  inferred?: boolean;
 }
 export interface RecordInput {
   kind: RecordKind;
@@ -141,6 +145,8 @@ export interface RecordInput {
   conditions?: (Condition | string)[];
   private?: boolean;
   derivative?: boolean;
+  inferred?: boolean;
+  steer?: boolean;
 }
 export interface RecordPatch {
   text?: string;
@@ -158,6 +164,7 @@ export interface RecordPatch {
   derivative?: boolean;
   resolution?: string;
   expected?: 'met' | 'didnt' | 'open';
+  inferred?: boolean;
 }
 export interface WatchDef {
   purpose: string;
@@ -184,6 +191,12 @@ export interface Observation {
   breach: boolean;
   fresh: boolean;
   def: string;
+  population?: number;
+  invalid?: 'blank' | 'text' | 'error' | 'unavailable';
+  comparable?: false;
+  note?: string;
+  revisions?: number;
+  previous?: { value: number | boolean | string | null; at: string };
 }
 export interface Issue {
   id: string;
@@ -199,7 +212,7 @@ export interface Issue {
   next: string;
   interpretation?: { text: string; model: string; at: string; revision: number };
 }
-export type Health = 'ok' | 'baseline' | 'attention' | 'stale' | 'error' | 'unchecked' | 'proposed';
+export type Health = 'ok' | 'baseline' | 'attention' | 'stale' | 'error' | 'invalid' | 'unchecked' | 'proposed';
 export interface Watch {
   id: string;
   def: WatchDef;
@@ -227,6 +240,7 @@ export interface SourceStatus {
   name: string;
   kind: 'table';
   lastChange?: string;
+  asOf?: string;
   supply: 'import' | 'live' | 'manual' | 'unknown';
   rows: number;
 }
@@ -235,7 +249,7 @@ export interface Brief {
   changed: string[];
   matters: string[];
   next: string[];
-  health: { checked?: string; ok: number; baseline: number; attention: number; stale: number; error: number; unchecked: number; proposed: number };
+  health: { checked?: string; ok: number; baseline: number; attention: number; stale: number; error: number; invalid: number; unchecked: number; proposed: number };
   sources: SourceStatus[];
   stance: Stance;
   lead: string;
@@ -256,7 +270,9 @@ export interface Investigation {
   thread: string;
   startedAt: string;
   finishedAt?: string;
-  status: 'running' | 'done' | 'failed';
+  status: 'running' | 'done' | 'failed' | 'cancelled' | 'superseded';
+  cancelRequested?: string;
+  superseded?: string;
   answer?: string;
   model?: string;
   error?: string;
@@ -305,6 +321,16 @@ export interface Understanding {
   attention: number;
   assumptionsSeq: number;
   investigations: Investigation[];
+  monitoring: { state: string; text: string; cannotAssess: number };
+  scope: ScopeState[];
+}
+export interface ScopeState {
+  record: string;
+  text: string;
+  column?: string;
+  table?: string;
+  state: 'applied' | 'partly' | 'recorded' | 'no-column';
+  watches: { id: string; purpose: string; applicable: boolean; applied: boolean }[];
 }
 export interface GraphNode {
   id: string;
@@ -329,6 +355,85 @@ export interface Suggestion {
   purpose: string;
   why: string;
   def: WatchDef;
+}
+export interface IntakeColumn {
+  index: number;
+  header: string;
+  type: 'identifier' | 'number' | 'date' | 'boolean' | 'text' | 'empty';
+  filled: number;
+  blanks: number;
+  unique: number;
+  unit?: string;
+  sample: string[];
+  normalised: number;
+  textInNumber: number;
+  leadingZeros: number;
+  min?: number;
+  max?: number;
+  minDate?: string;
+  maxDate?: string;
+  constant?: string;
+}
+export interface IntakeRelation {
+  kind: 'first' | 'next' | 'same-period' | 'older' | 'different-entity' | 'duplicate' | 'unrelated';
+  table?: { id: number; name: string };
+  series?: string;
+  currentPeriod?: string;
+  sharedColumns: number;
+  identifiers?: { column: string; overlap: number; ofFile: number; ofTable: number; added: number; removed: number };
+  entity?: { column: string; file: string; table?: string };
+  recommended: 'update' | 'new' | 'history' | 'skip';
+  reason: string;
+}
+export interface IntakeSet {
+  name: string;
+  rows: string[][];
+  dataRows: number;
+  cols: number;
+  columns: IntakeColumn[];
+  headerDetected: boolean;
+  totalsRow?: { index: number; text: string };
+  quarantined: { row: number; reason: string; values: string[] }[];
+  emptyRowsDropped: number;
+  raggedRows: number;
+  formulasReduced: number;
+  instructionLikeCells: number;
+  notes: string[];
+  relation: IntakeRelation;
+}
+export interface IntakeProfile {
+  key: string;
+  doc: string;
+  name: string;
+  format: string;
+  size: number;
+  arrivedAt: string;
+  by: string;
+  origin: 'user' | 'inbox' | 'sql' | 'agent';
+  family: string;
+  period?: string;
+  periodFrom: 'name' | 'column' | 'none';
+  sets: IntakeSet[];
+  sanitised: string[];
+  warnings: string[];
+  status: 'profiled' | 'applied' | 'declined';
+  applied?: { at: string; by: string; decision: string; tables: { set: string; table: number; name: string; placed: 'new' | 'update' | 'history' }[]; records: string[]; seqs: number[] };
+  query?: { connection: string; sql: string; rows: number; truncated: boolean };
+  readings?: Reading[];
+}
+export interface Reading {
+  table: number;
+  name: string;
+  period?: string;
+  figures: { label: string; formula: string; value: number | string | boolean | null; note?: string }[];
+  text: string;
+}
+export interface InboxFile {
+  name: string;
+  size: number;
+  modified: string;
+  family: string;
+  period?: string;
 }
 export interface Companion {
   records: ContextRecord[];
@@ -416,6 +521,9 @@ export const api = {
   async investigationStack(): Promise<{ available: boolean; python: string; reason?: string; versions?: Record<string, string> }> {
     return j(await fetch('/api/investigation'));
   },
+  async inbox(): Promise<{ configured: boolean; mode: string; files: InboxFile[] }> {
+    return j(await fetch('/api/inbox'));
+  },
   files: {
     async list(): Promise<FileInfo[]> {
       return j(await fetch('/api/files'));
@@ -467,12 +575,31 @@ export const api = {
     async restoreSuggestion(id: string, sid: string): Promise<{ ok: boolean }> {
       return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/suggest/restore`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: sid }) }));
     },
+    // intake: profile first (nothing placed), then place as decided; the original is kept under its content hash
+    async intake(id: string, body: { name: string; base64?: string; text?: string } | { inbox: string } | { connection: string; sql: string }): Promise<IntakeProfile> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/intake`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));
+    },
+    async intakes(id: string): Promise<IntakeProfile[]> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/intake`));
+    },
+    async applyIntake(id: string, key: string, body: { decisions: { set?: string; action: 'update' | 'new' | 'history' | 'skip'; table?: number; name?: string }[]; period?: string }): Promise<IntakeProfile> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/intake/${encodeURIComponent(key)}/apply`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));
+    },
+    originalUrl(id: string, key: string): string {
+      return `/api/files/${encodeURIComponent(id)}/intake/${encodeURIComponent(key)}/original`;
+    },
+    async reading(id: string, table: number): Promise<Reading> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/reading/${table}`));
+    },
     async understanding(id: string): Promise<Understanding> {
       return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/understanding`));
     },
     /** a bounded investigation by the LangChain + DeepAgents + LangGraph stack; returns at once, the result lands on the record */
     async investigate(id: string, body: { question?: string; issue?: string; client?: string }): Promise<Investigation> {
       return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/investigate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));
+    },
+    async cancelInvestigation(id: string, iid: string, client?: string): Promise<Investigation> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/investigations/${encodeURIComponent(iid)}/cancel`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ client }) }));
     },
     async investigation(id: string, iid: string): Promise<Investigation> {
       return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/investigations/${encodeURIComponent(iid)}`));
@@ -488,6 +615,9 @@ export const api = {
     },
     async updateRecord(id: string, rid: string, body: RecordPatch & { client?: string }): Promise<ContextRecord> {
       return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/records/${encodeURIComponent(rid)}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));
+    },
+    async applyExclusion(id: string, rid: string): Promise<{ applied: string[]; skipped: string[]; column?: string }> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/records/${encodeURIComponent(rid)}/apply`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }));
     },
     async removeRecord(id: string, rid: string): Promise<void> {
       await j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/records/${encodeURIComponent(rid)}`, { method: 'DELETE' }));

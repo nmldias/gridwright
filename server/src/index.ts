@@ -10,8 +10,9 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { canEdit, canManage, canSign, canView, deleteAccess, normalise, permissionFor, readAccess, writeAccess, type FileAccess } from './access.js';
 import { chat, completeOnce } from './ai.js';
-import { addRecord, addWatch, affectedBy, brief as companionBrief, checkDocument, contextForModel, deleteCompanion, dismissSuggestion, findIssue, getInvestigation, graphOf, markSeen, recordRejection, removeRecord, removeWatch, restoreSuggestion, setCompanionNotifier, setInterpretation, snapshot as companionSnapshot, startCompanion, suggestWatches, understandingOf, updateRecord, updateWatch, type RecordKind, type RecordPatch } from './companion.js';
-import { probeStack, runCodeForDocument, setInvestigationNotifier, stackStatus, startInvestigationProcess } from './investigate.js';
+import { addRecord, addWatch, affectedBy, applyExclusion, brief as companionBrief, checkDocument, contextForModel, deleteCompanion, dismissSuggestion, findIssue, getInvestigation, graphOf, interruptRunningInvestigations, markSeen, recordRejection, removeRecord, removeWatch, restoreSuggestion, setCompanionNotifier, setInterpretation, snapshot as companionSnapshot, startCompanion, suggestWatches, understandingOf, updateRecord, updateWatch, type RecordKind, type RecordPatch } from './companion.js';
+import { cancelInvestigation, probeStack, runCodeForDocument, setInvestigationNotifier, stackStatus, startInvestigationProcess } from './investigate.js';
+import { applyIntake, deleteIntake, inboxRoot, inboxTaken, intake, intakeFromInbox, intakeQuery, listInbox, listProfiles, originalPath, readingOf, readProfile, MAX_INTAKE_BYTES } from './intake.js';
 import { appendEntry, checkpointSeqs, compactCheckpoints, currentSeq, deleteHistory, historyCsv, opTouchesCell, readAll, recentEntries, replayBundle, writeCheckpoint } from './history.js';
 import { identityEnabled, identityOf } from './identity.js';
 import { accessChanged, attachMultiplayer, broadcastEntries, notifyCompanion, notifyProposal as notifyProposalRoom, notifySaved } from './multiplayer.js';
@@ -40,7 +41,7 @@ import {
   type StoredConnection,
 } from './storage.js';
 
-const VERSION = '0.9.0';
+const VERSION = '0.10.0';
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? '0.0.0.0';
 const TOKEN = process.env.GRIDWRIGHT_TOKEN ?? '';
@@ -350,7 +351,7 @@ app.post('/api/files/:id/companion/records', requireRole('editor'), (req, res) =
   if (!docPermission(req, res, 'sign')) return;
   try {
     const b = req.body ?? {};
-    res.json(addRecord(req.params.id, authorOf(req), originOf(req), { kind: b.kind as RecordKind, text: String(b.text ?? ''), source: b.source, period: b.period, links: Array.isArray(b.links) ? b.links : undefined, bearing: b.bearing, due: b.due, match: b.match, reviewBy: b.reviewBy, why: b.why, conditions: b.conditions, private: !!b.private, derivative: !!b.derivative }));
+    res.json(addRecord(req.params.id, authorOf(req), originOf(req), { kind: b.kind as RecordKind, text: String(b.text ?? ''), source: b.source, period: b.period, links: Array.isArray(b.links) ? b.links : undefined, bearing: b.bearing, due: b.due, match: b.match, reviewBy: b.reviewBy, why: b.why, conditions: b.conditions, private: !!b.private, derivative: !!b.derivative, inferred: !!b.inferred, steer: !!b.steer }));
   } catch (e) {
     res.status(400).json({ error: errorMessage(e) });
   }
@@ -361,6 +362,18 @@ app.put('/api/files/:id/companion/records/:rid', requireRole('editor'), (req, re
   if (identityOf(req).agent && (patch.status || patch.expected)) return noAgent(req, res);
   try {
     res.json(updateRecord(req.params.id, req.params.rid, authorOf(req), patch));
+  } catch (e) {
+    res.status(400).json({ error: errorMessage(e) });
+  }
+});
+// an exclusion applied to the watches that read the population: recorded is not applied until this
+app.post('/api/files/:id/companion/records/:rid/apply', requireRole('editor'), (req, res) => {
+  if (!docPermission(req, res, 'sign') || !noAgent(req, res)) return;
+  try {
+    const r = applyExclusion(req.params.id, authorOf(req), req.params.rid);
+    const c = checkDocument(req.params.id, 'exclusion applied');
+    notifyCompanion(req.params.id, { attention: c.attention });
+    res.json(r);
   } catch (e) {
     res.status(400).json({ error: errorMessage(e) });
   }
@@ -440,6 +453,72 @@ app.post('/api/files/:id/companion/interpret/:iid', requireRole('editor'), async
   }
 });
 
+// --- intake: material brought in, profiled, sanitised and related before it is placed ------------
+app.get('/api/inbox', (_req, res) => {
+  const root = inboxRoot();
+  res.json({ configured: !!root, mode: root ? 'manual: files in GRIDWRIGHT_INBOX are listed on request, never watched' : 'not configured (set GRIDWRIGHT_INBOX to a directory)', files: root ? listInbox() : [] });
+});
+app.get('/api/files/:id/intake', (req, res) => {
+  if (!docPermission(req, res, 'view')) return;
+  res.json(listProfiles(req.params.id));
+});
+// profile a file (base64 or text), a file from the inbox, or a read-only query result; nothing is placed
+app.post('/api/files/:id/intake', requireRole('editor'), async (req, res) => {
+  if (!docPermission(req, res, 'sign')) return;
+  const b = req.body ?? {};
+  const who = identityOf(req);
+  try {
+    if (typeof b.inbox === 'string') return res.json(intakeFromInbox(req.params.id, authorOf(req), b.inbox));
+    if (typeof b.connection === 'string') {
+      const p = await intakeQuery(req.params.id, authorOf(req), b.connection, String(b.sql ?? ''), { visible: (c) => canSeeConnection(c as StoredConnection, who), authorize: (c, sql) => authorizeQuery(c as StoredConnection, who, sql) });
+      return res.json(p);
+    }
+    if (typeof b.base64 === 'string' && b.base64.length > (MAX_INTAKE_BYTES * 4) / 3 + 4) return res.status(413).json({ error: `the file is larger than ${Math.round(MAX_INTAKE_BYTES / 1024 / 1024)} MB` });
+    res.json(intake(req.params.id, authorOf(req), { name: String(b.name ?? 'pasted.txt'), base64: typeof b.base64 === 'string' ? b.base64 : undefined, text: typeof b.text === 'string' ? b.text : undefined, origin: who.agent ? 'agent' : 'user' }));
+  } catch (e) {
+    const status = e instanceof SqlRefused ? e.status : 400;
+    res.status(status).json({ error: errorMessage(e) });
+  }
+});
+app.get('/api/files/:id/intake/:key', (req, res) => {
+  if (!docPermission(req, res, 'view')) return;
+  const p = readProfile(req.params.id, req.params.key);
+  if (!p) return res.status(404).json({ error: 'not found' });
+  res.json({ ...p, sets: p.sets.map((x) => ({ ...x, rows: x.rows.slice(0, 21) })) });
+});
+app.get('/api/files/:id/intake/:key/original', (req, res) => {
+  if (!docPermission(req, res, 'view')) return;
+  const path = originalPath(req.params.id, req.params.key);
+  const p = readProfile(req.params.id, req.params.key);
+  if (!path || !p) return res.status(404).json({ error: 'not found' });
+  res.setHeader('content-disposition', `attachment; filename="${p.name.replace(/[^\w.-]+/g, '_')}"`);
+  res.sendFile(path);
+});
+// place it as the person decided: through the log, then the source record, the checks and the first reading
+app.post('/api/files/:id/intake/:key/apply', requireRole('editor'), (req, res) => {
+  if (!docPermission(req, res, 'edit') || !noAgent(req, res)) return;
+  const b = req.body ?? {};
+  try {
+    const p = applyIntake(req.params.id, authorOf(req), req.params.key, { decisions: Array.isArray(b.decisions) ? b.decisions : [], period: typeof b.period === 'string' ? b.period : undefined }, (entries) => broadcastEntries(req.params.id, entries));
+    if (p.origin === 'inbox') inboxTaken(p.name, p.key);
+    notifyCompanion(req.params.id, { attention: companionBrief(req.params.id).health.attention });
+    const readings = (p.applied?.tables ?? []).map((t) => readingOf(req.params.id, t.table)).filter(Boolean);
+    res.json({ ...p, sets: p.sets.map((x) => ({ ...x, rows: [] })), readings });
+  } catch (e) {
+    res.status(400).json({ error: errorMessage(e) });
+  }
+});
+app.get('/api/files/:id/reading/:table', (req, res) => {
+  if (!docPermission(req, res, 'view')) return;
+  try {
+    const r = readingOf(req.params.id, Number(req.params.table));
+    if (!r) return res.status(404).json({ error: 'no reading' });
+    res.json(r);
+  } catch (e) {
+    res.status(400).json({ error: errorMessage(e) });
+  }
+});
+
 // generated code against the live document, in the cell sandbox: nothing written, the run kept as evidence
 app.post('/api/files/:id/companion/run', requireRole('editor'), async (req, res) => {
   if (!docPermission(req, res, 'view')) return;
@@ -471,6 +550,16 @@ app.post('/api/files/:id/companion/investigate', requireRole('editor'), (req, re
     res.status(400).json({ error: errorMessage(e) });
   }
 });
+app.post('/api/files/:id/companion/investigations/:iid/cancel', requireRole('editor'), (req, res) => {
+  if (!docPermission(req, res, 'view') || !noAgent(req, res)) return;
+  try {
+    const inv = cancelInvestigation(req.params.id, req.params.iid, authorOf(req));
+    notifyCompanion(req.params.id, { attention: companionBrief(req.params.id).health.attention });
+    res.json(inv);
+  } catch (e) {
+    res.status(400).json({ error: errorMessage(e) });
+  }
+});
 app.get('/api/files/:id/companion/investigations/:iid', (req, res) => {
   if (!docPermission(req, res, 'view')) return;
   const inv = getInvestigation(req.params.id, req.params.iid);
@@ -485,6 +574,7 @@ app.delete('/api/files/:id', requireRole('editor'), (req, res) => {
   deleteHistory(req.params.id);
   deleteAccess(req.params.id);
   deleteCompanion(req.params.id);
+  deleteIntake(req.params.id);
   res.json({ ok: true });
 });
 // sharing & folders: {public, shares, folder}; folder alone may be changed by editors
@@ -627,6 +717,10 @@ setProposalNotifier((doc, p) => notifyProposalRoom(doc, p));
 setCompanionNotifier((doc, payload) => notifyCompanion(doc, payload));
 setInvestigationNotifier((doc) => notifyCompanion(doc, { attention: companionBrief(doc).health.attention }));
 startCompanion(Number(process.env.GRIDWRIGHT_COMPANION_INTERVAL_MS ?? 600_000));
+{
+  const interrupted = interruptRunningInvestigations('the server restarted while it ran');
+  if (interrupted) console.log(`investigations interrupted by the restart: ${interrupted} (marked, their proposals set aside)`);
+}
 void probeStack().then((st) => console.log(st.available ? `investigation stack: ${st.python} (${Object.entries(st.versions ?? {}).map(([k, v]) => `${k} ${v}`).join(', ')})` : `investigation stack off: ${st.reason}`));
 app.all('/mcp', (req, res) => void handleMcp(req, res));
 

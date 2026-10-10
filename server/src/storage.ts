@@ -5,6 +5,17 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync,
 import { join } from 'node:path';
 
 export const DATA_DIR = process.env.GRIDWRIGHT_DATA ?? join(process.cwd(), 'data');
+
+/**
+ * Test-only fault injection: with GRIDWRIGHT_CRASH_AT=<point> the process dies (SIGKILL, no
+ * cleanup) when it reaches that point, so the recovery suite can show that an interruption at a
+ * boundary neither loses nor duplicates accepted work. Off unless the variable names a point.
+ */
+export function crashPoint(name: string) {
+  if (process.env.GRIDWRIGHT_CRASH_AT !== name) return;
+  console.error(`crash point reached: ${name} (GRIDWRIGHT_CRASH_AT) — dying without cleanup`);
+  process.kill(process.pid, 'SIGKILL');
+}
 const FILES_DIR = join(DATA_DIR, 'files');
 
 export function ensureDirs() {

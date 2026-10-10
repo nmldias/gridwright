@@ -119,7 +119,11 @@ def make_tools(gw: Gridwright) -> list:
                 body[k] = v
         if conditions:
             body["conditions"] = list(conditions)
-        r = gw.rest("POST", f"/api/files/{gw.doc}/companion/records", body)
+        # with the server's agent token the record is filed as the agent's (proposed); without one — the command line —
+        # it goes through MCP, which files agent records as proposed too; never as the person's own words
+        r = gw.rest("POST", f"/api/files/{gw.doc}/companion/records", body) if gw.agent_token else gw.mcp("remember", body)
+        if isinstance(r, dict) and r.get("record") and not r.get("id"):
+            r = {"id": r["record"], "status": r.get("status", "proposed")}
         if isinstance(r, dict) and r.get("id"):
             gw.records.append(r["id"])
         gw.step("remember", f"{kind}: {text[:100]} → {r.get('status', r.get('error', '?')) if isinstance(r, dict) else '?'}")
@@ -131,7 +135,9 @@ def make_tools(gw: Gridwright) -> list:
         body: dict[str, Any] = {"purpose": purpose, "formula": formula, "scope": scope, "kind": kind, "op": op, "value": value, "sustain": sustain}
         if sources:
             body["sources"] = list(sources)
-        r = gw.rest("POST", f"/api/files/{gw.doc}/companion/watches", body)
+        r = gw.rest("POST", f"/api/files/{gw.doc}/companion/watches", body) if gw.agent_token else gw.mcp("propose_watch", body)
+        if isinstance(r, dict) and r.get("watch") and not r.get("id"):
+            r = {"id": r["watch"], "authority": r.get("authority", "proposed")}
         gw.step("propose_watch", f"{purpose[:80]} → {r.get('authority', r.get('error', '?')) if isinstance(r, dict) else '?'}")
         return _dump({"id": r.get("id"), "authority": r.get("authority"), "error": r.get("error")} if isinstance(r, dict) else r)
 

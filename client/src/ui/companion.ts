@@ -3,14 +3,14 @@
 // here. A reflection — the last thing recorded, with a way to correct it — is kept per document too.
 
 import { create } from 'zustand';
-import { api, type Companion, type ContextRecord, type Dismissed, type Investigation, type RecordInput, type RecordKind, type RecordPatch, type Suggestion, type Watch, type WatchDef } from '../api/client';
+import { api, type Companion, type ContextRecord, type Dismissed, type Investigation, type RecordInput, type RecordKind, type RecordPatch, type ScopeState, type Suggestion, type Watch, type WatchDef } from '../api/client';
 import { getClientId } from '../api/ws';
 import { getState, setStatus, useStore } from '../state/store';
 import { familyOf } from './snapshots';
 
 export interface Reflection {
   at: number;
-  lines: { text: string; record?: ContextRecord; watch?: Watch }[];
+  lines: { text: string; record?: ContextRecord; watch?: Watch; scope?: ScopeState }[];
 }
 
 interface CompanionState {
@@ -44,11 +44,15 @@ function reflect(fileId: string, line: Reflection['lines'][number]) {
     return { reflection: { ...s.reflection, [fileId]: { at: Date.now(), lines } } };
   });
 }
+/** A line other modules (intake) show back for correction. */
+export function reflectLine(fileId: string, line: Reflection['lines'][number]) {
+  reflect(fileId, line);
+}
 export function clearReflection(fileId: string) {
   useCompanion.setState((s) => ({ reflection: { ...s.reflection, [fileId]: undefined } }));
 }
 
-const KIND_WORD: Record<RecordKind, string> = { fact: 'fact', source: 'source', objective: 'objective', constraint: 'constraint', exclusion: 'exclusion', hypothesis: 'hypothesis', contradiction: 'contradiction', decision: 'decision', question: 'question', expectation: 'expectation' };
+const KIND_WORD: Record<RecordKind, string> = { fact: 'fact', source: 'source', objective: 'objective', constraint: 'constraint', exclusion: 'exclusion', hypothesis: 'hypothesis', contradiction: 'contradiction', decision: 'decision', question: 'question', expectation: 'expectation', scenario: 'scenario' };
 
 /** Record something the person said or added; the reflection shows it back for correction. */
 export async function remember(kind: RecordKind, text: string, extra: Omit<RecordInput, 'kind' | 'text'> = {}): Promise<ContextRecord | null> {
@@ -60,8 +64,23 @@ export async function remember(kind: RecordKind, text: string, extra: Omit<Recor
   try {
     const r = await api.files.addRecord(fileId, { kind, text, ...extra, client: getClientId() });
     const tail = r.kind === 'expectation' ? ` (by ${r.due ?? 'no date'}${r.source ? ` in ${r.source}` : ''})` : r.kind === 'decision' && r.conditions?.length ? ` — reconsider if: ${r.conditions.map((c) => c.text).join('; ')}` : r.bearing ? ` — bears on: ${r.bearing}` : r.period ? ` (period ${r.period})` : '';
-    reflect(fileId, { text: `Recorded ${r.private ? 'private ' : ''}${KIND_WORD[kind]}: ${r.text}${tail}`, record: r });
-    void loadCompanion(fileId);
+    const lead = r.inferred ? `My reading — ${KIND_WORD[kind]}` : r.kind === 'scenario' ? 'Scenario (explored, not adopted)' : `Recorded ${r.private ? 'private ' : ''}${KIND_WORD[kind]}`;
+    const line: Reflection['lines'][number] = { text: `${lead}: ${r.text}${tail}`, record: r };
+    reflect(fileId, line);
+    const c = await loadCompanion(fileId);
+    if (r.kind === 'exclusion' && c) {
+      // recorded is not applied: say which watches still count the whole population
+      const sc = c.understanding.scope.find((x) => x.record === r.id);
+      if (sc) {
+        const pending = sc.watches.filter((w) => w.applicable && !w.applied).length;
+        const note = sc.state === 'no-column' ? ' — no yes/no column marks this yet; say which (e.g. “Reserved = yes”)' : sc.state === 'applied' ? ` — applied: the watches already leave ${sc.column} = yes out` : pending ? ` — recorded, not yet applied: ${pending} watch${pending === 1 ? '' : 'es'} still count${pending === 1 ? 's' : ''} the whole population` : ` — recorded; ${sc.column} = yes will be left out of new watches`;
+        useCompanion.setState((st) => {
+          const refl = st.reflection[fileId];
+          if (!refl) return {};
+          return { reflection: { ...st.reflection, [fileId]: { ...refl, lines: refl.lines.map((l) => (l === line || l.record?.id === r.id ? { ...l, text: `${lead}: ${r.text}${tail}${note}`, scope: sc } : l)) } } };
+        });
+      }
+    }
     return r;
   } catch (e) {
     setStatus(`Could not record it: ${(e as Error).message}`, 6000);
@@ -86,6 +105,36 @@ export interface Statement {
   text: string;
   extra: Omit<RecordInput, 'kind' | 'text'>;
 }
+/** Ordinary language, no syntax: [pattern, kind, inferred reading?, change of direction?]. The body group is what is kept. */
+const PLAIN: [RegExp, RecordKind, boolean, boolean][] = [
+  [/^(?:please\s+)?(?:preserve|protect|maintain|safeguard|keep)\s+(?<body>.+)$/i, 'constraint', false, false],
+  [/^(?:please\s+)?(?:leave out|exclude|ignore|set aside|do not (?:count|include)|don'?t (?:count|include)|without)\s+(?<body>.+)$/i, 'exclusion', false, false],
+  [/^(?:please\s+)?(?:release|free up|reduce|cut|lower|improve|increase|maximi[sz]e|minimi[sz]e|focus on|we need to|we want to)\s+(?<body>.+)$/i, 'objective', false, false],
+  [/^(?:we (?:decided|will|'ll)|decided|hold|let'?s hold|we hold|we keep)\s+(?<body>.+)$/i, 'decision', false, false],
+  [/^(?:suppose|what if|imagine|assume for now|let'?s say|say we)\s+(?<body>.+)$/i, 'scenario', false, false],
+  [/^before\s+(?<before>[^,]+),\s*(?:see|check|look|find out|establish|tell me)\s+(?<body>.+)$/i, 'question', false, true],
+  [/^(?:i'?m|i am|we'?re|we are)\s+(?:worried|concerned|anxious)\s+(?:about|by)\s+(?<body>.+)$/i, 'objective', true, false],
+  [/^(?:the\s+)?(?:problem|issue|concern|worry)\s+(?:is|here is)\s+(?<body>.+)$/i, 'objective', true, false],
+];
+/** Sentences of a message: each may be a statement; a question mark is a question for the model. */
+export function sentencesOf(input: string): string[] {
+  return input
+    .split(/(?<=[.!?])\s+(?=[A-Z"“'])/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+/** Every statement in a message, and whether anything is left for the model (a question, or a sentence that is not a statement). */
+export function statementsOf(input: string): { statements: Statement[]; rest: string[] } {
+  const sentences = sentencesOf(input);
+  const statements: Statement[] = [];
+  const rest: string[] = [];
+  for (const s of sentences) {
+    const st = /\?\s*$/.test(s) ? null : statementOf(s);
+    if (st) statements.push(st);
+    else rest.push(s);
+  }
+  return { statements, rest };
+}
 /**
  * "Objective: release cash (review by 2026-12-01)" · "Decision: hold the Creta — because an order is expected; reconsider if the order lapses"
  * · "Question: is the freight final? — bears on which vehicles to reprice" · "Expect: final freight invoice for SH-001 by 2026-10-20 in invoices"
@@ -106,6 +155,22 @@ export function statementOf(input: string): Statement | null {
       kind = k;
       text = text.slice(m[0].length).trim();
       break;
+    }
+  }
+  if (!kind) {
+    // plain language, no prefix: a direct instruction is recorded as what it says; a concern is the companion's reading, shown as such
+    for (const [re, k, inferred, steer] of PLAIN) {
+      const m = re.exec(text);
+      if (m) {
+        kind = k;
+        text = (m.groups?.body ?? m[m.length - 1]).trim().replace(/[.!]+$/, '');
+        if (inferred) extra.inferred = true;
+        if (steer) {
+          extra.steer = true;
+          if (m.groups?.before) extra.bearing = `before ${m.groups.before.trim()}`;
+        }
+        break;
+      }
     }
   }
   if (!kind) {
@@ -208,6 +273,26 @@ export async function removeRecord(r: ContextRecord) {
   clearReflection(fileId);
   void loadCompanion(fileId);
 }
+/** The person confirms the companion's reading of what they said. */
+export async function confirmReading(r: ContextRecord) {
+  const fileId = getState().fileId;
+  if (!fileId) return;
+  await api.files.updateRecord(fileId, r.id, { inferred: false, client: getClientId() });
+  void loadCompanion(fileId);
+}
+/** Apply an exclusion to the watches that still count the whole population. */
+export async function applyExclusion(r: ContextRecord) {
+  const fileId = getState().fileId;
+  if (!fileId) return;
+  try {
+    const out = await api.files.applyExclusion(fileId, r.id);
+    setStatus(out.applied.length ? `Applied to ${out.applied.join(', ')} (${out.column} = yes left out)` : `Nothing to apply: ${out.skipped.length ? `${out.skipped.join(', ')} cannot carry the condition` : 'no watch reads that population'}`, 6000);
+    clearReflection(fileId);
+  } catch (e) {
+    setStatus(`Could not apply it: ${(e as Error).message}`, 8000);
+  }
+  void loadCompanion(fileId);
+}
 export async function correctRecord(r: ContextRecord, patch: RecordPatch) {
   const fileId = getState().fileId;
   if (!fileId) return;
@@ -274,6 +359,19 @@ export async function markSeen() {
   const fileId = getState().fileId;
   if (!fileId) return;
   await api.files.companionSeen(fileId);
+}
+
+/** Stop a running investigation: whatever it proposes afterwards is set aside. */
+export async function stopInvestigation(inv: Investigation) {
+  const fileId = getState().fileId;
+  if (!fileId) return;
+  try {
+    await api.files.cancelInvestigation(fileId, inv.id, getClientId());
+    setStatus('Stopping the investigation — nothing it proposes afterwards will count', 5000);
+  } catch (e) {
+    setStatus(`Could not stop it: ${(e as Error).message}`, 6000);
+  }
+  void loadCompanion(fileId);
 }
 
 /** A bounded investigation by the agent stack; the panel refreshes when the server says it finished. */

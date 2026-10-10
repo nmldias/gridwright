@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react';
-import { api, RECORD_KINDS, type Companion, type ContextRecord, type Investigation, type RecordKind, type Suggestion, type Understanding, type Watch, type WatchDef } from '../api/client';
+import { api, RECORD_KINDS, type Companion, type ContextRecord, type IntakeProfile, type IntakeSet, type Investigation, type RecordKind, type Suggestion, type Understanding, type Watch, type WatchDef } from '../api/client';
 import { readOnly, setStatus, useStore } from '../state/store';
-import { acceptSuggestion, addWatch, approveWatch, changeWatch, checkNow, clearReflection, confirmRecord, correctRecord, dismissSuggestion, investigate, loadCompanion, markExpectation, markSeen, remember, removeRecord, removeWatch, resolveRecord, restoreSuggestion, retireRecord, statementOf, useCompanion } from './companion';
+import { acceptSuggestion, addWatch, applyExclusion, approveWatch, changeWatch, checkNow, clearReflection, confirmReading, confirmRecord, correctRecord, dismissSuggestion, investigate, loadCompanion, markExpectation, markSeen, remember, removeRecord, removeWatch, resolveRecord, restoreSuggestion, retireRecord, statementOf, stopInvestigation, useCompanion } from './companion';
+import { applyIntake, skipIntake, useIntake } from './intake';
 
-const KIND_LABEL: Record<RecordKind, string> = { objective: 'What matters', constraint: 'Within', exclusion: 'Left out', decision: 'Decisions', question: 'Open questions', expectation: 'Expected', contradiction: 'Sources disagree', hypothesis: 'Hypotheses', fact: 'Facts', source: 'Snapshots and sources' };
+const KIND_LABEL: Record<RecordKind, string> = { objective: 'What matters', constraint: 'Within', exclusion: 'Left out', decision: 'Decisions', question: 'Open questions', expectation: 'Expected', scenario: 'Scenarios (explored, not adopted)', contradiction: 'Sources disagree', hypothesis: 'Hypotheses', fact: 'Facts', source: 'Snapshots and sources' };
 const KIND_HINT: Partial<Record<RecordKind, string>> = { question: 'what it bears on, after a dash: "Is the freight final? — bears on which vehicles to reprice"', expectation: '"final freight invoice for SH-001 by 2026-10-20 in invoices"', decision: '"hold the Creta — because an order is expected; reconsider if the order lapses"', constraint: 'e.g. replacement-cost margin stays positive on every disposal' };
-const HEALTH_LABEL: Record<Watch['health'], string> = { ok: 'fine', baseline: 'waiting for the next snapshot', attention: 'needs attention', stale: 'not checked — source stale', error: 'cannot evaluate', unchecked: 'not checked yet', proposed: 'proposed — needs your approval' };
+const HEALTH_LABEL: Record<Watch['health'], string> = { ok: 'fine', baseline: 'waiting for the next snapshot', attention: 'needs attention', stale: 'not checked — source stale', error: 'cannot evaluate', invalid: 'cannot assess — blank or text', unchecked: 'not checked yet', proposed: 'proposed — needs your approval' };
 const ruleWords = (d: WatchDef) => (d.kind === 'threshold' ? `${d.op === '>' ? 'more than' : d.op === '>=' ? 'at least' : d.op === '<' ? 'below' : d.op === '<=' ? 'at most' : d.op === '=' ? 'equal to' : 'not'} ${fmtValue(d.value)}` : d.kind === 'check' ? 'must stay TRUE' : d.kind === 'worsening' ? `${d.bad === 'down' ? 'falling' : 'rising'} snapshot after snapshot` : 'any change');
 const ago = (iso?: string) => {
   if (!iso) return 'never';
@@ -13,6 +14,7 @@ const ago = (iso?: string) => {
   return m < 1 ? 'just now' : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`;
 };
 const fmtValue = (v: unknown) => (typeof v === 'number' ? v.toLocaleString('en-GB', { maximumFractionDigits: 2 }) : String(v ?? '—'));
+const NO_INTAKE: IntakeProfile[] = [];
 const live = (r: ContextRecord) => r.status !== 'retired' && r.status !== 'superseded' && r.status !== 'resolved';
 const byName = (r: ContextRecord) => (r.origin === 'agent' ? (r.by.name.startsWith('investigation') ? 'an investigation' : 'an agent') : r.origin === 'system' ? 'a check' : r.by.name);
 
@@ -22,6 +24,8 @@ export function CompanionBrief() {
   const version = useStore((s) => s.companionVersion);
   const data = useCompanion((s) => (fileId ? s.byDoc[fileId] : undefined));
   const reflection = useCompanion((s) => (fileId ? s.reflection[fileId] : undefined));
+  const pendingIntake = useIntake((s) => (fileId ? s.pending[fileId] : undefined)) ?? NO_INTAKE;
+  const intakeBusy = useIntake((s) => (fileId ? !!s.busy[fileId] : false));
   const [view, setView] = useState<'none' | 'context' | 'watching'>('none');
   const [stack, setStack] = useState<{ available: boolean; reason?: string } | null>(null);
   const ro = readOnly();
@@ -58,15 +62,21 @@ export function CompanionBrief() {
   const healthText = [h.ok ? `${h.ok} fine` : '', h.baseline ? `${h.baseline} waiting for the next snapshot` : '', h.stale ? `${h.stale} stale` : '', h.error ? `${h.error} cannot evaluate` : '', h.proposed ? `${h.proposed} proposed` : ''].filter(Boolean).join(' · ');
   const running = data.investigations.find((i) => i.status === 'running');
   const canInvestigate = !ro && !!stack?.available && !running;
+  const cannot = h.error + h.invalid + h.stale;
   return (
     <div className={`companion ${attention ? 'attention' : ''} stance-${u.stance}`}>
       <div className="companion-head">
         <b className="companion-lead">{u.lead}</b>
-        <span className="muted small">
+        <span className="muted small" title={u.monitoring.text}>
           {checked}
           {healthText ? ` · ${healthText}` : ''}
+          {cannot ? ` · ${cannot} cannot be assessed` : ''}
         </span>
       </div>
+      {intakeBusy && <div className="muted small">Reading the file…</div>}
+      {pendingIntake.map((p) => (
+        <IntakeCard key={p.key} p={p} />
+      ))}
       <Situation u={u} onCorrect={() => setView('context')} />
       <div className="next-move">
         <span className="brief-h">Next useful move</span>
@@ -84,6 +94,16 @@ export function CompanionBrief() {
               <span>{l.text}</span>
               {l.record && (
                 <>
+                  {l.record.inferred && !ro && (
+                    <button className="link small" onClick={() => void confirmReading(l.record!)}>
+                      yes, that's it
+                    </button>
+                  )}
+                  {l.scope && (l.scope.state === 'recorded' || l.scope.state === 'partly') && l.scope.watches.some((w) => w.applicable && !w.applied) && !ro && (
+                    <button className="link small" onClick={() => void applyExclusion(l.record!)}>
+                      apply to the watches
+                    </button>
+                  )}
                   <button className="link small" onClick={() => setView('context')}>
                     correct
                   </button>
@@ -104,26 +124,38 @@ export function CompanionBrief() {
           </button>
         </div>
       )}
-      <div className="brief">
-        <div className="brief-col">
-          <div className="brief-h">What has changed</div>
-          {b.changed.length ? b.changed.slice(-4).map((t, i) => <div key={i}>{t}</div>) : <div className="muted">Nothing since you last looked.</div>}
-        </div>
-        <div className="brief-col">
-          <div className="brief-h">Why it matters</div>
-          {b.matters.map((t, i) => (
-            <div key={i} className={attention && i < attention ? 'matters-attention' : ''}>
-              {t}
+      {(b.changed.length > 0 || attention > 0 || b.matters.some((t) => !/^(No material issues|Nothing is being watched|\d+ watch(es)? (still building|not checked))/.test(t)) || b.next.some((t) => t !== 'Nothing to decide.' && t !== u.next)) && (
+        <div className="brief">
+          {b.changed.length > 0 && (
+            <div className="brief-col">
+              <div className="brief-h">What has changed</div>
+              {b.changed.slice(-4).map((t, i) => (
+                <div key={i}>{t}</div>
+              ))}
             </div>
-          ))}
+          )}
+          {(attention > 0 || b.matters.some((t) => !/^(No material issues|Nothing is being watched|\d+ watch(es)? (still building|not checked))/.test(t))) && (
+            <div className="brief-col">
+              <div className="brief-h">Why it matters</div>
+              {b.matters.map((t, i) => (
+                <div key={i} className={attention && i < attention ? 'matters-attention' : ''}>
+                  {t}
+                </div>
+              ))}
+            </div>
+          )}
+          {b.next.filter((t) => t !== u.next && t !== 'Nothing to decide.').length > 0 && (
+            <div className="brief-col">
+              <div className="brief-h">Also</div>
+              {b.next
+                .filter((t) => t !== u.next && t !== 'Nothing to decide.')
+                .map((t, i) => (
+                  <div key={i}>{t}</div>
+                ))}
+            </div>
+          )}
         </div>
-        <div className="brief-col">
-          <div className="brief-h">What to do next</div>
-          {b.next.map((t, i) => (
-            <div key={i}>{t}</div>
-          ))}
-        </div>
-      </div>
+      )}
       <div className="row wrap companion-actions">
         <button className={view === 'context' ? 'active' : ''} onClick={() => setView(view === 'context' ? 'none' : 'context')}>
           Context{data.records.filter(live).length ? ` · ${data.records.filter(live).length}` : ''}
@@ -137,6 +169,146 @@ export function CompanionBrief() {
       </div>
       {view === 'context' && <ContextView data={data} />}
       {view === 'watching' && <WatchingView watches={data.watches} fileId={fileId} investigations={data.investigations} canInvestigate={canInvestigate} stack={stack} />}
+    </div>
+  );
+}
+
+/** A file brought in: what it is, what it relates to, what was cleaned — and the decision, which is the person's. */
+function IntakeCard({ p }: { p: IntakeProfile }) {
+  const [period, setPeriod] = useState(p.period ?? '');
+  const [details, setDetails] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const fileId = useStore((s) => s.fileId);
+  const ro = readOnly();
+  const sets = p.sets;
+  const one = sets.length === 1;
+  const place = async (set: IntakeSet, action: 'update' | 'new' | 'history' | 'skip') => {
+    setBusy(true);
+    try {
+      await applyIntake(p, [{ set: set.name, action, table: set.relation.table?.id }, ...sets.filter((x) => x !== set).map((x) => ({ set: x.name, action: 'skip' as const }))], period.trim() || undefined);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const placeAll = async () => {
+    setBusy(true);
+    try {
+      await applyIntake(p, sets.map((x) => ({ set: x.name, action: x.relation.recommended, table: x.relation.table?.id })), period.trim() || undefined);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const verb = (r: IntakeSet['relation']) => (r.recommended === 'update' ? `Update ${r.table?.name ?? 'the table'}` : r.recommended === 'history' ? 'Keep as history' : r.recommended === 'skip' ? 'Nothing to do' : 'Add as a table');
+  return (
+    <div className="intake-card" data-key={p.key}>
+      <div className="row">
+        <b className="grow">{p.name}</b>
+        <span className="muted small">
+          {p.format.toUpperCase()} · {sets.reduce((n, x) => n + x.dataRows, 0)} row{sets.reduce((n, x) => n + x.dataRows, 0) === 1 ? '' : 's'}
+          {one ? ` × ${sets[0].cols} columns` : ` in ${sets.length} sets`} · {Math.round(p.size / 1024) || 1} KB{p.origin === 'inbox' ? ' · from the inbox' : p.origin === 'sql' ? ` · query on ${p.query?.connection}` : ''}
+        </span>
+      </div>
+      {sets.map((set) => (
+        <div key={set.name} className={`intake-set rel-${set.relation.kind}`}>
+          {!one && <div className="small">
+            <b>{set.name}</b> · {set.dataRows} rows × {set.cols} columns
+          </div>}
+          <div className="small">
+            <b>{set.relation.kind === 'first' ? 'New here' : set.relation.kind === 'next' ? 'Next snapshot' : set.relation.kind === 'same-period' ? 'Same period' : set.relation.kind === 'older' ? 'Older snapshot' : set.relation.kind === 'different-entity' ? 'Same columns, different entity' : set.relation.kind === 'duplicate' ? 'Already added' : 'Unrelated'}:</b> {set.relation.reason}
+          </div>
+          {set.relation.identifiers && set.relation.kind !== 'first' && (
+            <div className="muted small">
+              {set.relation.identifiers.column}: {set.relation.identifiers.ofFile} in the file, {set.relation.identifiers.ofTable} in the table, {Math.round(set.relation.identifiers.overlap * 100)}% in common{set.relation.identifiers.added ? ` · ${set.relation.identifiers.added} new` : ''}{set.relation.identifiers.removed ? ` · ${set.relation.identifiers.removed} gone` : ''}
+            </div>
+          )}
+          {set.notes.length > 0 && <div className="muted small">Checked: {set.notes.join(' · ')}</div>}
+          {set.quarantined.length > 0 && (
+            <div className="small amber-text">
+              {set.quarantined.length} row{set.quarantined.length === 1 ? '' : 's'} held back: {set.quarantined.map((q) => `row ${q.row} (${q.reason})`).join('; ')}
+            </div>
+          )}
+          {!ro && !busy && (
+            <div className="row wrap">
+              {set.relation.recommended !== 'skip' && (
+                <button className="primary small" onClick={() => void place(set, set.relation.recommended)}>
+                  {verb(set.relation)}
+                </button>
+              )}
+              {set.relation.recommended !== 'new' && (
+                <button className="small" onClick={() => void place(set, 'new')}>
+                  Add as a new table
+                </button>
+              )}
+              {set.relation.recommended === 'new' && set.relation.table && (
+                <button className="small" onClick={() => void place(set, 'update')} title={`Replace the rows of ${set.relation.table.name} with this file — only if it is the same series`}>
+                  Update {set.relation.table.name} instead
+                </button>
+              )}
+              {set.relation.recommended !== 'history' && set.relation.kind !== 'first' && set.relation.kind !== 'duplicate' && (
+                <button className="small" onClick={() => void place(set, 'history')}>
+                  Keep as history
+                </button>
+              )}
+              {one && (
+                <button className="link small" onClick={() => skipIntake(p)}>
+                  not now
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      ))}
+      <div className="row wrap small">
+        <label className="small">
+          Period{' '}
+          <input className="period" value={period} placeholder="e.g. 2026-10-13" onChange={(e) => setPeriod(e.target.value)} onKeyDown={(e) => e.stopPropagation()} title={p.periodFrom === 'name' ? 'read from the file name' : p.periodFrom === 'column' ? 'the latest date in a date column' : 'not recognised — set the period the data describes'} />
+          {p.periodFrom === 'none' && <span className="amber-text"> not recognised — set it</span>}
+        </label>
+        {!one && !ro && !busy && (
+          <button className="primary small" onClick={() => void placeAll()}>
+            Place all as suggested
+          </button>
+        )}
+        {!one && !ro && (
+          <button className="link small" onClick={() => skipIntake(p)}>
+            not now
+          </button>
+        )}
+        <button className="link small" onClick={() => setDetails((v) => !v)}>
+          {details ? 'hide columns' : 'columns'}
+        </button>
+        {fileId && (
+          <a className="link small" href={api.files.originalUrl(fileId, p.key)} download>
+            original
+          </a>
+        )}
+        {busy && <span className="muted small">Placing…</span>}
+      </div>
+      {details &&
+        sets.map((set) => (
+          <table key={set.name} className="intake-columns small">
+            <thead>
+              <tr>
+                <th>Column</th>
+                <th>Type</th>
+                <th>Filled</th>
+                <th>Unit</th>
+                <th>Sample</th>
+              </tr>
+            </thead>
+            <tbody>
+              {set.columns.map((c) => (
+                <tr key={c.index}>
+                  <td>{c.header}{c.constant ? <span className="muted"> (all “{c.constant}”)</span> : ''}</td>
+                  <td>{c.type}{c.leadingZeros ? ` · ${c.leadingZeros} with leading zeros kept` : ''}{c.textInNumber ? ` · ${c.textInNumber} text` : ''}</td>
+                  <td>{c.filled}{c.blanks ? ` (${c.blanks} blank)` : ''}</td>
+                  <td>{c.unit ?? ''}</td>
+                  <td className="muted">{c.sample.join(' · ')}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ))}
     </div>
   );
 }
@@ -309,6 +481,7 @@ function ContextView({ data }: { data: Companion }) {
                     {r.status === 'proposed' && <span className="badge amber">proposed by {byName(r)}</span>}
                     {r.status === 'confirmed' && <span className="badge green">confirmed</span>}
                     {r.status === 'observed' && <span className="badge">found by a check</span>}
+                    {r.inferred && <span className="badge amber">my reading — confirm or correct</span>}
                     {r.private && <span className="badge">private</span>}
                     {r.derivative && <span className="badge">generated — not independent</span>}
                     {r.kind === 'expectation' && r.expected && <span className={`badge ${r.expected.state === 'missing' ? 'amber' : r.expected.state === 'met' ? 'green' : ''}`}>{r.expected.state === 'met' ? 'arrived' : r.expected.state === 'missing' ? 'not arrived' : r.expected.state === 'unchecked' ? 'not checked' : r.expected.state === 'didnt' ? 'did not happen' : 'open'}</span>}
@@ -318,6 +491,24 @@ function ContextView({ data }: { data: Companion }) {
                       <b>Why:</b> {r.why}
                     </div>
                   )}
+                  {r.kind === 'exclusion' && (() => {
+                    const sc = data.understanding.scope.find((x) => x.record === r.id);
+                    if (!sc) return null;
+                    const pending = sc.watches.filter((w) => w.applicable && !w.applied);
+                    return (
+                      <div className={`small scope-${sc.state}`}>
+                        {sc.state === 'no-column' ? 'Recorded — no yes/no column marks this yet; say which (e.g. “Reserved = yes”)' : sc.state === 'applied' ? `Applied: the watches on ${sc.table} leave ${sc.column} = yes out` : `Recorded, ${sc.state === 'partly' ? 'partly applied' : 'not yet applied'}: ${pending.length} watch${pending.length === 1 ? '' : 'es'} still count${pending.length === 1 ? 's' : ''} the whole ${sc.table} population`}
+                        {!ro && pending.length > 0 && (
+                          <>
+                            {' '}
+                            <button className="link small" onClick={() => void applyExclusion(r)}>
+                              apply to the watches
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    );
+                  })()}
                   {r.bearing && (
                     <div className="small">
                       <b>Bears on:</b> {r.bearing}
@@ -401,6 +592,11 @@ function ContextView({ data }: { data: Companion }) {
                         {r.status === 'proposed' && (
                           <button className="link small" onClick={() => void confirmRecord(r)}>
                             confirm
+                          </button>
+                        )}
+                        {r.inferred && (
+                          <button className="link small" onClick={() => void confirmReading(r)}>
+                            yes, that's it
                           </button>
                         )}
                         {(r.kind === 'question' || r.kind === 'contradiction' || r.kind === 'hypothesis') && (
@@ -529,12 +725,19 @@ function ContextView({ data }: { data: Companion }) {
 
 function InvestigationView({ inv, fileId }: { inv: Investigation; fileId: string }) {
   const [open, setOpen] = useState(inv.status === 'running');
+  const ro = readOnly();
   void fileId;
+  const badge = inv.status === 'running' ? (inv.cancelRequested ? 'stopping…' : inv.superseded ? 'running — overtaken, its result will be set aside' : 'running…') : inv.status === 'failed' ? (inv.error?.startsWith('interrupted') ? 'interrupted — nothing it proposed is current' : 'failed') : inv.status === 'cancelled' ? 'stopped' : inv.status === 'superseded' ? 'superseded — direction changed while it ran' : inv.stale ? 'provisional — assumptions changed since' : 'done';
   return (
     <div className={`investigation ${inv.status} ${inv.stale ? 'stale' : ''}`}>
       <div className="row">
         <b className="grow">{inv.question}</b>
-        <span className={`badge ${inv.status === 'running' ? 'amber' : inv.status === 'failed' ? 'red' : inv.stale ? 'amber' : 'green'}`}>{inv.status === 'running' ? 'running…' : inv.status === 'failed' ? 'failed' : inv.stale ? 'provisional — assumptions changed since' : 'done'}</span>
+        <span className={`badge ${inv.status === 'running' ? 'amber' : inv.status === 'failed' ? 'red' : inv.status === 'cancelled' || inv.status === 'superseded' || inv.stale ? '' : 'green'}`}>{badge}</span>
+        {inv.status === 'running' && !inv.cancelRequested && !ro && (
+          <button className="small" onClick={() => void stopInvestigation(inv)} title="Stop it; nothing it proposes afterwards counts">
+            Stop
+          </button>
+        )}
       </div>
       <div className="muted small">
         started {ago(inv.startedAt)} by {inv.by.name}
@@ -702,9 +905,6 @@ function WatchingView({ watches, fileId, investigations, canInvestigate, stack }
                 ) : (
                   !ro && (
                     <div className="row wrap">
-                      <button className="small" onClick={() => void explain(w)} disabled={explaining === w.id}>
-                        {explaining === w.id ? 'Asking the model…' : 'Explain (asks the model)'}
-                      </button>
                       <button className="small" disabled={!canInvestigate} title={stack?.available ? 'A bounded investigation: the agent reads the context, computes independently in the sandbox and proposes; it changes nothing' : `The investigation stack is not available: ${stack?.reason ?? 'not probed yet'}`} onClick={() => void investigate(undefined, w.issue!.id)}>
                         Investigate (agent)
                       </button>
