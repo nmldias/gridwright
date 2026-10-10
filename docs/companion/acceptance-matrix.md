@@ -53,7 +53,7 @@ The gates of the brief (§15) and the eight steps of the journey (§4), each wit
 - A human assessment of decision-ready outcomes, missed issues, false alerts and repeated explanations; the measures in `situation.py` are the planted-issue count and the no-repetition check only.
 - Rollback from 0.11.0 to 0.10.0 (restore of a backup was exercised by hand on 2026-10-10, twice — once with the WAL store present; the previous build was not started on 0.11.0 data).
 - Upgrade on Spark 1 (arm64, DGX OS) to 0.11.0 — not deployed in this pass; 0.10.0 was published to the release branch.
-- The release image's three CI runs (as it ships, with user namespaces, with sandbox=none) run on push to main; they had not run when this was written.
+- Bubblewrap inside Docker: the image's CI runs showed Python off as it ships and off with seccomp/apparmor unconfined (the network namespace refused), on with `none`; isolation of generated code from the data directory is demonstrated only on the systemd install with `--sandbox`.
 - A SQL source on MySQL/MariaDB or SQL Server (the kinds are mapped; `sources.py` runs on PostgreSQL only).
 - A worker in a process of its own (the loop runs inside the server; the code is the same).
 - PDF extraction (text-native or scanned): no extractor is wired; the invoice fixture is XML and JSON.

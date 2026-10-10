@@ -33,9 +33,10 @@ services:
       AI_BASE_URL: ${AI_BASE_URL:-}
       AI_MODEL: ${AI_MODEL:-}
       AI_API_KEY: ${AI_API_KEY:-}
-    # Let the container create user namespaces so that bubblewrap isolates generated code from /data
-    # (the host must allow unprivileged user namespaces; Ubuntu ≥ 23.10 restricts them under AppArmor):
-    # security_opt: ["seccomp=unconfined", "apparmor=unconfined"]
+    # bubblewrap inside a container needs the host to allow unprivileged user namespaces AND the network
+    # namespace it sets up; on a stock Docker host (GitHub's runner included) even
+    # security_opt: ["seccomp=unconfined", "apparmor=unconfined"] was not enough (RTM_NEWADDR refused), so
+    # the practical choices are GRIDWRIGHT_PYTHON_SANDBOX=none here or the systemd install with --sandbox.
     volumes:
       - ./data:/data          # documents, history, connections; ./data/pyodide → offline Python runtime
     extra_hosts:
