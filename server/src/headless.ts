@@ -187,6 +187,23 @@ export function tableMetas(book: BookApi): TableMetaView[] {
   return JSON.parse(book.tables()) as TableMetaView[];
 }
 
+/** The workbook as the Python runner sees it (what the browser would send): plain values per table, formulas at their last committed value. */
+export function snapshotOf(book: BookApi, maxCells = 200_000): { tables: { id: number; name: string; rows: number; cols: number; values: unknown[][] }[]; current: { table: number; row: number; col: number } } {
+  const tables = [];
+  let budget = maxCells;
+  for (const t of tableMetas(book)) {
+    const values: unknown[][] = Array.from({ length: t.rows }, () => new Array(t.cols).fill(''));
+    for (const c of JSON.parse(book.cells(t.id)) as CellViewJson[]) {
+      if (c.r >= t.rows || c.c >= t.cols || !c.v) continue;
+      values[c.r][c.c] = 'n' in c.v ? c.v.n : 's' in c.v ? c.v.s : 'b' in c.v ? c.v.b : 'e' in c.v ? c.v.e : '';
+    }
+    budget -= t.rows * t.cols;
+    if (budget < 0) break;
+    tables.push({ id: t.id, name: t.name, rows: t.rows, cols: t.cols, values });
+  }
+  return { tables, current: { table: tables[0]?.id ?? 0, row: 0, col: 0 } };
+}
+
 export function tableByName(book: BookApi, name: string): TableMetaView | null {
   const metas = tableMetas(book);
   const n = name.trim().toLowerCase();

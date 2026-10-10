@@ -16,6 +16,7 @@ State flows through five nodes; each is a plain function, so the same cycle can 
 larger LangGraph (a CFOrUS case graph) or on a schedule.
 """
 import json
+import os
 import sys
 import urllib.request
 from typing import Any, TypedDict
@@ -38,8 +39,18 @@ class CompanionState(TypedDict, total=False):
     cases: list[dict[str, Any]] # what a decision-case system should open or update
 
 
+def _headers() -> dict[str, str]:
+    # the identity the request carries: an agent token the server issued, and the shared token when the server requires one
+    h = {"content-type": "application/json", "accept": "application/json, text/event-stream"}
+    if os.environ.get("GRIDWRIGHT_AGENT_TOKEN"):
+        h["x-gridwright-agent"] = os.environ["GRIDWRIGHT_AGENT_TOKEN"]
+    if os.environ.get("GRIDWRIGHT_TOKEN"):
+        h["authorization"] = f"Bearer {os.environ['GRIDWRIGHT_TOKEN']}"
+    return h
+
+
 def _post(base: str, path: str, body: Any) -> Any:
-    req = urllib.request.Request(base + path, method="POST", data=json.dumps(body).encode(), headers={"content-type": "application/json", "accept": "application/json, text/event-stream"})
+    req = urllib.request.Request(base + path, method="POST", data=json.dumps(body).encode(), headers=_headers())
     with urllib.request.urlopen(req, timeout=120) as r:
         return json.loads(r.read().decode())
 

@@ -10,7 +10,8 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { canEdit, canManage, canSign, canView, deleteAccess, normalise, permissionFor, readAccess, writeAccess, type FileAccess } from './access.js';
 import { chat, completeOnce } from './ai.js';
-import { addRecord, addWatch, affectedBy, brief as companionBrief, checkDocument, contextForModel, deleteCompanion, findIssue, graphOf, markSeen, removeRecord, removeWatch, setCompanionNotifier, setInterpretation, snapshot as companionSnapshot, startCompanion, suggestWatches, updateRecord, updateWatch, type RecordKind } from './companion.js';
+import { addRecord, addWatch, affectedBy, brief as companionBrief, checkDocument, contextForModel, deleteCompanion, dismissSuggestion, findIssue, getInvestigation, graphOf, markSeen, recordRejection, removeRecord, removeWatch, restoreSuggestion, setCompanionNotifier, setInterpretation, snapshot as companionSnapshot, startCompanion, suggestWatches, understandingOf, updateRecord, updateWatch, type RecordKind, type RecordPatch } from './companion.js';
+import { probeStack, runCodeForDocument, setInvestigationNotifier, stackStatus, startInvestigationProcess } from './investigate.js';
 import { appendEntry, checkpointSeqs, compactCheckpoints, currentSeq, deleteHistory, historyCsv, opTouchesCell, readAll, recentEntries, replayBundle, writeCheckpoint } from './history.js';
 import { identityEnabled, identityOf } from './identity.js';
 import { accessChanged, attachMultiplayer, broadcastEntries, notifyCompanion, notifyProposal as notifyProposalRoom, notifySaved } from './multiplayer.js';
@@ -39,7 +40,7 @@ import {
   type StoredConnection,
 } from './storage.js';
 
-const VERSION = '0.8.1';
+const VERSION = '0.9.0';
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? '0.0.0.0';
 const TOKEN = process.env.GRIDWRIGHT_TOKEN ?? '';
@@ -98,7 +99,7 @@ const publicPython = (req: Request) => {
   return p.available ? { version: p.version, sandbox: p.sandbox, gpu: p.gpu, timeoutMs: p.limits.timeoutMs, memoryMb: p.limits.memoryMb, can: { run: canRunPython(who), gpu: canUseGpu(who) } } : null;
 };
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, version: VERSION, multiplayer: true, pyodide: !!pyodideDir(), identity: identityEnabled, token: !!TOKEN, tools: true, defaultSharing: DEFAULT_SHARING, mcp: engineAvailable(), python: publicPython(req) });
+  res.json({ ok: true, version: VERSION, multiplayer: true, pyodide: !!pyodideDir(), identity: identityEnabled, token: !!TOKEN, tools: true, defaultSharing: DEFAULT_SHARING, mcp: engineAvailable(), python: publicPython(req), investigation: stackStatus().available });
 });
 
 // --- server-side Python cells -------------------------------------------------------------
@@ -260,12 +261,40 @@ app.post('/api/files/:id/checkpoint', requireRole('editor'), (req, res) => {
 const authorOf = (req: Request): { id: string; name: string; login?: string } => {
   const id = identityOf(req);
   const client = typeof req.body?.client === 'string' ? req.body.client : 'api';
-  return { id: client, name: id.name || 'Guest', login: id.login || undefined };
+  return { id: id.agent ? id.agent : client, name: id.agent ? `${id.agent} for ${id.name || 'Guest'}` : id.name || 'Guest', login: id.login || undefined };
 };
+/** What an agent process may not do for the person it acts for: ratify, approve, decide, delete. */
+const noAgent = (req: Request, res: Response): boolean => {
+  if (identityOf(req).agent) {
+    res.status(403).json({ error: 'an agent may propose, not ratify: a person confirms, approves, decides and removes' });
+    return false;
+  }
+  return true;
+};
+const originOf = (req: Request): 'user' | 'agent' => (identityOf(req).agent ? 'agent' : 'user');
 app.get('/api/files/:id/companion', (req, res) => {
   if (!docPermission(req, res, 'view')) return;
   try {
-    res.json(companionSnapshot(req.params.id));
+    res.json(companionSnapshot(req.params.id, { login: identityOf(req).login || undefined }));
+  } catch (e) {
+    res.status(400).json({ error: errorMessage(e) });
+  }
+});
+// the understanding: what we are working toward, what we rest on, what stands, what is uncertain, the next move
+app.get('/api/files/:id/companion/understanding', (req, res) => {
+  if (!docPermission(req, res, 'view')) return;
+  try {
+    res.json(understandingOf(req.params.id));
+  } catch (e) {
+    res.status(400).json({ error: errorMessage(e) });
+  }
+});
+// the context as an agent reads it (private working context left out when the caller is an agent)
+app.get('/api/files/:id/companion/context', (req, res) => {
+  if (!docPermission(req, res, 'view')) return;
+  try {
+    const who = identityOf(req);
+    res.json(contextForModel(req.params.id, { viewer: { login: who.login || undefined }, outside: !!who.agent }));
   } catch (e) {
     res.status(400).json({ error: errorMessage(e) });
   }
@@ -285,10 +314,23 @@ app.get('/api/files/:id/companion/graph', (req, res) => {
 app.get('/api/files/:id/companion/suggest', (req, res) => {
   if (!docPermission(req, res, 'view')) return;
   try {
-    res.json(suggestWatches(req.params.id));
+    res.json(suggestWatches(req.params.id, req.query.all === '1'));
   } catch (e) {
     res.status(400).json({ error: errorMessage(e) });
   }
+});
+// a suggestion set aside carries its reason — "not now" returns with the next snapshot — and can be brought back
+app.post('/api/files/:id/companion/suggest/dismiss', requireRole('editor'), (req, res) => {
+  if (!docPermission(req, res, 'sign') || !noAgent(req, res)) return;
+  try {
+    res.json(dismissSuggestion(req.params.id, authorOf(req), req.body ?? {}));
+  } catch (e) {
+    res.status(400).json({ error: errorMessage(e) });
+  }
+});
+app.post('/api/files/:id/companion/suggest/restore', requireRole('editor'), (req, res) => {
+  if (!docPermission(req, res, 'sign') || !noAgent(req, res)) return;
+  res.json({ ok: restoreSuggestion(req.params.id, authorOf(req), String(req.body?.id ?? '')) });
 });
 app.get('/api/files/:id/companion/brief', (req, res) => {
   if (!docPermission(req, res, 'view')) return;
@@ -308,28 +350,30 @@ app.post('/api/files/:id/companion/records', requireRole('editor'), (req, res) =
   if (!docPermission(req, res, 'sign')) return;
   try {
     const b = req.body ?? {};
-    res.json(addRecord(req.params.id, authorOf(req), 'user', { kind: b.kind as RecordKind, text: String(b.text ?? ''), source: b.source, period: b.period, links: Array.isArray(b.links) ? b.links : undefined }));
+    res.json(addRecord(req.params.id, authorOf(req), originOf(req), { kind: b.kind as RecordKind, text: String(b.text ?? ''), source: b.source, period: b.period, links: Array.isArray(b.links) ? b.links : undefined, bearing: b.bearing, due: b.due, match: b.match, reviewBy: b.reviewBy, why: b.why, conditions: b.conditions, private: !!b.private, derivative: !!b.derivative }));
   } catch (e) {
     res.status(400).json({ error: errorMessage(e) });
   }
 });
 app.put('/api/files/:id/companion/records/:rid', requireRole('editor'), (req, res) => {
   if (!docPermission(req, res, 'sign')) return;
+  const patch = (req.body ?? {}) as RecordPatch;
+  if (identityOf(req).agent && (patch.status || patch.expected)) return noAgent(req, res);
   try {
-    res.json(updateRecord(req.params.id, req.params.rid, authorOf(req), req.body ?? {}));
+    res.json(updateRecord(req.params.id, req.params.rid, authorOf(req), patch));
   } catch (e) {
     res.status(400).json({ error: errorMessage(e) });
   }
 });
 app.delete('/api/files/:id/companion/records/:rid', requireRole('editor'), (req, res) => {
-  if (!docPermission(req, res, 'sign')) return;
+  if (!docPermission(req, res, 'sign') || !noAgent(req, res)) return;
   res.json({ ok: removeRecord(req.params.id, req.params.rid, authorOf(req)) });
 });
 // watches: a person's watch is approved; an agent's is proposed; a moved threshold is a recorded decision
 app.post('/api/files/:id/companion/watches', requireRole('editor'), (req, res) => {
   if (!docPermission(req, res, 'sign')) return;
   try {
-    const w = addWatch(req.params.id, authorOf(req), 'user', req.body ?? {});
+    const w = addWatch(req.params.id, authorOf(req), originOf(req), req.body ?? {});
     const r = checkDocument(req.params.id, 'new watch');
     notifyCompanion(req.params.id, { attention: r.attention });
     res.json(companionSnapshot(req.params.id).watches.find((x) => x.id === w.id) ?? w);
@@ -341,6 +385,7 @@ app.put('/api/files/:id/companion/watches/:wid', requireRole('editor'), (req, re
   if (!docPermission(req, res, 'sign')) return;
   try {
     const b = req.body ?? {};
+    if (identityOf(req).agent) return noAgent(req, res);
     updateWatch(req.params.id, req.params.wid, authorOf(req), { approve: !!b.approve, def: b.def, reason: typeof b.reason === 'string' ? b.reason : undefined });
     const r = checkDocument(req.params.id, 'watch changed');
     notifyCompanion(req.params.id, { attention: r.attention });
@@ -350,7 +395,7 @@ app.put('/api/files/:id/companion/watches/:wid', requireRole('editor'), (req, re
   }
 });
 app.delete('/api/files/:id/companion/watches/:wid', requireRole('editor'), (req, res) => {
-  if (!docPermission(req, res, 'sign')) return;
+  if (!docPermission(req, res, 'sign') || !noAgent(req, res)) return;
   const ok = removeWatch(req.params.id, req.params.wid, authorOf(req));
   notifyCompanion(req.params.id, { attention: companionBrief(req.params.id).health.attention });
   res.json({ ok });
@@ -393,6 +438,44 @@ app.post('/api/files/:id/companion/interpret/:iid', requireRole('editor'), async
   } catch (e) {
     res.status(400).json({ error: errorMessage(e) });
   }
+});
+
+// generated code against the live document, in the cell sandbox: nothing written, the run kept as evidence
+app.post('/api/files/:id/companion/run', requireRole('editor'), async (req, res) => {
+  if (!docPermission(req, res, 'view')) return;
+  const who = identityOf(req);
+  if (!canRunPython(who)) return res.status(403).json({ error: 'running code on the server is not permitted for your login (GRIDWRIGHT_PYTHON_USERS)' });
+  try {
+    const r = await runCodeForDocument(req.params.id, authorOf(req), { code: String(req.body?.code ?? ''), purpose: typeof req.body?.purpose === 'string' ? req.body.purpose : undefined, investigation: typeof req.body?.investigation === 'string' ? req.body.investigation : undefined });
+    if (r.busy) return res.status(429).json(r);
+    res.json(r);
+  } catch (e) {
+    res.status(400).json({ error: errorMessage(e) });
+  }
+});
+// a bounded investigation by the LangChain + DeepAgents + LangGraph stack, as a separate process acting for the requester
+app.get('/api/investigation', (_req, res) => res.json(stackStatus()));
+app.post('/api/investigation/probe', requireRole('admin'), async (_req, res) => res.json(await probeStack(true)));
+app.post('/api/files/:id/companion/investigate', requireRole('editor'), (req, res) => {
+  if (!docPermission(req, res, 'view') || !noAgent(req, res)) return;
+  const who = identityOf(req);
+  try {
+    const b = req.body ?? {};
+    const issue = typeof b.issue === 'string' ? findIssue(req.params.id, b.issue) : null;
+    const question = String(b.question ?? (issue ? `Investigate: ${issue.issue.summary}` : '')).trim();
+    const base = process.env.GRIDWRIGHT_SELF_URL ?? `http://127.0.0.1:${PORT}`;
+    const inv = startInvestigationProcess(req.params.id, who, authorOf(req), { question, issue: issue?.issue.id, thread: typeof b.thread === 'string' ? b.thread : undefined }, base, TOKEN);
+    notifyCompanion(req.params.id, { attention: companionBrief(req.params.id).health.attention });
+    res.json(inv);
+  } catch (e) {
+    res.status(400).json({ error: errorMessage(e) });
+  }
+});
+app.get('/api/files/:id/companion/investigations/:iid', (req, res) => {
+  if (!docPermission(req, res, 'view')) return;
+  const inv = getInvestigation(req.params.id, req.params.iid);
+  if (!inv) return res.status(404).json({ error: 'not found' });
+  res.json(inv);
 });
 
 app.delete('/api/files/:id', requireRole('editor'), (req, res) => {
@@ -499,7 +582,7 @@ app.post('/api/files/:id/proposals', requireRole('editor'), (req, res) => {
 });
 // the decision is a server-side commit: expected revision, exact operations and decision together, once
 app.post('/api/files/:id/proposals/:pid/decide', requireRole('editor'), (req, res) => {
-  if (!docPermission(req, res, 'edit')) return;
+  if (!docPermission(req, res, 'edit') || !noAgent(req, res)) return;
   try {
     const id = identityOf(req);
     const b = req.body ?? {};
@@ -515,6 +598,7 @@ app.post('/api/files/:id/proposals/:pid/decide', requireRole('editor'), (req, re
       typeof b.command === 'string' ? b.command : undefined,
     );
     if (committed.length) broadcastEntries(req.params.id, committed);
+    if (decision === 'rejected' && recordRejection(req.params.id, { id: typeof b.client === 'string' ? b.client : 'api', name: id.name || 'Guest', login: id.login || undefined }, { id: proposal.id, title: proposal.title, agent: proposal.agent, note: proposal.decisionNote })) notifyCompanion(req.params.id, { attention: companionBrief(req.params.id).health.attention });
     notifyProposalRoom(req.params.id, proposal);
     res.json(proposal);
   } catch (e) {
@@ -541,7 +625,9 @@ app.post('/api/files/:id/proposals/:pid/refresh', requireRole('editor'), (req, r
 setProposalNotifier((doc, p) => notifyProposalRoom(doc, p));
 // the companion: re-check after every logged change, and on a timer for freshness; push to open sessions
 setCompanionNotifier((doc, payload) => notifyCompanion(doc, payload));
+setInvestigationNotifier((doc) => notifyCompanion(doc, { attention: companionBrief(doc).health.attention }));
 startCompanion(Number(process.env.GRIDWRIGHT_COMPANION_INTERVAL_MS ?? 600_000));
+void probeStack().then((st) => console.log(st.available ? `investigation stack: ${st.python} (${Object.entries(st.versions ?? {}).map(([k, v]) => `${k} ${v}`).join(', ')})` : `investigation stack off: ${st.reason}`));
 app.all('/mcp', (req, res) => void handleMcp(req, res));
 
 // --- connections --------------------------------------------------------------------

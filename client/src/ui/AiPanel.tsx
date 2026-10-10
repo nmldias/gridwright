@@ -99,7 +99,7 @@ export function AiPanel() {
     const st = statementOf(input);
     if (st) {
       patchConversation(key, { input: '' });
-      void remember(st.kind, st.text);
+      void remember(st.kind, st.text, st.extra);
       return;
     }
     void sendMessage(key, { tools, autoApply, file: fileId });
@@ -199,7 +199,7 @@ export function AiPanel() {
       <div className="chat">
         {messages.length === 0 && (
           <div className="muted small">
-            Ask about the data, for formulas, Python/JavaScript/SQL analysis, or new tables. Start a line with <b>Objective:</b>, <b>Exclude:</b>, <b>Decision:</b> or <b>Remember:</b> to record it in the context without asking. Every proposed change is shown as a before → after diff; nothing is written until you apply it (Ctrl+Z reverts).
+            Ask about the data, for formulas, Python/JavaScript/SQL analysis, or new tables. Start a line with <b>Objective:</b>, <b>Constraint:</b>, <b>Exclude:</b>, <b>Decision:</b> (… — because …; reconsider if …), <b>Question:</b> (… — bears on …), <b>Expect:</b> (… by 2026-10-20 in invoices) or <b>Private:</b> to record it in the context without asking. Every proposed change is shown as a before → after diff; nothing is written until you apply it (Ctrl+Z reverts).
           </div>
         )}
         {messages.map((m, i) => (
@@ -266,7 +266,7 @@ export function AiPanel() {
         <textarea
           value={input}
           rows={3}
-          placeholder="Ask, or state what matters (Objective: …, Exclude: …)  ·  Enter to send"
+          placeholder="Ask, or state what matters (Objective: …, Exclude: …, Decision: …, Question: …)  ·  Enter to send"
           onKeyDown={(e) => {
             e.stopPropagation();
             if (e.key === 'Enter' && !e.shiftKey) {

@@ -3,7 +3,7 @@
 // here. A reflection — the last thing recorded, with a way to correct it — is kept per document too.
 
 import { create } from 'zustand';
-import { api, type Companion, type ContextRecord, type RecordKind, type Suggestion, type Watch, type WatchDef } from '../api/client';
+import { api, type Companion, type ContextRecord, type Dismissed, type Investigation, type RecordInput, type RecordKind, type RecordPatch, type Suggestion, type Watch, type WatchDef } from '../api/client';
 import { getClientId } from '../api/ws';
 import { getState, setStatus, useStore } from '../state/store';
 import { familyOf } from './snapshots';
@@ -48,10 +48,10 @@ export function clearReflection(fileId: string) {
   useCompanion.setState((s) => ({ reflection: { ...s.reflection, [fileId]: undefined } }));
 }
 
-const KIND_WORD: Record<RecordKind, string> = { fact: 'fact', source: 'source', objective: 'objective', hypothesis: 'hypothesis', contradiction: 'contradiction', decision: 'decision', exclusion: 'exclusion' };
+const KIND_WORD: Record<RecordKind, string> = { fact: 'fact', source: 'source', objective: 'objective', constraint: 'constraint', exclusion: 'exclusion', hypothesis: 'hypothesis', contradiction: 'contradiction', decision: 'decision', question: 'question', expectation: 'expectation' };
 
 /** Record something the person said or added; the reflection shows it back for correction. */
-export async function remember(kind: RecordKind, text: string, extra: { source?: string; period?: string; links?: { table?: number; ref?: string }[] } = {}): Promise<ContextRecord | null> {
+export async function remember(kind: RecordKind, text: string, extra: Omit<RecordInput, 'kind' | 'text'> = {}): Promise<ContextRecord | null> {
   const fileId = getState().fileId;
   if (!fileId) {
     setStatus('Save the document first: the companion keeps context per saved document.', 6000);
@@ -59,7 +59,8 @@ export async function remember(kind: RecordKind, text: string, extra: { source?:
   }
   try {
     const r = await api.files.addRecord(fileId, { kind, text, ...extra, client: getClientId() });
-    reflect(fileId, { text: `Recorded ${KIND_WORD[kind]}: ${r.text}${r.period ? ` (period ${r.period})` : ''}`, record: r });
+    const tail = r.kind === 'expectation' ? ` (by ${r.due ?? 'no date'}${r.source ? ` in ${r.source}` : ''})` : r.kind === 'decision' && r.conditions?.length ? ` — reconsider if: ${r.conditions.map((c) => c.text).join('; ')}` : r.bearing ? ` — bears on: ${r.bearing}` : r.period ? ` (period ${r.period})` : '';
+    reflect(fileId, { text: `Recorded ${r.private ? 'private ' : ''}${KIND_WORD[kind]}: ${r.text}${tail}`, record: r });
     void loadCompanion(fileId);
     return r;
   } catch (e) {
@@ -70,22 +71,85 @@ export async function remember(kind: RecordKind, text: string, extra: { source?:
 
 /** Chat prefixes that are statements to keep, not questions: no model call needed. */
 const PREFIXES: [RegExp, RecordKind][] = [
-  [/^(objective|goal|constraint)\s*:\s*/i, 'objective'],
-  [/^(exclude|exclusion)\s*:\s*/i, 'exclusion'],
+  [/^(objective|goal)\s*:\s*/i, 'objective'],
+  [/^(constraint|within|keep)\s*:\s*/i, 'constraint'],
+  [/^(exclude|exclusion|leave out)\s*:\s*/i, 'exclusion'],
   [/^(decision|decided)\s*:\s*/i, 'decision'],
   [/^(remember|fact|note)\s*:\s*/i, 'fact'],
-  [/^(hypothesis|maybe)\s*:\s*/i, 'hypothesis'],
+  [/^(hypothesis|maybe|suspect)\s*:\s*/i, 'hypothesis'],
   [/^(contradiction|conflict)\s*:\s*/i, 'contradiction'],
+  [/^(question|open|unknown)\s*:\s*/i, 'question'],
+  [/^(expect|expected|expectation|due)\s*:\s*/i, 'expectation'],
 ];
-export function statementOf(text: string): { kind: RecordKind; text: string } | null {
-  for (const [re, kind] of PREFIXES) {
-    const m = re.exec(text.trim());
+export interface Statement {
+  kind: RecordKind;
+  text: string;
+  extra: Omit<RecordInput, 'kind' | 'text'>;
+}
+/**
+ * "Objective: release cash (review by 2026-12-01)" · "Decision: hold the Creta — because an order is expected; reconsider if the order lapses"
+ * · "Question: is the freight final? — bears on which vehicles to reprice" · "Expect: final freight invoice for SH-001 by 2026-10-20 in invoices"
+ * · "Private: hypothesis: …" keeps it out of what outside agents read.
+ */
+export function statementOf(input: string): Statement | null {
+  let text = input.trim();
+  const extra: Statement['extra'] = {};
+  const priv = /^private\s*:\s*/i.exec(text);
+  if (priv) {
+    text = text.slice(priv[0].length).trim();
+    extra.private = true;
+  }
+  let kind: RecordKind | null = null;
+  for (const [re, k] of PREFIXES) {
+    const m = re.exec(text);
     if (m) {
-      const body = text.trim().slice(m[0].length).trim();
-      return body ? { kind, text: body } : null;
+      kind = k;
+      text = text.slice(m[0].length).trim();
+      break;
     }
   }
-  return null;
+  if (!kind) {
+    if (extra.private) kind = 'hypothesis';
+    else return null;
+  }
+  const review = /\s*\(\s*review by\s+(\d{4}-\d{2}-\d{2})\s*\)\s*$/i.exec(text);
+  if (review) {
+    extra.reviewBy = review[1];
+    text = text.slice(0, review.index).trim();
+  }
+  if (kind === 'decision') {
+    const m = /^(.*?)\s+[—-]+\s*because\s+(.+?)(?:\s*;\s*reconsider if\s+(.+))?$/i.exec(text) ?? /^(.*?)\s*;\s*reconsider if\s+(.+)$/i.exec(text);
+    if (m && m.length === 4) {
+      text = m[1].trim();
+      extra.why = m[2].trim();
+      if (m[3]) extra.conditions = m[3].split(/\s*;\s*/).filter(Boolean);
+    } else if (m) {
+      text = m[1].trim();
+      extra.conditions = m[2].split(/\s*;\s*/).filter(Boolean);
+    }
+  }
+  if (kind === 'question' || kind === 'contradiction' || kind === 'hypothesis') {
+    const m = /^(.*?)\s+[—-]+\s*(?:bears on|depends|it decides|decides)\s*:?\s*(.+)$/i.exec(text);
+    if (m) {
+      text = m[1].trim();
+      extra.bearing = m[2].trim();
+    }
+  }
+  if (kind === 'expectation') {
+    const by = /\s+by\s+(\d{4}-\d{2}-\d{2})\b/i.exec(text);
+    if (by) {
+      extra.due = by[1];
+      text = (text.slice(0, by.index) + text.slice(by.index + by[0].length)).trim();
+    }
+    const src = /\s+in\s+([A-Za-z_][\w ]*?)\s*$/i.exec(text);
+    if (src) {
+      extra.source = src[1].trim();
+      text = text.slice(0, src.index).trim();
+    }
+    const match = /\b([A-Z]{1,4}-?\d{2,}[A-Z0-9-]*)\b/.exec(text);
+    if (match) extra.match = match[1];
+  }
+  return text ? { kind, text, extra } : null;
 }
 
 /** After an import: the file is a source of the table — a snapshot, with the period read from the file name when it carries one. */
@@ -100,7 +164,7 @@ export async function recordImport(fileName: string, table: number, tableName: s
   const family = familyOf(fileName);
   try {
     const r = await api.files.addRecord(fileId, { kind: 'source', text, source: family, period: opts.period, links: [{ table }], client: getClientId() });
-    reflect(fileId, { text: `${opts.replaced ? `${tableName} updated from ${fileName}` : `${fileName} linked to ${tableName}`}${opts.period ? ` — period ${opts.period}` : ' — period not set'}`, record: r });
+    reflect(fileId, { text: `${opts.replaced ? `${tableName} updated from ${fileName}` : `${fileName} linked to ${tableName}`}${opts.period ? ` — period ${opts.period}` : ' — period not set'}${r.derivative ? ' — looks like generated material: not counted as independent evidence' : ''}`, record: r });
     void loadCompanion(fileId);
   } catch {
     /* the import stands; the context is best-effort */
@@ -110,6 +174,19 @@ export async function recordImport(fileName: string, table: number, tableName: s
 /** One tap on a suggestion: an approved watch, nothing to write. */
 export async function acceptSuggestion(sg: Suggestion): Promise<Watch | null> {
   return addWatch(sg.def);
+}
+/** Set a suggestion aside with a reason; "not now" returns with the next snapshot. */
+export async function dismissSuggestion(sg: Suggestion, reason: Dismissed['reason']) {
+  const fileId = getState().fileId;
+  if (!fileId) return;
+  await api.files.dismissSuggestion(fileId, { id: sg.id, purpose: sg.purpose, reason, client: getClientId() });
+  void loadCompanion(fileId);
+}
+export async function restoreSuggestion(id: string) {
+  const fileId = getState().fileId;
+  if (!fileId) return;
+  await api.files.restoreSuggestion(fileId, id);
+  void loadCompanion(fileId);
 }
 
 export async function confirmRecord(r: ContextRecord) {
@@ -131,10 +208,25 @@ export async function removeRecord(r: ContextRecord) {
   clearReflection(fileId);
   void loadCompanion(fileId);
 }
-export async function correctRecord(r: ContextRecord, patch: { text?: string; period?: string; source?: string; kind?: RecordKind }) {
+export async function correctRecord(r: ContextRecord, patch: RecordPatch) {
   const fileId = getState().fileId;
   if (!fileId) return;
   await api.files.updateRecord(fileId, r.id, { ...patch, client: getClientId() });
+  void loadCompanion(fileId);
+}
+/** A question or a conflict settled: what was decided, and the record is resolved (its answer may become a fact). */
+export async function resolveRecord(r: ContextRecord, resolution: string, keepAsFact = false) {
+  const fileId = getState().fileId;
+  if (!fileId) return;
+  await api.files.updateRecord(fileId, r.id, { status: 'resolved', resolution, client: getClientId() });
+  if (keepAsFact && resolution.trim()) await api.files.addRecord(fileId, { kind: 'fact', text: resolution.trim(), source: `answer to: ${r.text.slice(0, 80)}`, client: getClientId() });
+  void loadCompanion(fileId);
+}
+/** What the person says about an expectation: it arrived (evidence elsewhere), or it did not happen. */
+export async function markExpectation(r: ContextRecord, state: 'met' | 'didnt' | 'open') {
+  const fileId = getState().fileId;
+  if (!fileId) return;
+  await api.files.updateRecord(fileId, r.id, { expected: state, client: getClientId() });
   void loadCompanion(fileId);
 }
 
@@ -182,4 +274,23 @@ export async function markSeen() {
   const fileId = getState().fileId;
   if (!fileId) return;
   await api.files.companionSeen(fileId);
+}
+
+/** A bounded investigation by the agent stack; the panel refreshes when the server says it finished. */
+export async function investigate(question?: string, issue?: string): Promise<Investigation | null> {
+  const fileId = getState().fileId;
+  if (!fileId) {
+    setStatus('Save the document first.', 6000);
+    return null;
+  }
+  try {
+    const inv = await api.files.investigate(fileId, { question, issue, client: getClientId() });
+    setStatus(`Investigating: ${inv.question.slice(0, 80)} — the agent proposes, it changes nothing`, 6000);
+    void loadCompanion(fileId);
+    return inv;
+  } catch (e) {
+    setStatus(`Could not start the investigation: ${(e as Error).message}`, 10000);
+    void loadCompanion(fileId);
+    return null;
+  }
 }

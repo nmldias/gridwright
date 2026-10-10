@@ -240,7 +240,7 @@ export function buildServer(who: Identity): McpServer {
     async ({ id }) => {
       try {
         visibleDoc(id, who);
-        return text({ ...contextForModel(id), openIssues: openIssues(id).map((i) => ({ id: i.id, summary: i.summary, evidence: i.evidence, uncertainty: i.uncertainty, next: i.next, revision: i.revision })), brief: companionBrief(id) });
+        return text({ ...contextForModel(id, { viewer: { login: who.login || undefined }, outside: true }), openIssues: openIssues(id).map((i) => ({ id: i.id, summary: i.summary, evidence: i.evidence, uncertainty: i.uncertainty, next: i.next, revision: i.revision })), brief: companionBrief(id) });
       } catch (e) {
         return fail(errorMessage(e));
       }
@@ -261,11 +261,11 @@ export function buildServer(who: Identity): McpServer {
   );
   server.registerTool(
     'remember',
-    { title: 'Propose a context record', description: 'File an objective, exclusion, fact (with source and period), hypothesis, contradiction or decision into the document\'s context. An agent\'s record is marked proposed until a person confirms it; it grants nothing.', inputSchema: { id: z.string(), kind: z.enum(RECORD_KINDS as [RecordKind, ...RecordKind[]]), text: z.string(), source: z.string().optional(), period: z.string().optional() } },
-    async ({ id, kind, text: t, source, period }) => {
+    { title: 'Propose a context record', description: 'File an objective, constraint, exclusion, fact (with source and period), hypothesis, contradiction (with what depends on resolving it), decision (with why and the conditions behind it), question (with what it bears on) or expectation (what should happen, by when, in which source, recognised by which text) into the document\'s context. An agent\'s record is marked proposed until a person confirms it; it grants nothing.', inputSchema: { id: z.string(), kind: z.enum(RECORD_KINDS as [RecordKind, ...RecordKind[]]), text: z.string(), source: z.string().optional(), period: z.string().optional(), bearing: z.string().optional(), due: z.string().optional(), match: z.string().optional(), why: z.string().optional(), conditions: z.array(z.string()).optional() } },
+    async ({ id, kind, text: t, source, period, bearing, due, match, why, conditions }) => {
       try {
         visibleDoc(id, who);
-        const r = addRecord(id, { id: 'mcp', name: who.name || 'agent', login: who.login || undefined }, 'agent', { kind, text: t, source, period });
+        const r = addRecord(id, { id: 'mcp', name: who.name || 'agent', login: who.login || undefined }, 'agent', { kind, text: t, source, period, bearing, due, match, why, conditions });
         return text({ record: r.id, status: r.status, note: 'Proposed; a person confirms it in the Ask panel.' });
       } catch (e) {
         return fail(errorMessage(e));

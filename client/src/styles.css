@@ -1597,3 +1597,113 @@ details.evidence > div {
 .suggestion .small button {
   min-height: 0;
 }
+
+/* ---- the situation: the understanding at the top of Ask, element by element ---- */
+.situation {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: var(--ui-small);
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+}
+.situation-line {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+.situation-k {
+  flex: 0 0 86px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.situation-line .link {
+  margin-left: 4px;
+}
+.next-move {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  font-size: var(--ui-small);
+}
+.next-move .brief-h {
+  margin: 0;
+  flex: 0 0 auto;
+}
+.next-move .next-text {
+  flex: 1 1 200px;
+}
+.next-move button {
+  min-height: 26px;
+  padding: 2px 9px;
+}
+.companion.stance-question .companion-lead {
+  color: #0c447c;
+}
+.companion.stance-observation .companion-lead {
+  color: var(--accent);
+}
+.condition.fails {
+  color: var(--amber);
+}
+.condition.holds {
+  color: var(--green);
+}
+.ctx-item.revisit {
+  background: var(--amber-soft);
+  padding: 4px 6px;
+  border-radius: 4px;
+}
+.ctx-item.observed {
+  border-left: 3px solid #85b7eb;
+  padding-left: 6px;
+}
+.ctx-item.expectation .badge.amber,
+.revisit-note {
+  color: var(--amber);
+}
+.conditions {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.badge.red {
+  background: #fde8e8;
+  color: #993c1d;
+}
+.investigations {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.investigation {
+  border: 1px solid var(--border);
+  border-left: 3px solid #7c3aed;
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.investigation.done {
+  border-left-color: var(--green);
+}
+.investigation.failed {
+  border-left-color: #993c1d;
+}
+.investigation.stale {
+  border-left-color: var(--amber);
+}
+.investigation .steps code {
+  font-size: 11.5px;
+}
+.conditions > button.link,
+.companion-section > button.link {
+  align-self: flex-start;
+}

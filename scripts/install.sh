@@ -18,6 +18,10 @@
 #                      python3 is used as it is. For GPU cells install RAPIDS into that venv:
 #                      ~/gridwright-data/pyenv/bin/pip install --extra-index-url=https://pypi.nvidia.com "cudf-cu13"
 #                      (pick the cuXX that matches `nvidia-smi`; see rapids.ai/start).
+#   --companion        install the companion's investigation stack (LangChain, DeepAgents, LangGraph,
+#                      SQLite checkpoints) into the --python venv (created if missing), so *Investigate*
+#                      in Ask works; the stack runs as a separate process and calls the server back over
+#                      the loopback interface with a short-lived token for the requesting person.
 #   --sandbox          strongest isolation for server-side Python cells: installs bubblewrap and, on
 #                      Ubuntu ≥ 23.10 (DGX OS included), an AppArmor profile that lets it create user
 #                      namespaces — without it those kernels confine the namespace and cells run as a
@@ -53,12 +57,14 @@ TAILSCALE=0
 PYODIDE=0
 PYVENV=0
 SANDBOX=0
+COMPANION=0
 BACKUP=1
 for a in "$@"; do
   case "$a" in
     --tailscale) TAILSCALE=1 ;;
     --pyodide) PYODIDE=1 ;;
     --python) PYVENV=1 ;;
+    --companion) PYVENV=1; COMPANION=1 ;;
     --sandbox) SANDBOX=1 ;;
     --no-backup) BACKUP=0 ;;
     -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
@@ -139,6 +145,11 @@ if [ "$PYVENV" = 1 ]; then
   # no --upgrade: an existing numpy/pandas stays as it is, because cuDF's numba pins numpy and a blind upgrade breaks the GPU path
   "$DATA/pyenv/bin/pip" install -q pandas numpy matplotlib openpyxl || die "pip install failed (is the internet reachable?)"
   say "venv ready: $("$DATA/pyenv/bin/python" --version) with pandas $("$DATA/pyenv/bin/python" -c 'import pandas; print(pandas.__version__)')"
+  if [ "${COMPANION:-0}" = 1 ]; then
+    say "installing the companion's investigation stack into the venv (LangChain, DeepAgents, LangGraph)"
+    "$DATA/pyenv/bin/pip" install -q -r "$ROOT/integrations/companion/requirements.txt" || die "pip install of the investigation stack failed (is the internet reachable?)"
+    say "investigation stack: $("$DATA/pyenv/bin/python" "$ROOT/integrations/companion/investigate.py" --probe)"
+  fi
 fi
 if [ "$SANDBOX" = 1 ]; then
   command -v sudo >/dev/null 2>&1 || die "--sandbox needs sudo"

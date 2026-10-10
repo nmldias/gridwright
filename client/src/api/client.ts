@@ -93,8 +93,15 @@ export interface Proposal {
 }
 
 // --- the companion ---------------------------------------------------------------------------
-export type RecordKind = 'fact' | 'source' | 'objective' | 'hypothesis' | 'contradiction' | 'decision' | 'exclusion';
-export const RECORD_KINDS: RecordKind[] = ['objective', 'exclusion', 'decision', 'fact', 'source', 'hypothesis', 'contradiction'];
+export type RecordKind = 'fact' | 'source' | 'objective' | 'constraint' | 'hypothesis' | 'contradiction' | 'decision' | 'exclusion' | 'question' | 'expectation';
+export const RECORD_KINDS: RecordKind[] = ['objective', 'constraint', 'exclusion', 'decision', 'question', 'expectation', 'contradiction', 'hypothesis', 'fact', 'source'];
+export type RecordStatus = 'stated' | 'proposed' | 'confirmed' | 'observed' | 'resolved' | 'retired' | 'superseded';
+export interface Condition {
+  text: string;
+  watch?: string;
+  holds?: boolean;
+  since?: string;
+}
 export interface ContextRecord {
   id: string;
   kind: RecordKind;
@@ -104,9 +111,53 @@ export interface ContextRecord {
   arrivedAt: string;
   by: { id: string; name: string; login?: string };
   origin: 'user' | 'agent' | 'system';
-  status: 'stated' | 'proposed' | 'confirmed' | 'retired' | 'superseded';
+  status: RecordStatus;
   supersededBy?: string;
   links?: { table?: number; ref?: string }[];
+  bearing?: string;
+  due?: string;
+  match?: string;
+  expected?: { state: 'open' | 'met' | 'missing' | 'unchecked' | 'didnt'; text: string; at: string };
+  reviewBy?: string;
+  why?: string;
+  conditions?: Condition[];
+  revisit?: { at: string; condition: string; summary: string };
+  private?: boolean;
+  derivative?: boolean;
+  resolution?: string;
+  key?: string;
+}
+export interface RecordInput {
+  kind: RecordKind;
+  text: string;
+  source?: string;
+  period?: string;
+  links?: { table?: number; ref?: string }[];
+  bearing?: string;
+  due?: string;
+  match?: string;
+  reviewBy?: string;
+  why?: string;
+  conditions?: (Condition | string)[];
+  private?: boolean;
+  derivative?: boolean;
+}
+export interface RecordPatch {
+  text?: string;
+  status?: 'confirmed' | 'retired' | 'stated' | 'resolved';
+  period?: string;
+  source?: string;
+  kind?: RecordKind;
+  bearing?: string;
+  due?: string;
+  match?: string;
+  reviewBy?: string;
+  why?: string;
+  conditions?: (Condition | string)[];
+  private?: boolean;
+  derivative?: boolean;
+  resolution?: string;
+  expected?: 'met' | 'didnt' | 'open';
 }
 export interface WatchDef {
   purpose: string;
@@ -121,12 +172,14 @@ export interface WatchDef {
   response: 'note' | 'brief' | 'case';
   sources?: string[];
   freshnessHours?: number;
+  complement?: string;
 }
 export interface Observation {
   at: string;
   seq: number;
   period?: string;
   value: number | boolean | string | null;
+  complement?: number | null;
   error?: string;
   breach: boolean;
   fresh: boolean;
@@ -161,6 +214,7 @@ export interface Watch {
   observations: Observation[];
   issue?: Issue;
   history: Issue[];
+  recurrenceRaised?: number;
 }
 export interface CompanionEvent {
   at: string;
@@ -176,12 +230,81 @@ export interface SourceStatus {
   supply: 'import' | 'live' | 'manual' | 'unknown';
   rows: number;
 }
+export type Stance = 'quiet' | 'observation' | 'question' | 'decision';
 export interface Brief {
   changed: string[];
   matters: string[];
   next: string[];
   health: { checked?: string; ok: number; baseline: number; attention: number; stale: number; error: number; unchecked: number; proposed: number };
   sources: SourceStatus[];
+  stance: Stance;
+  lead: string;
+  statement: string;
+}
+export interface Uncertainty {
+  kind: 'question' | 'contradiction' | 'expectation' | 'review' | 'provisional' | 'stale' | 'hypothesis' | 'proposed';
+  text: string;
+  bearing?: string;
+  record?: string;
+  watch?: string;
+  rank: number;
+}
+export interface Investigation {
+  id: string;
+  question: string;
+  issue?: string;
+  thread: string;
+  startedAt: string;
+  finishedAt?: string;
+  status: 'running' | 'done' | 'failed';
+  answer?: string;
+  model?: string;
+  error?: string;
+  steps: { tool: string; summary: string }[];
+  runs: string[];
+  records: string[];
+  proposals: string[];
+  by: { id: string; name: string; login?: string };
+  assumptionsSeq: number;
+  stale?: boolean;
+}
+export interface CodeRun {
+  id: string;
+  at: string;
+  by: string;
+  purpose: string;
+  codeHash: string;
+  ok: boolean;
+  ms: number;
+  sandbox: string;
+  error?: string;
+  output?: string;
+  assumptionsSeq: number;
+  investigation?: string;
+}
+export interface Dismissed {
+  id: string;
+  purpose: string;
+  reason: 'not now' | 'not relevant' | 'incorrect';
+  at: string;
+  by: string;
+  period?: string;
+}
+export interface Understanding {
+  objective?: ContextRecord;
+  constraints: ContextRecord[];
+  exclusions: ContextRecord[];
+  coverage: { name: string; period?: string; rows: number; supply: SourceStatus['supply']; lastChange?: string; derivative?: boolean }[];
+  decisions: { record: ContextRecord; conditions: (Condition & { purpose?: string })[]; revisit?: ContextRecord['revisit'] }[];
+  expectations: ContextRecord[];
+  uncertain: Uncertainty[];
+  stance: Stance;
+  lead: string;
+  next: string;
+  statement: string;
+  attention: number;
+  assumptionsSeq: number;
+  investigations: Investigation[];
 }
 export interface GraphNode {
   id: string;
@@ -214,6 +337,11 @@ export interface Companion {
   brief: Brief;
   seenAt?: string;
   graph: { nodes: GraphNode[]; edges: GraphEdge[] };
+  understanding: Understanding;
+  dismissed: Dismissed[];
+  runs: CodeRun[];
+  investigations: Investigation[];
+  assumptionsSeq: number;
 }
 
 export type ToolEvent =
@@ -267,7 +395,7 @@ export class ProposalConflictError extends Error {
 }
 
 export const api = {
-  async health(): Promise<{ ok: boolean; version: string; multiplayer: boolean; pyodide?: boolean; identity?: boolean; python?: ServerPython | null }> {
+  async health(): Promise<{ ok: boolean; version: string; multiplayer: boolean; pyodide?: boolean; identity?: boolean; python?: ServerPython | null; investigation?: boolean }> {
     return j(await fetch('/api/health'));
   },
   python: {
@@ -284,6 +412,9 @@ export const api = {
   },
   async me(): Promise<{ login: string; name: string; role: 'admin' | 'editor' | 'viewer'; identity: boolean }> {
     return j(await fetch('/api/me'));
+  },
+  async investigationStack(): Promise<{ available: boolean; python: string; reason?: string; versions?: Record<string, string> }> {
+    return j(await fetch('/api/investigation'));
   },
   files: {
     async list(): Promise<FileInfo[]> {
@@ -327,8 +458,24 @@ export const api = {
     async companion(id: string): Promise<Companion> {
       return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion`));
     },
-    async suggestions(id: string): Promise<Suggestion[]> {
-      return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/suggest`));
+    async suggestions(id: string, all = false): Promise<Suggestion[]> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/suggest${all ? '?all=1' : ''}`));
+    },
+    async dismissSuggestion(id: string, body: { id: string; purpose: string; reason: Dismissed['reason']; client?: string }): Promise<Dismissed> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/suggest/dismiss`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));
+    },
+    async restoreSuggestion(id: string, sid: string): Promise<{ ok: boolean }> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/suggest/restore`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: sid }) }));
+    },
+    async understanding(id: string): Promise<Understanding> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/understanding`));
+    },
+    /** a bounded investigation by the LangChain + DeepAgents + LangGraph stack; returns at once, the result lands on the record */
+    async investigate(id: string, body: { question?: string; issue?: string; client?: string }): Promise<Investigation> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/investigate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));
+    },
+    async investigation(id: string, iid: string): Promise<Investigation> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/investigations/${encodeURIComponent(iid)}`));
     },
     async companionSeen(id: string): Promise<void> {
       await fetch(`/api/files/${encodeURIComponent(id)}/companion/seen`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
@@ -336,10 +483,10 @@ export const api = {
     async companionCheck(id: string): Promise<Companion & { attention: number; changed: boolean }> {
       return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/check`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }));
     },
-    async addRecord(id: string, body: { kind: RecordKind; text: string; source?: string; period?: string; links?: { table?: number; ref?: string }[]; client?: string }): Promise<ContextRecord> {
+    async addRecord(id: string, body: RecordInput & { client?: string }): Promise<ContextRecord> {
       return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/records`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));
     },
-    async updateRecord(id: string, rid: string, body: { text?: string; status?: 'confirmed' | 'retired' | 'stated'; period?: string; source?: string; kind?: RecordKind; client?: string }): Promise<ContextRecord> {
+    async updateRecord(id: string, rid: string, body: RecordPatch & { client?: string }): Promise<ContextRecord> {
       return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion/records/${encodeURIComponent(rid)}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));
     },
     async removeRecord(id: string, rid: string): Promise<void> {

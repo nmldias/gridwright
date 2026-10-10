@@ -1,0 +1,10 @@
+# The companion's investigation stack: LangChain (model + tools), DeepAgents (the agent harness),
+# LangGraph (the cycle and the durable thread), SQLite checkpoints. Install into the interpreter the
+# server starts investigations with (GRIDWRIGHT_AGENT_PYTHON, else the data-directory venv, else python3):
+#   pip install -r integrations/companion/requirements.txt
+langchain>=1.0
+langchain-core>=1.0
+langchain-openai>=1.0
+deepagents>=0.7
+langgraph>=1.0
+langgraph-checkpoint-sqlite>=3.0
