@@ -242,6 +242,31 @@ def main():
         close.click()
         time.sleep(0.2)
         check("closing from inside the panel works on a phone", pg.evaluate("() => window.__gw.getState().panel") == "none", "")
+        # the cell menu on a phone: a long press opens it as a sheet that fits the screen and scrolls — every item reachable, none under the canvas
+        pg.evaluate("() => window.__gw.getState().set({ start: false })")
+        pg.evaluate("""() => {
+          const host = document.querySelector('.canvas-host');
+          const r = host.getBoundingClientRect();
+          const x = r.left + 120, y = r.top + 160;
+          host.dispatchEvent(new PointerEvent('pointerdown', { pointerType: 'touch', pointerId: 7, isPrimary: true, clientX: x, clientY: y, bubbles: true, cancelable: true, button: 0, buttons: 1 }));
+          window.__gw_press = { host, x, y };
+        }""")
+        time.sleep(0.8)
+        pg.evaluate("() => { const { host, x, y } = window.__gw_press; host.dispatchEvent(new PointerEvent('pointerup', { pointerType: 'touch', pointerId: 7, isPrimary: true, clientX: x, clientY: y, bubbles: true, cancelable: true, button: 0, buttons: 0 })); }")
+        pg.wait_for_selector(".context-menu", timeout=5000)
+        sheet = pg.evaluate("""() => {
+          const m = document.querySelector('.context-menu');
+          const r = m.getBoundingClientRect();
+          const items = [...m.querySelectorAll('.menu-item')];
+          m.scrollTop = m.scrollHeight;
+          const last = items[items.length - 1].getBoundingClientRect();
+          return { top: r.top, bottom: r.bottom, innerHeight: window.innerHeight, items: items.length, scrolls: m.scrollHeight > m.clientHeight, lastReachable: last.bottom <= window.innerHeight + 1 && last.top >= r.top - 1, itemHeight: Math.min(...items.map((b) => b.getBoundingClientRect().height)) };
+        }""")
+        check("the cell menu on a phone is a sheet that fits the screen and scrolls: the last of its items is reachable, each at least 44 px", sheet["bottom"] <= sheet["innerHeight"] + 1 and sheet["top"] >= 0 and sheet["scrolls"] and sheet["lastReachable"] and sheet["itemHeight"] >= 44, str(sheet))
+        pg.screenshot(path=f"{OUT}/ui-03-phone-cell-menu.png")
+        pg.tap(".context-menu .menu-item:has-text('Copy')")
+        time.sleep(0.3)
+        check("tapping an item on the sheet acts and closes it", pg.locator(".context-menu").count() == 0, "")
         ctx.close()
         browser.close()
     check("no uncaught errors in the page", not errors, "; ".join(errors[:2])[:160])

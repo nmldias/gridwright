@@ -1610,7 +1610,12 @@ impl Engine {
                         continue;
                     }
                     if let Some(c) = t.cells.get(&CellKey::new(row + i, col + j)) {
-                        if !c.is_blank() && c.spill_from != Some(CellKey::new(row, col)) {
+                        // a cell blocks a spill when it holds something of its own: an input, a value that is not ours,
+                        // or another formula's spill — a format alone (a number format set on an empty range, as a
+                        // template or an import does ahead of the values) is not an occupant
+                        let ours = c.spill_from == Some(CellKey::new(row, col));
+                        let occupied = !c.input.is_empty() || (c.spill_from.is_some() && !ours) || (c.spill_from.is_none() && !c.value.is_empty());
+                        if occupied {
                             blocked = true;
                         }
                     }
@@ -2679,6 +2684,45 @@ mod tests {
         let e2 = Engine::new(wb2);
         assert_eq!(val(&e2, 1, 5, 2), Value::Number(3.0));
         assert_eq!(e2.wb.table(1).unwrap().name, "Data");
+    }
+
+    #[test]
+    fn a_format_alone_does_not_block_a_spill_even_after_a_round_trip() {
+        let mut e = engine();
+        for (i, v) in ["1", "2", "3", "4"].iter().enumerate() {
+            set(&mut e, 1, i as u32, 0, v);
+        }
+        // the range a formula will spill into is formatted first, as the ageing template does
+        e.apply(Op::SetFormat {
+            table: 1,
+            r0: 0,
+            c0: 1,
+            r1: 3,
+            c1: 1,
+            format: Format {
+                number_format: Some("#,##0".into()),
+                ..Default::default()
+            },
+        });
+        set(&mut e, 1, 0, 1, "=A1:A4*10");
+        assert_eq!(val(&e, 1, 3, 1), Value::Number(40.0));
+        assert_eq!(e.wb.cell(CellRef::new(1, 3, 1)).unwrap().format.number_format.as_deref(), Some("#,##0"));
+        // saved and opened again: the spilled cells come back as formatted empties, and the spill is re-established, not blocked
+        let json = serde_json::to_string(&e.wb).unwrap();
+        let wb: Workbook = serde_json::from_str(&json).unwrap();
+        let e2 = Engine::new(wb);
+        assert_eq!(val(&e2, 1, 0, 1), Value::Number(10.0));
+        assert_eq!(val(&e2, 1, 3, 1), Value::Number(40.0));
+        assert_eq!(e2.wb.cell(CellRef::new(1, 0, 1)).unwrap().spill_size, Some((4, 1)));
+        // a value of its own in the way still blocks, and clearing it restores the spill
+        let mut e3 = e2;
+        assert!(set(&mut e3, 1, 2, 1, "x").error.is_some()); // spilled cells are read-only while the spill stands
+        set(&mut e3, 1, 0, 1, "=A1*10");
+        set(&mut e3, 1, 2, 1, "x");
+        set(&mut e3, 1, 0, 1, "=A1:A4*10");
+        assert_eq!(val(&e3, 1, 0, 1), Value::Error(ErrorKind::Spill));
+        set(&mut e3, 1, 2, 1, "");
+        assert_eq!(val(&e3, 1, 3, 1), Value::Number(40.0));
     }
 
     #[test]

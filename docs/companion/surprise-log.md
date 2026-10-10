@@ -54,6 +54,9 @@ Every file is invented; `README.md` in the folder says so. `expected.py` compute
 16. **A SQL snapshot's name carried the date**, so the period came from the name (the day of the query), never from a date column. Fixed: the name is the table the query reads; the period comes from the data or, failing that, the arrival.
 17. **The conversation was in memory**, not in browser storage as an earlier note said — a reload lost it. Now owned by the server per document and person.
 
+18. **A dynamic-array spill into a pre-formatted range showed `#SPILL!` after every reload** (reported from Spark 1: the AP ageing template's second table). The engine counted a cell holding only a number format as an occupant; live, the template formatted the range after the spill, so it only surfaced once the document was saved and opened again — in the browser and in the server's own replay alike. Fixed in the engine (a format alone is not an occupant; an input, a foreign value or another formula's spill is), with a unit test that round-trips through JSON and an end-to-end check. (`features2.py` templates)
+19. **The cell menu on a phone ran off the screen** (reported from Spark 1): 29 items at touch size made it 1,340 px tall from where the finger was, so most of it sat below the viewport, unreachable — "hidden by the canvas". Now a sheet from the bottom that fits the screen and scrolls, items 44 px; dropdown menus are capped to the screen height too. (`interface.py` phone)
+
 ## Assumptions that still need checking (not reproduced as defects)
 
 - The header-row heuristic (first row, mostly distinct text) on exports whose first rows are a title block; such files would need the title rows quarantined — untested.

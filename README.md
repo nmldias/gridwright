@@ -216,7 +216,7 @@ Measured in headless Chromium with software WebGL (SwiftShader): filling a 5 000
 ## Tests
 
 ```bash
-cd core && cargo test                                   # engine: 37 tests (incl. a check that every listed function resolves)
+cd core && cargo test                                   # engine: 38 tests (incl. a check that every listed function resolves)
 python3 e2e/smoke.py http://localhost:8787 --python     # editing, handles, code cells, save/open (22 checks)
 node e2e/mock-llm.mjs &                                 # mock model for the assistant (also plays a tool round)
 python3 e2e/features.py http://localhost:8787 --pg host:port:db:user:pass --mock-llm http://127.0.0.1:8899/v1
@@ -224,7 +224,8 @@ python3 e2e/features.py http://localhost:8787 --pg host:port:db:user:pass --mock
                                                         # AI diff, convergence, touch (40 checks)
 python3 e2e/features2.py http://localhost:8787 --pg … --mock-llm … --acl http://127.0.0.1:8795
                                                         # charts, sign-offs, CHECK/FX/RECONCILE/AGEING, trace, merges,
-                                                        # undo as ops, OT, audit CSV, AI tools, templates, sharing (44 checks)
+                                                        # undo as ops, OT, audit CSV, AI tools, templates (the AGEING spill surviving
+                                                        # a save, a reload and the server's replay), sharing (45 checks)
 python3 e2e/features3.py http://localhost:8787 --pg … --acl http://127.0.0.1:8795
                                                         # SQL policy (refusals, read-only session, limits, timeout, allow-list),
                                                         # run records, MCP tools, proposals end to end, private by default (32 checks)
@@ -239,7 +240,7 @@ python3 e2e/interface.py http://localhost:8787 --acl http://127.0.0.1:8795
                                                         # interaction quality: drafts survive panel changes, numeric overflow, document
                                                         # menu and start choices, Review wording, navigator and fit, keyboard menus,
                                                         # a reader's bar, a per-person conversation on a shared document, the phone
-                                                        # layout (35 checks)
+                                                        # layout and the cell menu as a scrolling sheet on a phone (37 checks)
 python3 e2e/companion.py http://localhost:8787 --mock-llm http://127.0.0.1:8899/v1
                                                         # the companion: three weekly files → series table, periods from the names,
                                                         # one-tap suggestions, worsening raised only when sustained, one evolving

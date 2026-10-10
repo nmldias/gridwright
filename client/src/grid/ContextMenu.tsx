@@ -77,7 +77,7 @@ export function ContextMenu({ host }: { host: HTMLElement | null }) {
   const left = Math.min(menu.x, window.innerWidth - 230);
   const top = Math.min(menu.y, window.innerHeight - 420);
   return (
-    <div className="context-menu" style={{ left, top }} onContextMenu={(e) => e.preventDefault()}>
+    <div className="context-menu" style={{ left, top }} onContextMenu={(e) => e.preventDefault()} onPointerDown={(e) => e.stopPropagation()}>
       {sel && tableId !== null && (
         <>
           {item('Cut', () => void copySelection(true))}
