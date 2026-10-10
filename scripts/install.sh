@@ -1,0 +1,597 @@
+#!/usr/bin/env bash
+# One-shot install of the prebuilt Gridwright release on a Linux host (arm64 or x86_64),
+# without root: installs Node 22 into ~/.local if the host has no Node ≥ 22.13, installs the
+# server dependencies, registers a systemd *user* service (survives reboots), a nightly
+# backup timer, and optionally fronts the server with `tailscale serve` (HTTPS + identity).
+#
+#   tar -xzf gridwright.tar.gz && cd gridwright && scripts/install.sh [options]
+#
+# Options:
+#   --tailscale        serve over HTTPS on the tailnet via `tailscale serve`; the server then
+#                      binds to 127.0.0.1 and trusts Tailscale's identity headers (names, roles,
+#                      audit log). Needs `sudo tailscale set --operator=$USER` once, and HTTPS
+#                      certificates enabled in the Tailscale admin console (DNS → HTTPS Certificates).
+#   --pyodide          download the Pyodide 0.27.5 distribution (~300 MB) into the data directory
+#                      so Python cells work without internet access.
+#   --python           create a Python virtual environment in the data directory (pandas, numpy,
+#                      matplotlib, openpyxl) for server-side Python cells. Without it the host's
+#                      python3 is used as it is. For GPU cells install RAPIDS into that venv:
+#                      ~/gridwright-data/pyenv/bin/pip install --extra-index-url=https://pypi.nvidia.com "cudf-cu13"
+#                      (pick the cuXX that matches `nvidia-smi`; see rapids.ai/start).
+#   --companion        install the companion's investigation stack (LangChain, DeepAgents, LangGraph,
+#                      SQLite checkpoints, at the tested versions in integrations/companion/requirements.lock.txt)
+#                      into the --python venv (created if missing), so *Investigate*
+#                      in Ask works; the stack runs as a separate process and calls the server back over
+#                      the loopback interface with a short-lived token for the requesting person.
+#   --sandbox          strongest isolation for server-side Python cells: installs bubblewrap and, on
+#                      Ubuntu ≥ 23.10 (DGX OS included), an AppArmor profile that lets it create user
+#                      namespaces — without it those kernels confine the namespace and cells run as a
+#                      plain process. Uses sudo once; re-run the installer afterwards is not needed.
+#   --accounts         multi-tenant: people sign in with e-mail and password, and the server hosts
+#                      many clients, each with its own members, documents, connections, model
+#                      settings and inbox (GRIDWRIGHT_AUTH=accounts; see docs/multi-tenancy.md).
+#                      The first platform administrator is GW_ADMIN_EMAIL; a temporary password is
+#                      written to <data>/initial-admin.txt on the first start. GW_TOKEN is not used.
+#                      Combined with --tailscale, Tailscale only provides HTTPS; identity is the accounts'.
+#   --https[=DOMAIN]   serve over HTTPS on the public internet: installs Caddy (sudo, apt) in front with a
+#                      Let's Encrypt certificate for DOMAIN — by default <public-ip>.sslip.io, a name that
+#                      resolves to this machine without registering anything. The server then binds to
+#                      127.0.0.1 and trusts the forwarded headers of that local proxy only
+#                      (GRIDWRIGHT_TRUST_PROXY=1). Ports 80 and 443 must be open to the internet (80 for
+#                      the certificate and the redirect); with ufw active they are allowed and the plain
+#                      port is closed. Use it for any public address with --accounts: passwords and the
+#                      session cookie must not travel over plain HTTP.
+#   --system-user[=NAME]  run as a dedicated, unprivileged system account (default NAME: gridwright) instead
+#                      of your own user: the account has no shell, no sudo, no docker; the code is a root-owned,
+#                      read-only copy in /opt/NAME, the data lives in /var/lib/NAME/data (an existing
+#                      ~/gridwright-data, or GW_MIGRATE_FROM, is copied over once and left in place), backups in
+#                      /var/lib/NAME/backups, and the service is a hardened *system* unit (ProtectSystem=strict,
+#                      ProtectHome, NoNewPrivileges, no capabilities, private /tmp and /dev). A per-user service
+#                      on the same port or data is retired. Needs sudo. Recommended for any shared server.
+#   --no-backup        do not install the nightly backup timer.
+#
+# Install from a folder of its own (the release tarball, or `git clone -b release`): the service runs
+# that folder's server/dist, so switching branches or rebuilding in a development checkout would
+# change the live server.
+#
+# Environment:
+#   GW_PORT      listen port (default 8787)
+#   GW_DATA      data directory (default ~/gridwright-data; with --system-user /var/lib/NAME/data)
+#   GW_MIGRATE_FROM  with --system-user: the per-user data directory to copy over once (default ~/gridwright-data)
+#   GW_SERVICE   systemd unit name (default gridwright)
+#   GW_TOKEN     optional shared access token (empty = open to anyone who can reach the port)
+#   GW_ADMIN_EMAIL  the first platform administrator (with --accounts; default admin@gridwright.local)
+#   GW_ADMINS    comma-separated Tailscale logins allowed to manage connections/AI/backups (with --tailscale)
+#   GW_READONLY  comma-separated Tailscale logins that may only view (with --tailscale)
+#   GW_DEFAULT_SHARING  sharing level of new documents: none (private, default with --tailscale), view or edit
+#   GW_PYTHON           interpreter for server-side Python cells (default: the --python venv, else python3); "off" disables
+#   GW_PYTHON_SANDBOX   auto (default: bubblewrap → user namespace → none), bwrap, unshare, none, or require
+#                       (refuse to run cells without a namespace sandbox)
+#   GW_PYTHON_TIMEOUT_MS, GW_PYTHON_MEMORY_MB, GW_PYTHON_CONCURRENCY, GW_PYTHON_THREADS
+#                       per-run limits: wall clock (60000 ms), memory (default a quarter of RAM, at most half of
+#                       what is free at start), parallel runs (2), BLAS threads per run (4)
+#   GW_INBOX            one directory the companion lists on request as an inbound source for intake
+#                       (CSV, Excel, XML, JSON); nothing is watched, taken files move to its taken/ subfolder
+#   GW_INTAKE_MAX_MB    largest file intake accepts (default 25)
+#   GW_BACKUP_DIR    where nightly backups go (default ~/gridwright-backups, with --system-user /var/lib/NAME/backups; 14 kept)
+#   GW_BACKUP_TARGET optional rsync destination for the backups, e.g. nmldias@100.78.161.2:gridwright-backups/
+#   AI_BASE_URL, AI_MODEL, AI_API_KEY   defaults for the assistant (also editable in the UI)
+#
+# Re-running the script is safe: it updates the service and restarts it.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+ROOT="$(pwd)"
+PORT="${GW_PORT:-8787}"
+DATA="${GW_DATA:-$HOME/gridwright-data}"
+NODE_FALLBACK="v22.23.3"
+PYODIDE_VERSION="0.27.5"
+TAILSCALE=0
+PYODIDE=0
+PYVENV=0
+SANDBOX=0
+COMPANION=0
+BACKUP=1
+ACCOUNTS=0
+HTTPS=0
+HTTPS_DOMAIN=""
+SYSUSER=""
+SVC="${GW_SERVICE:-gridwright}"
+for a in "$@"; do
+  case "$a" in
+    --tailscale) TAILSCALE=1 ;;
+    --pyodide) PYODIDE=1 ;;
+    --python) PYVENV=1 ;;
+    --companion) PYVENV=1; COMPANION=1 ;;
+    --sandbox) SANDBOX=1 ;;
+    --no-backup) BACKUP=0 ;;
+    --accounts) ACCOUNTS=1 ;;
+    --https) HTTPS=1 ;;
+    --https=*) HTTPS=1; HTTPS_DOMAIN="${a#--https=}" ;;
+    --system-user) SYSUSER=gridwright ;;
+    --system-user=*) SYSUSER="${a#--system-user=}" ;;
+    -h|--help) sed -n '2,/^# Re-running/p' "$0"; exit 0 ;;
+    *) echo "unknown option: $a" >&2; exit 2 ;;
+  esac
+done
+
+say() { printf '\033[32m==>\033[0m %s\n' "$*"; }
+die() { printf '\033[31mERROR\033[0m %s\n' "$*" >&2; exit 1; }
+[[ "$SVC" =~ ^[A-Za-z0-9_.-]+$ ]] || die "GW_SERVICE: not a unit name: $SVC"
+as_svc() { "$@"; }   # runs a command as the service account (yourself, unless --system-user)
+RUN_ROOT="$ROOT"     # the folder the service runs from
+MIGRATED=0
+if [ -n "$SYSUSER" ]; then
+  [[ "$SYSUSER" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || die "--system-user: not a user name: $SYSUSER"
+  command -v sudo >/dev/null 2>&1 || die "--system-user needs sudo"
+  command -v systemctl >/dev/null 2>&1 || die "--system-user needs systemd"
+  SVC_HOME="/var/lib/$SYSUSER"
+  APP="/opt/$SYSUSER"
+  MIGRATE_FROM="${GW_MIGRATE_FROM:-$HOME/gridwright-data}"
+  DATA="${GW_DATA:-$SVC_HOME/data}"
+  case "$DATA" in /home/*|/root/*|/run/user/*) die "with --system-user the data directory must be outside /home, /root and /run/user (the service cannot see home folders): $DATA" ;; esac
+fi
+USER_UNIT="$HOME/.config/systemd/user/gridwright.service"
+user_unit_has() { [ -f "$USER_UNIT" ] && grep -qxF "Environment=$1" "$USER_UNIT"; }
+
+[ -f server/dist/index.js ] && [ -f client/dist/index.html ] || die "this is not the prebuilt release (server/dist or client/dist missing) — run scripts/build.sh first"
+[ -f server/engine/gridwright_core.js ] || echo "note: server/engine is missing, so the MCP server and proposals will be off (rebuild with scripts/build.sh or fetch a newer release)" >&2
+command -v curl >/dev/null 2>&1 || die "curl is required"
+if [ -z "$SYSUSER" ] && git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 && ! git -C "$ROOT" log -1 --format=%s 2>/dev/null | grep -q '^release: prebuilt'; then
+  echo "note: $ROOT is a development checkout — the service will run this folder's server/dist, so a branch" >&2
+  echo "      switch, pull or rebuild here changes the live server. For production install from a folder of its own:" >&2
+  echo "      git clone -b release https://github.com/nmldias/gridwright ~/gridwright-live && ~/gridwright-live/scripts/install.sh ..." >&2
+fi
+
+# --- Node ≥ 22.13 (node:sqlite, the companion's store, is unflagged from there) ----------------
+node_ok() { "$1" -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a>22||(a===22&&b>=13)?0:1)' 2>/dev/null; }
+NODE_BIN="$(command -v node 2>/dev/null || true)"
+if [ -z "$NODE_BIN" ] || ! node_ok "$NODE_BIN"; then
+  arch="$(uname -m)"
+  case "$arch" in aarch64|arm64) na=arm64 ;; x86_64|amd64) na=x64 ;; *) die "unsupported CPU: $arch" ;; esac
+  ver="$(curl -fsSL --max-time 30 https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt 2>/dev/null | grep -o "node-v22[0-9.]*-linux-$na.tar.xz" | head -1 | sed -E 's/node-(v[0-9.]+)-.*/\1/')"
+  ver="${ver:-$NODE_FALLBACK}"
+  dest="$HOME/.local/node-$ver"
+  if [ ! -x "$dest/bin/node" ]; then
+    say "no Node ≥ 22.13 on this host; installing Node $ver ($na) into $dest"
+    mkdir -p "$HOME/.local"
+    tmp="$(mktemp -d)"
+    curl -fsSL --max-time 600 "https://nodejs.org/dist/$ver/node-$ver-linux-$na.tar.xz" -o "$tmp/node.tar.xz"
+    tar -xJf "$tmp/node.tar.xz" -C "$tmp"
+    mv "$tmp/node-$ver-linux-$na" "$dest"
+    rm -rf "$tmp"
+  fi
+  NODE_BIN="$dest/bin/node"
+  export PATH="$dest/bin:$PATH"
+fi
+say "node $("$NODE_BIN" -v) at $NODE_BIN"
+
+# --- server dependencies (pure JavaScript: express, ws, pg, mysql2, mssql) --------------
+say "installing server dependencies"
+(cd server && npm ci --omit=dev --no-audit --no-fund --loglevel=error)
+# the data directory holds the encryption key, the accounts database and every client's documents:
+# only the service user may read it (the service also runs with UMask=0077 so new files stay private)
+if [ -n "$SYSUSER" ]; then
+  # --- a dedicated, unprivileged service account ------------------------------------------
+  if ! id -u "$SYSUSER" >/dev/null 2>&1; then
+    say "creating the system account $SYSUSER (no shell, no sudo)"
+    sudo useradd --system --user-group --home-dir "$SVC_HOME" --create-home --shell /usr/sbin/nologin --comment "Gridwright service" "$SYSUSER" || die "useradd $SYSUSER failed"
+  fi
+  extra="$(id -nG "$SYSUSER" | tr ' ' '\n' | grep -xE 'sudo|admin|wheel|docker|lxd|adm|disk|root|shadow' | tr '\n' ' ' || true)"
+  [ -z "$extra" ] || die "$SYSUSER is in privileged groups ($extra) — choose another name with --system-user=NAME"
+  sudo install -d -o "$SYSUSER" -g "$SYSUSER" -m 750 "$SVC_HOME"
+  as_svc() { (cd / && sudo -u "$SYSUSER" -H -- "$@"); }
+  # Node must be runnable by the account: a Node installed under your home is copied next to the code
+  case "$NODE_BIN" in
+    "$HOME"/*)
+      node_root="$(dirname "$(dirname "$NODE_BIN")")"
+      sudo rm -rf "/opt/$SYSUSER-node.new"
+      sudo cp -a "$node_root" "/opt/$SYSUSER-node.new" && sudo chown -R root:root "/opt/$SYSUSER-node.new" && sudo chmod -R u+rwX,go+rX,go-w "/opt/$SYSUSER-node.new"
+      sudo rm -rf "/opt/$SYSUSER-node" && sudo mv "/opt/$SYSUSER-node.new" "/opt/$SYSUSER-node"
+      NODE_BIN="/opt/$SYSUSER-node/bin/node" ;;
+  esac
+  as_svc "$NODE_BIN" -v >/dev/null 2>&1 || die "$SYSUSER cannot run $NODE_BIN"
+  # the code: a root-owned, read-only copy of this release (the account can run it, not change it)
+  if [ "$ROOT" != "$APP" ]; then
+    say "copying the release to $APP (root-owned, read-only for $SYSUSER)"
+    sudo rm -rf "$APP.new" && sudo mkdir -p "$APP.new" && sudo cp -a "$ROOT/." "$APP.new/" && sudo rm -rf "$APP.new/.git"
+    sudo chown -R root:root "$APP.new" && sudo chmod -R u+rwX,go+rX,go-w "$APP.new"
+    sudo rm -rf "$APP.old"
+    if [ -d "$APP" ]; then sudo mv "$APP" "$APP.old"; fi
+    sudo mv "$APP.new" "$APP" && sudo rm -rf "$APP.old"
+  fi
+  RUN_ROOT="$APP"
+  # the data: copied over once from a per-user install (the original stays until you delete it)
+  if ! sudo test -e "$DATA" && [ -d "$MIGRATE_FROM" ]; then
+    say "copying the existing data $MIGRATE_FROM → $DATA (the original is left in place)"
+    if user_unit_has "GRIDWRIGHT_DATA=$MIGRATE_FROM" && systemctl --user is-active --quiet gridwright.service 2>/dev/null; then
+      say "stopping the per-user service for a consistent copy"
+      systemctl --user stop gridwright.service
+    fi
+    sudo mkdir -p "$(dirname "$DATA")"
+    sudo cp -a "$MIGRATE_FROM" "$DATA"
+    sudo rm -f "$DATA/agent.sock" "$DATA/backup.sh" "$DATA/.bwrap-test.err" "$DATA/server.log"
+    # a venv may move, but its scripts carry the old path in their first line
+    if sudo test -d "$DATA/pyenv/bin"; then
+      sudo find "$DATA/pyenv/bin" -maxdepth 1 -type f -exec sed -i "1s|^#!$MIGRATE_FROM/pyenv/|#!$DATA/pyenv/|" {} +
+    fi
+    MIGRATED=1
+  fi
+  sudo install -d -o "$SYSUSER" -g "$SYSUSER" -m 700 "$DATA"
+  sudo chown -R "$SYSUSER:$SYSUSER" "$DATA"
+  sudo chmod -R go-rwx "$DATA"
+else
+  mkdir -p "$DATA"
+  chmod 700 "$DATA" 2>/dev/null || true
+  chmod -R go-rwx "$DATA" 2>/dev/null || true
+fi
+
+# --- optional: self-hosted Pyodide ----------------------------------------------------
+if [ "$PYODIDE" = 1 ]; then
+  if as_svc test -f "$DATA/pyodide/pyodide.mjs"; then
+    say "Pyodide already present in $DATA/pyodide"
+  else
+    say "downloading Pyodide $PYODIDE_VERSION (full distribution, this takes a while)"
+    tmp="$(mktemp -d)"
+    curl -fL --max-time 3600 --progress-bar "https://github.com/pyodide/pyodide/releases/download/$PYODIDE_VERSION/pyodide-$PYODIDE_VERSION.tar.bz2" -o "$tmp/pyodide.tar.bz2"
+    tar -xjf "$tmp/pyodide.tar.bz2" -C "$tmp"
+    if [ -n "$SYSUSER" ]; then
+      sudo rm -rf "$DATA/pyodide" && sudo mv "$tmp/pyodide" "$DATA/pyodide" && sudo chown -R "$SYSUSER:$SYSUSER" "$DATA/pyodide" && sudo chmod -R go-rwx "$DATA/pyodide"
+    else
+      rm -rf "$DATA/pyodide"
+      mv "$tmp/pyodide" "$DATA/pyodide"
+    fi
+    rm -rf "$tmp"
+    say "Pyodide installed: $(as_svc du -sh "$DATA/pyodide" | cut -f1) in $DATA/pyodide (served at /pyodide/)"
+  fi
+fi
+
+# --- optional: tailscale serve ------------------------------------------------------------
+HOST_BIND=0.0.0.0
+TRUST=0
+TRUST_PROXY=""
+if [ "$HTTPS" = 1 ]; then
+  [ "$TAILSCALE" = 1 ] && die "--https and --tailscale both terminate HTTPS; choose one"
+  command -v sudo >/dev/null 2>&1 || die "--https needs sudo (to install Caddy and bind ports 80/443)"
+  if [ -z "$HTTPS_DOMAIN" ]; then
+    pub="$(curl -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+    [[ "$pub" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "could not find this machine's public IPv4 address; pass --https=your.domain"
+    HTTPS_DOMAIN="${pub//./-}.sslip.io"
+  fi
+  [[ "$HTTPS_DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] || die "--https: not a domain name: $HTTPS_DOMAIN"
+  HOST_BIND=127.0.0.1
+  TRUST_PROXY=1
+fi
+if [ "$TAILSCALE" = 1 ]; then
+  command -v tailscale >/dev/null 2>&1 || die "tailscale is not installed on this host"
+  HOST_BIND=127.0.0.1
+  TRUST=1
+fi
+GW_AUTH=""
+if [ "$ACCOUNTS" = 1 ]; then
+  # identity comes from the accounts: Tailscale (if any) only terminates HTTPS, and the shared token is unused
+  GW_AUTH=accounts
+  TRUST=0
+  [ -n "${GW_TOKEN:-}" ] && echo "note: GW_TOKEN is not used with --accounts (people sign in instead)" >&2
+  GW_TOKEN=""
+fi
+
+# --- Python for server-side cells -----------------------------------------------------------
+if [ "$PYVENV" = 1 ]; then
+  command -v python3 >/dev/null 2>&1 || die "--python needs python3 on this host (sudo apt install python3 python3-venv)"
+  if as_svc test -x "$DATA/pyenv/bin/python"; then
+    say "Python venv already present in $DATA/pyenv (adding missing packages only — versions you installed, e.g. RAPIDS and the numpy it pins, are left alone)"
+  else
+    say "creating a Python venv in $DATA/pyenv"
+    as_svc python3 -m venv "$DATA/pyenv" || die "python3 -m venv failed (sudo apt install python3-venv)"
+  fi
+  as_svc "$DATA/pyenv/bin/python" -m pip install -q --upgrade pip >/dev/null 2>&1 || true
+  # no --upgrade: an existing numpy/pandas stays as it is, because cuDF's numba pins numpy and a blind upgrade breaks the GPU path
+  as_svc "$DATA/pyenv/bin/python" -m pip install -q pandas numpy matplotlib openpyxl || die "pip install failed (is the internet reachable?)"
+  say "venv ready: $(as_svc "$DATA/pyenv/bin/python" --version) with pandas $(as_svc "$DATA/pyenv/bin/python" -c 'import pandas; print(pandas.__version__)')"
+  if [ "${COMPANION:-0}" = 1 ]; then
+    say "installing the companion's investigation stack into the venv (LangChain, DeepAgents, LangGraph)"
+    as_svc "$DATA/pyenv/bin/python" -m pip install -q -r "$RUN_ROOT/integrations/companion/requirements.lock.txt" || die "pip install of the investigation stack failed (is the internet reachable?)"
+    say "investigation stack: $(as_svc "$DATA/pyenv/bin/python" "$RUN_ROOT/integrations/companion/investigate.py" --probe)"
+  fi
+fi
+if [ "$SANDBOX" = 1 ]; then
+  command -v sudo >/dev/null 2>&1 || die "--sandbox needs sudo"
+  if ! command -v bwrap >/dev/null 2>&1; then
+    say "installing bubblewrap (sudo)"
+    sudo apt-get install -y -qq bubblewrap >/dev/null || die "apt-get install bubblewrap failed"
+  fi
+  BWRAP_ERR="$(mktemp)"
+  bwrap_ok() { as_svc bwrap --ro-bind / / --tmpfs /tmp --proc /proc --dev /dev --unshare-all --die-with-parent true 2>"$BWRAP_ERR"; }
+  bwrap_err() { tail -n 1 "$BWRAP_ERR" 2>/dev/null; }
+  profile_text() {
+    printf 'abi <abi/4.0>,\ninclude <tunables/global>\n\n# Lets bubblewrap create user namespaces on kernels with apparmor_restrict_unprivileged_userns=1\n# (installed by gridwright/scripts/install.sh --sandbox). The sandbox itself is set up by bwrap.\nprofile bwrap %s flags=(unconfined) {\n  userns,\n\n  include if exists <local/bwrap>\n}\n' "$(command -v bwrap)"
+  }
+  if bwrap_ok; then
+    say "bubblewrap sandbox works"
+  elif [ ! -d /etc/apparmor.d ]; then
+    echo "warning: bubblewrap cannot set up its sandbox ($(bwrap_err)) and this host has no AppArmor; cells will fall back" >&2
+  elif [ -f /etc/apparmor.d/bwrap ] && ! grep -q gridwright /etc/apparmor.d/bwrap; then
+    echo "warning: bubblewrap cannot set up its sandbox ($(bwrap_err)) and /etc/apparmor.d/bwrap already exists (not Gridwright's):" >&2
+    sed 's/^/    /' /etc/apparmor.d/bwrap >&2
+    echo "  If that profile confines bwrap's children, move it aside and re-run:" >&2
+    echo "    sudo apparmor_parser -R /etc/apparmor.d/bwrap && sudo mv /etc/apparmor.d/bwrap /etc/apparmor.d/disable/ && scripts/install.sh --sandbox" >&2
+  else
+    say "bubblewrap cannot set up its sandbox ($(bwrap_err)); adding an AppArmor profile that lets it create user namespaces (sudo)"
+    profile_text | sudo tee /etc/apparmor.d/bwrap >/dev/null
+    sudo apparmor_parser -r -T -W /etc/apparmor.d/bwrap || die "apparmor_parser failed (is apparmor installed?)"
+    if bwrap_ok; then
+      say "bubblewrap sandbox works"
+    else
+      echo "warning: bubblewrap still cannot set up its sandbox: $(bwrap_err)" >&2
+      echo "  $(sysctl kernel.apparmor_restrict_unprivileged_userns kernel.apparmor_restrict_unprivileged_unconfined 2>&1 | tr '\n' ' ')" >&2
+      echo "  loaded profile: $(sudo aa-status 2>/dev/null | grep -c -i bwrap) match(es); kernel $(uname -r). Please report this output." >&2
+    fi
+  fi
+elif ! command -v bwrap >/dev/null 2>&1 || [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ] && [ ! -f /etc/apparmor.d/bwrap ]; then
+  echo "note: for the strongest isolation of server-side Python cells run the installer with --sandbox (bubblewrap + an AppArmor profile; needs sudo once)" >&2
+fi
+
+# --- run it: systemd user service when available, nohup otherwise --------------------------
+unit_env() {
+  cat <<EOF
+Environment=NODE_ENV=production
+Environment=PORT=$PORT
+Environment=HOST=$HOST_BIND
+Environment=GRIDWRIGHT_DATA=$DATA
+Environment=CLIENT_DIR=$RUN_ROOT/client/dist
+Environment=GRIDWRIGHT_TOKEN=${GW_TOKEN:-}
+Environment=GRIDWRIGHT_AUTH=$GW_AUTH
+Environment=GRIDWRIGHT_ADMIN_EMAIL=${GW_ADMIN_EMAIL:-}
+Environment=GRIDWRIGHT_TRUST_TAILSCALE=$TRUST
+Environment=GRIDWRIGHT_TRUST_PROXY=${TRUST_PROXY:-${GW_TRUST_PROXY:-}}
+Environment=GRIDWRIGHT_ADMINS=${GW_ADMINS:-}
+Environment=GRIDWRIGHT_READONLY=${GW_READONLY:-}
+Environment=GRIDWRIGHT_DEFAULT_SHARING=${GW_DEFAULT_SHARING:-}
+Environment=GRIDWRIGHT_PYTHON=${GW_PYTHON:-}
+Environment=GRIDWRIGHT_PYTHON_SANDBOX=${GW_PYTHON_SANDBOX:-}
+Environment=GRIDWRIGHT_PYTHON_TIMEOUT_MS=${GW_PYTHON_TIMEOUT_MS:-}
+Environment=GRIDWRIGHT_PYTHON_MEMORY_MB=${GW_PYTHON_MEMORY_MB:-}
+Environment=GRIDWRIGHT_PYTHON_CONCURRENCY=${GW_PYTHON_CONCURRENCY:-}
+Environment=GRIDWRIGHT_PYTHON_THREADS=${GW_PYTHON_THREADS:-}
+Environment=GRIDWRIGHT_INBOX=${GW_INBOX:-}
+Environment=GRIDWRIGHT_INTAKE_MAX_MB=${GW_INTAKE_MAX_MB:-}
+Environment=AI_BASE_URL=${AI_BASE_URL:-}
+Environment=AI_MODEL=${AI_MODEL:-}
+Environment=AI_API_KEY=${AI_API_KEY:-}
+EOF
+}
+
+start_nohup() {
+  pkill -f "$ROOT/server/dist/index.js" 2>/dev/null || true
+  (cd server && PORT="$PORT" HOST="$HOST_BIND" GRIDWRIGHT_DATA="$DATA" CLIENT_DIR="$ROOT/client/dist" \
+    GRIDWRIGHT_TOKEN="${GW_TOKEN:-}" GRIDWRIGHT_AUTH="$GW_AUTH" GRIDWRIGHT_ADMIN_EMAIL="${GW_ADMIN_EMAIL:-}" GRIDWRIGHT_TRUST_TAILSCALE="$TRUST" GRIDWRIGHT_TRUST_PROXY="${TRUST_PROXY:-${GW_TRUST_PROXY:-}}" GRIDWRIGHT_ADMINS="${GW_ADMINS:-}" GRIDWRIGHT_READONLY="${GW_READONLY:-}" GRIDWRIGHT_DEFAULT_SHARING="${GW_DEFAULT_SHARING:-}" \
+    GRIDWRIGHT_PYTHON="${GW_PYTHON:-}" GRIDWRIGHT_PYTHON_SANDBOX="${GW_PYTHON_SANDBOX:-}" GRIDWRIGHT_PYTHON_TIMEOUT_MS="${GW_PYTHON_TIMEOUT_MS:-}" GRIDWRIGHT_PYTHON_MEMORY_MB="${GW_PYTHON_MEMORY_MB:-}" GRIDWRIGHT_PYTHON_CONCURRENCY="${GW_PYTHON_CONCURRENCY:-}" GRIDWRIGHT_PYTHON_THREADS="${GW_PYTHON_THREADS:-}" \
+    GRIDWRIGHT_INBOX="${GW_INBOX:-}" GRIDWRIGHT_INTAKE_MAX_MB="${GW_INTAKE_MAX_MB:-}" \
+    AI_BASE_URL="${AI_BASE_URL:-}" AI_MODEL="${AI_MODEL:-}" AI_API_KEY="${AI_API_KEY:-}" \
+    umask 077 && setsid -f nohup "$NODE_BIN" "$ROOT/server/dist/index.js" > "$DATA/server.log" 2>&1 < /dev/null)
+  say "started with nohup (no systemd user session); log: $DATA/server.log"
+}
+
+# hardening for the system units (--system-user). Tested with bubblewrap running inside: ProtectKernelTunables,
+# ProtectKernelLogs and ProtectHostname make the sandbox's own /proc mount fail, RestrictNamespaces and
+# PrivateUsers would stop bubblewrap, MemoryDenyWriteExecute breaks Node's JIT — those stay off.
+harden() {
+  local dev="PrivateDevices=yes"
+  ls /dev/nvidia* >/dev/null 2>&1 && dev="# PrivateDevices off: GPU devices are present"
+  cat <<EOF
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=$*
+ProtectHome=yes
+PrivateTmp=yes
+$dev
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+EOF
+}
+
+HAVE_SYSTEMD=0
+SYSTEM_UNIT=0
+if [ -n "$SYSUSER" ]; then
+  HAVE_SYSTEMD=1
+  SYSTEM_UNIT=1
+  # a per-user install on the same port or data would fight over them: retire it (its data folder stays)
+  if user_unit_has "PORT=$PORT" || user_unit_has "GRIDWRIGHT_DATA=$MIGRATE_FROM"; then
+    systemctl --user disable --now gridwright.service gridwright-backup.timer >/dev/null 2>&1 || true
+    rm -f "$USER_UNIT" "$HOME/.config/systemd/user/gridwright-backup.service" "$HOME/.config/systemd/user/gridwright-backup.timer"
+    systemctl --user daemon-reload 2>/dev/null || true
+    say "retired the per-user service (systemctl --user gridwright) in favour of the system service"
+  fi
+  rw="$DATA"
+  [ -n "${GW_INBOX:-}" ] && rw="$rw $GW_INBOX"
+  {
+    printf '[Unit]\nDescription=Gridwright spreadsheet server\nWants=network-online.target\nAfter=network-online.target\n\n[Service]\nUser=%s\nGroup=%s\nWorkingDirectory=%s/server\n' "$SYSUSER" "$SYSUSER" "$RUN_ROOT"
+    unit_env
+    printf 'UMask=0077\nExecStart=%s %s/server/dist/index.js\nRestart=on-failure\nRestartSec=3\n' "$NODE_BIN" "$RUN_ROOT"
+    harden "$rw"
+    printf '\n[Install]\nWantedBy=multi-user.target\n'
+  } | sudo tee "/etc/systemd/system/$SVC.service" >/dev/null
+  sudo chmod 600 "/etc/systemd/system/$SVC.service"
+  sudo systemctl daemon-reload
+  sudo systemctl enable "$SVC.service" >/dev/null 2>&1
+  sudo systemctl restart "$SVC.service"
+  say "system service installed, running as $SYSUSER: sudo systemctl status $SVC · sudo journalctl -u $SVC -f"
+elif command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+  HAVE_SYSTEMD=1
+  unit_dir="$HOME/.config/systemd/user"
+  mkdir -p "$unit_dir"
+  {
+    printf '[Unit]\nDescription=Gridwright spreadsheet server\nAfter=network-online.target\n\n[Service]\nWorkingDirectory=%s/server\n' "$ROOT"
+    unit_env
+    printf 'UMask=0077\nExecStart=%s %s/server/dist/index.js\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n' "$NODE_BIN" "$ROOT"
+  } > "$unit_dir/gridwright.service"
+  systemctl --user daemon-reload
+  systemctl --user enable gridwright.service >/dev/null 2>&1
+  systemctl --user restart gridwright.service
+  say "systemd user service installed: systemctl --user status gridwright · journalctl --user -u gridwright -f"
+  if loginctl enable-linger "$USER" >/dev/null 2>&1; then
+    say "linger enabled: the service keeps running after logout and starts at boot"
+  else
+    say "to keep it running after logout / start at boot: sudo loginctl enable-linger $USER"
+  fi
+else
+  start_nohup
+fi
+
+# --- nightly backups ----------------------------------------------------------------------
+if [ "$BACKUP" = 1 ]; then
+  if [ -n "$SYSUSER" ]; then BACKUP_DIR="${GW_BACKUP_DIR:-$SVC_HOME/backups}"; else BACKUP_DIR="${GW_BACKUP_DIR:-$HOME/gridwright-backups}"; fi
+  # backups contain the encryption key: private to the service user
+  if [ -n "$SYSUSER" ]; then
+    sudo install -d -o "$SYSUSER" -g "$SYSUSER" -m 700 "$BACKUP_DIR"
+  else
+    mkdir -p "$BACKUP_DIR"
+    chmod 700 "$BACKUP_DIR" && chmod -R go-rwx "$BACKUP_DIR" 2>/dev/null || true
+  fi
+  backup_script() {
+  cat <<EOF
+#!/usr/bin/env bash
+# Nightly backup of the Gridwright data directory (documents, history, connections, settings).
+set -euo pipefail
+umask 077
+stamp="\$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BACKUP_DIR"
+tar -czf "$BACKUP_DIR/gridwright-\$stamp.tar.gz" -C "$DATA" --exclude=./pyodide --exclude=./pyenv --exclude=./pycache --exclude=./server.log --exclude=./backup.sh .
+ls -1t "$BACKUP_DIR"/gridwright-*.tar.gz 2>/dev/null | tail -n +15 | xargs -r rm -f
+${GW_BACKUP_TARGET:+rsync -a --delete "$BACKUP_DIR/" "$GW_BACKUP_TARGET" || echo "rsync to $GW_BACKUP_TARGET failed" >&2}
+echo "backup written: $BACKUP_DIR/gridwright-\$stamp.tar.gz"
+EOF
+  }
+  if [ -n "$SYSUSER" ]; then
+    backup_script | sudo tee "$DATA/backup.sh" >/dev/null
+    sudo chown "$SYSUSER:$SYSUSER" "$DATA/backup.sh" && sudo chmod 700 "$DATA/backup.sh"
+  else
+    backup_script > "$DATA/backup.sh"
+    chmod +x "$DATA/backup.sh"
+  fi
+  if [ "$SYSTEM_UNIT" = 1 ]; then
+    {
+      printf '[Unit]\nDescription=Gridwright nightly backup\n\n[Service]\nType=oneshot\nUser=%s\nGroup=%s\nUMask=0077\nExecStart=%s/backup.sh\n' "$SYSUSER" "$SYSUSER" "$DATA"
+      harden "$BACKUP_DIR"
+    } | sudo tee "/etc/systemd/system/$SVC-backup.service" >/dev/null
+    printf '[Unit]\nDescription=Gridwright nightly backup at 02:30\n\n[Timer]\nOnCalendar=*-*-* 02:30:00\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n' | sudo tee "/etc/systemd/system/$SVC-backup.timer" >/dev/null
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now "$SVC-backup.timer" >/dev/null 2>&1
+    say "nightly backup timer installed → $BACKUP_DIR (14 kept${GW_BACKUP_TARGET:+, mirrored to $GW_BACKUP_TARGET}); run now: sudo systemctl start $SVC-backup"
+  elif [ "$HAVE_SYSTEMD" = 1 ]; then
+    cat > "$HOME/.config/systemd/user/gridwright-backup.service" <<EOF
+[Unit]
+Description=Gridwright nightly backup
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=$DATA/backup.sh
+EOF
+    cat > "$HOME/.config/systemd/user/gridwright-backup.timer" <<EOF
+[Unit]
+Description=Gridwright nightly backup at 02:30
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl --user daemon-reload
+    systemctl --user enable --now gridwright-backup.timer >/dev/null 2>&1
+    say "nightly backup timer installed → $BACKUP_DIR (14 kept${GW_BACKUP_TARGET:+, mirrored to $GW_BACKUP_TARGET}); run now: $DATA/backup.sh"
+  else
+    say "backup script: $DATA/backup.sh (add it to cron: 30 2 * * * $DATA/backup.sh)"
+  fi
+fi
+
+# --- health ------------------------------------------------------------------------------
+for i in $(seq 1 30); do
+  curl -fsS -H "Authorization: Bearer ${GW_TOKEN:-}" "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1 && break
+  sleep 0.5
+  [ "$i" -eq 30 ] && { [ -f "$DATA/server.log" ] && tail -n 30 "$DATA/server.log"; if [ "$SYSTEM_UNIT" = 1 ]; then sudo journalctl -u "$SVC" --no-pager -n 30 || true; else journalctl --user -u gridwright --no-pager -n 30 2>/dev/null || true; fi; die "server did not answer on port $PORT"; }
+done
+
+# the runtime is probed in the background right after start (a second or two), then the GPU probe
+# imports cuDF when it is installed (can take a while on first use) — wait for both, within reason
+for i in $(seq 1 40); do
+  curl -fsS -H "Authorization: Bearer ${GW_TOKEN:-}" "http://127.0.0.1:$PORT/api/python" 2>/dev/null | grep -q '"not probed yet"' || break
+  sleep 0.5
+done
+if as_svc "$DATA/pyenv/bin/python" -c 'import importlib.util, sys; sys.exit(0 if importlib.util.find_spec("cudf") else 1)' 2>/dev/null; then
+  say "cuDF is installed in the venv — waiting for the GPU probe"
+  for i in $(seq 1 90); do
+    curl -fsS -H "Authorization: Bearer ${GW_TOKEN:-}" "http://127.0.0.1:$PORT/api/python" 2>/dev/null | grep -q '"gpu":null' || break
+    sleep 1
+  done
+fi
+if [ "$ACCOUNTS" = 1 ]; then
+  # /api/python needs a signed-in person with accounts on
+  py_line="see Settings after signing in (with accounts on, only bubblewrap is accepted unless GRIDWRIGHT_ALLOW_WEAK_SANDBOX=1)"
+else
+  py_line="$(curl -fsS -H "Authorization: Bearer ${GW_TOKEN:-}" "http://127.0.0.1:$PORT/api/python" 2>/dev/null | "$NODE_BIN" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const p=JSON.parse(s);process.stdout.write(p.available?`CPython ${p.version}, sandbox: ${p.sandbox}${p.sandbox!=="bwrap"&&p.fallbacks?" ("+p.fallbacks+" — run the installer with --sandbox)":""}${p.gpu===null?", GPU: still probing (see Settings → Re-check server Python)":p.gpu.startsWith("cudf")?", GPU: "+p.gpu:", GPU: "+p.gpu}`:"off — "+(p.reason||"no python3 found (run with --python or set GW_PYTHON)"))}catch{process.stdout.write("unknown")}})')"
+fi
+say "server-side Python cells: $py_line"
+
+if [ "$HTTPS" = 1 ]; then
+  if ! command -v caddy >/dev/null 2>&1; then
+    say "installing Caddy (sudo apt)"
+    sudo apt-get install -y -qq caddy >/dev/null || die "apt-get install caddy failed"
+  fi
+  CADDYFILE=/etc/caddy/Caddyfile
+  if [ -f "$CADDYFILE" ] && ! grep -q "written by gridwright" "$CADDYFILE" && grep -vE '^\s*(#|$)' "$CADDYFILE" | grep -qvE '^\s*(:80 \{|root \* /usr/share/caddy|file_server|\})\s*$'; then
+    die "$CADDYFILE has a configuration of its own; add this site to it and re-run without --https:
+  $HTTPS_DOMAIN {
+    reverse_proxy 127.0.0.1:$PORT
+  }"
+  fi
+  printf '# written by gridwright scripts/install.sh --https — re-running the installer replaces this file\n%s {\n\tencode zstd gzip\n\treverse_proxy 127.0.0.1:%s\n}\n' "$HTTPS_DOMAIN" "$PORT" | sudo tee "$CADDYFILE" >/dev/null
+  sudo caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1 || die "caddy rejected $CADDYFILE"
+  sudo systemctl enable caddy >/dev/null 2>&1 || true
+  sudo systemctl reload-or-restart caddy || die "caddy did not start: sudo journalctl -u caddy -n 50"
+  if command -v ufw >/dev/null 2>&1 && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
+    sudo ufw allow 80/tcp comment 'Gridwright HTTPS (certificate + redirect)' >/dev/null
+    sudo ufw allow 443/tcp comment 'Gridwright HTTPS' >/dev/null
+    sudo ufw delete allow "$PORT/tcp" >/dev/null 2>&1 || true
+  fi
+  say "waiting for the certificate for $HTTPS_DOMAIN (Let's Encrypt, up to two minutes)"
+  for i in $(seq 1 60); do
+    curl -fsS --max-time 5 "https://$HTTPS_DOMAIN/api/health" >/dev/null 2>&1 && break
+    sleep 2
+    [ "$i" -eq 60 ] && echo "warning: https://$HTTPS_DOMAIN/ does not answer yet — are ports 80 and 443 open to the internet? sudo journalctl -u caddy -n 50" >&2
+  done
+  say "Gridwright is up: https://$HTTPS_DOMAIN/   (HTTPS by Caddy; the server itself listens on 127.0.0.1:$PORT only)"
+elif [ "$TAILSCALE" = 1 ]; then
+  if tailscale serve --bg --https=443 "http://127.0.0.1:$PORT" >/dev/null 2>&1; then
+    fqdn="$(tailscale status --json 2>/dev/null | "$NODE_BIN" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s);process.stdout.write((j.Self.DNSName||"").replace(/\.$/,""))}catch{}})')"
+    say "Gridwright is up on the tailnet: https://${fqdn:-<this-machine>.<tailnet>.ts.net}/  (identity from Tailscale; admins: ${GW_ADMINS:-everyone})"
+  else
+    say "tailscale serve failed — run once: sudo tailscale set --operator=$USER   and enable HTTPS certificates in the admin console, then re-run with --tailscale"
+    say "meanwhile the server listens on 127.0.0.1:$PORT only"
+  fi
+else
+  ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  ts="$(command -v tailscale >/dev/null 2>&1 && tailscale ip -4 2>/dev/null | head -1 || true)"
+  say "Gridwright is up: http://${ts:-${ip:-localhost}}:$PORT${GW_TOKEN:+/?token=$GW_TOKEN}"
+  [ -n "$ts" ] && [ -n "$ip" ] && [ "$ts" != "$ip" ] && say "also on the LAN: http://$ip:$PORT"
+fi
+if [ "$ACCOUNTS" = 1 ]; then
+  say "accounts on: sign in as ${GW_ADMIN_EMAIL:-admin@gridwright.local} (platform administrator)"
+  if as_svc test -f "$DATA/initial-admin.txt"; then say "  its temporary password is in $DATA/initial-admin.txt${SYSUSER:+ (sudo cat it)} — change it at first sign-in, then delete the file"; fi
+  say "  existing documents and connections belong to the Default client; create clients in Clients & people → Clients"
+fi
+say "data: $DATA   (documents, history, connections, AI settings, secret.key — back this up)"
+if [ "$MIGRATED" = 1 ]; then
+  say "the old data folder $MIGRATE_FROM is no longer used; once you have checked the new service, delete it (it still holds a copy of secret.key): rm -rf $MIGRATE_FROM"
+fi

@@ -1,0 +1,15 @@
+# The investigation stack at the versions the gate tests ran with (CPython 3.13, Linux; Spark 1
+# reported the same langchain line under its own venv). The installer uses this file; the floors
+# in requirements.txt say what the code needs. Bump deliberately: a change of model, prompt or
+# framework version is a change to evaluate, not to pick up by accident.
+langchain==1.4.4
+langchain-core==1.6.9
+langchain-openai==1.7.0
+deepagents==0.7.23
+langgraph==1.2.14
+langgraph-checkpoint==4.2.0
+langgraph-checkpoint-sqlite==3.1.1
+langgraph-prebuilt==1.1.0
+langgraph-sdk==0.4.6
+openai==3.28.0
+pydantic==2.13.5

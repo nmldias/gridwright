@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<invoices>
+  <invoice id="F-1001"><VIN>00012345ABC</VIN><amount>25000000</amount><currency>Kz</currency><shipment>SH-002</shipment><date>2026-10-12</date></invoice>
+  <invoice id="F-1002"><VIN>KMHJ381ABNU012347</VIN><amount>18629981.5</amount><currency>Kz</currency><shipment>SH-002</shipment><date>2026-10-14</date></invoice>
+</invoices>

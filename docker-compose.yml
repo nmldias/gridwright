@@ -1,0 +1,54 @@
+# Gridwright self-hosted. `docker compose up -d --build` then open http://<host>:8787
+services:
+  gridwright:
+    build: .
+    image: gridwright:local
+    container_name: gridwright
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      # Encrypts stored DB passwords / AI keys. Leave empty to have a random key generated into
+      # /data/secret.key (keep the data volume with your backups), or set a long random string.
+      GRIDWRIGHT_SECRET: ${GRIDWRIGHT_SECRET:-}
+      # Optional shared access token: open http://host:8787/?token=... once per browser.
+      GRIDWRIGHT_TOKEN: ${GRIDWRIGHT_TOKEN:-}
+      # Trust `tailscale serve` identity headers (bind the port to 127.0.0.1 when enabling this).
+      GRIDWRIGHT_TRUST_TAILSCALE: ${GRIDWRIGHT_TRUST_TAILSCALE:-0}
+      GRIDWRIGHT_ADMINS: ${GRIDWRIGHT_ADMINS:-}
+      GRIDWRIGHT_READONLY: ${GRIDWRIGHT_READONLY:-}
+      # Sharing level of new documents: none (private; the default when identity is on), view or edit.
+      GRIDWRIGHT_DEFAULT_SHARING: ${GRIDWRIGHT_DEFAULT_SHARING:-}
+      # Server-side Python cells and the companion's generated code: `auto` (default) runs them under
+      # bubblewrap when the container may create user namespaces (see security_opt below) and keeps
+      # them OFF otherwise — never a plain process by accident; `none` accepts the container as the only
+      # boundary knowingly (generated code then sees /data). /api/python reports what is in use.
+      GRIDWRIGHT_PYTHON_SANDBOX: ${GRIDWRIGHT_PYTHON_SANDBOX:-auto}
+      GRIDWRIGHT_INBOX: ${GRIDWRIGHT_INBOX:-}
+      # Limits per run (ms, MB, parallel runs); GRIDWRIGHT_PYTHON=off disables the runtime.
+      GRIDWRIGHT_PYTHON_TIMEOUT_MS: ${GRIDWRIGHT_PYTHON_TIMEOUT_MS:-60000}
+      GRIDWRIGHT_PYTHON_MEMORY_MB: ${GRIDWRIGHT_PYTHON_MEMORY_MB:-2048}
+      GRIDWRIGHT_PYTHON_CONCURRENCY: ${GRIDWRIGHT_PYTHON_CONCURRENCY:-2}
+      # Optional defaults for the AI assistant (can also be set in the UI).
+      AI_BASE_URL: ${AI_BASE_URL:-}
+      AI_MODEL: ${AI_MODEL:-}
+      AI_API_KEY: ${AI_API_KEY:-}
+    # bubblewrap inside a container needs the host to allow unprivileged user namespaces AND the network
+    # namespace it sets up; on a stock Docker host (GitHub's runner included) even
+    # security_opt: ["seccomp=unconfined", "apparmor=unconfined"] was not enough (RTM_NEWADDR refused), so
+    # the practical choices are GRIDWRIGHT_PYTHON_SANDBOX=none here or the systemd install with --sandbox.
+    volumes:
+      - ./data:/data          # documents, history, connections; ./data/pyodide → offline Python runtime
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach databases / LLM servers running on the host
+
+  # Optional: a PostgreSQL to play with (connect from the SQL panel as host "postgres", user gw / gw)
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["demo-db"]
+    environment:
+      POSTGRES_USER: gw
+      POSTGRES_PASSWORD: gw
+      POSTGRES_DB: demo
+    ports:
+      - "5433:5432"
