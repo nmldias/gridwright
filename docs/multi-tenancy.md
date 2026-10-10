@@ -42,6 +42,14 @@ certificate (for `<public-ip>.sslip.io`, or `--https=your.domain`), binds the se
 127.0.0.1 and sets `GRIDWRIGHT_TRUST_PROXY=1`, so the cookie is `Secure` and HSTS is sent. Behind
 another proxy, set `GRIDWRIGHT_TRUST_PROXY` to its address.
 
+**Run it as its own account.** Add `--system-user` and the server runs as a dedicated system
+account (`gridwright`: no shell, no sudo, no docker) from a root-owned, read-only copy of the
+release in `/opt/gridwright`, with its data in `/var/lib/gridwright/data` and backups in
+`/var/lib/gridwright/backups`. The unit is a hardened system service (`ProtectSystem=strict`,
+`ProtectHome`, `NoNewPrivileges`, no capabilities, private `/tmp` and `/dev`); a per-user install
+is retired and its data copied over once (the old folder stays until you delete it). Manage it with
+`sudo systemctl status gridwright` and `sudo journalctl -u gridwright -f`.
+
 **Existing data.** Documents and connections created before accounts were turned on carry no
 client, so they belong to the default client and only its members see them. Nothing is moved or
 rewritten. Turning accounts off again returns to the previous behaviour.
@@ -155,6 +163,7 @@ made:
 | Inbox | a subfolder per client |
 | Investigations, agent cells, scheduled refreshes | run with an identity rebuilt for the document's client and the person's live role |
 | Backups | the whole-server backup is for platform administrators only |
+| Service account | with `install.sh --system-user`: a dedicated account without shell, sudo or docker; code read-only to it; the system unit hides `/home`, makes the OS read-only except the data directory, and drops every capability |
 | Server-side Python | bubblewrap with no network; `/run`, `/var/run`, the data directory and every socket-bearing tree hidden (the start-up probe refuses to turn Python on if the host's Docker, systemd or D-Bus sockets are reachable); a cache and warm interpreters per client, so nothing one client's code writes is seen by another's; a finished run's leftover processes are killed; per-client share of the run slots and queue |
 | Code cells in the browser | an opaque-origin sandbox frame (its own CSP: no network, no app cookies, no parent page); code written by someone else runs only after the person approves it |
 | Outbound connections | client-entered model endpoints and database hosts must resolve to public addresses, checked inside the connection's own DNS lookup (no rebinding window); connection errors shown to clients carry no network detail |

@@ -54,7 +54,7 @@ export function StatusBar() {
   }, [selection, meta, stats, cellsVersion]);
 
   return (
-    <div className="statusbar">
+    <footer className="statusbar">
       <span className="status-msg">{status}</span>
       <span className="grow" />
       {running > 0 && <span className="pill loading">{running} cell{running > 1 ? 's' : ''} running</span>}
@@ -89,6 +89,6 @@ export function StatusBar() {
       <span className="muted" title="Zoom: Ctrl + wheel">
         {Math.round(zoom * 100)}%
       </span>
-    </div>
+    </footer>
   );
 }
