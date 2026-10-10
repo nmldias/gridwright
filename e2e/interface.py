@@ -213,6 +213,12 @@ def main():
             bar2 = [b for b in pg.evaluate("() => [...document.querySelectorAll('.topbar > button, .topbar > .menu-wrap > button')].map((b) => b.textContent.trim().replace(/▾$/, '').trim())") if b]
             check("a reader who cannot edit sees no creation controls: no Add, Python or Format — Ask, Review and Share remain", "Add" not in bar2 and "Python" not in bar2 and "Format" not in bar2 and all(k in bar2 for k in ("Ask", "Review", "Share")), str(bar2))
             ctx.close()
+            # the conversation is the person's: Alice's transcript on the shared document is not Bob's, and Bob's is not Alice's
+            B = {"tailscale-user-login": "bob@example.com", "tailscale-user-name": "Bob"}
+            rest("PUT", f"/api/files/{created['id']}/conversation", {"messages": [{"role": "user", "content": "Private hypothesis: the Creta is overpriced"}, {"role": "assistant", "content": "Noted."}]}, base=ACL, headers=A)
+            mine = rest("GET", f"/api/files/{created['id']}/conversation", base=ACL, headers=A)
+            theirs = rest("GET", f"/api/files/{created['id']}/conversation", base=ACL, headers=B)
+            check("the conversation is per person on a shared document: the owner's transcript comes back to the owner and never to a viewer", len(mine["messages"]) == 2 and mine["owner"] == "alice@example.com" and theirs["messages"] == [] and theirs["owner"] == "bob@example.com", f"{len(mine['messages'])} / {len(theirs['messages'])}")
             rest("DELETE", f"/api/files/{created['id']}", base=ACL, headers=A)
         else:
             print("SKIP reader's bar (no --acl)")

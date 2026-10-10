@@ -564,6 +564,16 @@ export const api = {
       return j(await fetch(`/api/files/${encodeURIComponent(id)}/proposals/${encodeURIComponent(pid)}/refresh`, { method: 'POST' }));
     },
     /** A checkpoint built by the server from the log — how a sign-off share persists. */
+    // the conversation with the assistant: the server owns it, per document and person
+    async conversation(id: string): Promise<{ doc: string; owner: string; messages: unknown[]; updatedAt: string }> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/conversation`));
+    },
+    async saveConversation(id: string, messages: unknown[]): Promise<{ updatedAt: string }> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/conversation`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ messages }) }));
+    },
+    async clearConversation(id: string): Promise<{ ok: boolean }> {
+      return j(await fetch(`/api/files/${encodeURIComponent(id)}/conversation`, { method: 'DELETE' }));
+    },
     // the companion: context records, watches, issues, the brief and the graph
     async companion(id: string): Promise<Companion> {
       return j(await fetch(`/api/files/${encodeURIComponent(id)}/companion`));

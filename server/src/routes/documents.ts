@@ -13,7 +13,9 @@ import { deleteIntake } from '../intake.js';
 import { accessChanged, broadcastEntries, notifyCompanion, notifyProposal as notifyProposalRoom, notifySaved } from '../multiplayer.js';
 import { createProposal, decideProposal, getProposal, listProposals, ProposalConflict, refreshProposal } from '../proposals.js';
 import { deleteFile, listFiles, readFile, writeFile } from '../storage.js';
-import { docPermission, noAgent, requireRole } from './common.js';
+import { clearConversation, deleteConversationsOf, readConversation, writeConversation } from '../conversations.js';
+import { ConversationSchema } from '../contracts.js';
+import { body, docPermission, fail, noAgent, requireRole } from './common.js';
 
 export function registerDocumentRoutes(app: Express, ctx: { defaultSharing: 'edit' | 'view' | 'none' }) {
   const DEFAULT_SHARING = ctx.defaultSharing;
@@ -104,6 +106,27 @@ export function registerDocumentRoutes(app: Express, ctx: { defaultSharing: 'edi
     deleteAccess(req.params.id);
     deleteCompanion(req.params.id);
     deleteIntake(req.params.id);
+    deleteConversationsOf(req.params.id);
+    res.json({ ok: true });
+  });
+  // the conversation with the assistant: the caller's own transcript on this document, owned by the server
+  app.get('/api/files/:id/conversation', (req, res) => {
+    if (!docPermission(req, res, 'view')) return;
+    res.json(readConversation(req.params.id, identityOf(req).login || ''));
+  });
+  app.put('/api/files/:id/conversation', (req, res) => {
+    if (!docPermission(req, res, 'view') || !noAgent(req, res)) return;
+    const b = body(ConversationSchema, req, res);
+    if (!b) return;
+    try {
+      res.json(writeConversation(req.params.id, identityOf(req).login || '', b.messages));
+    } catch (e) {
+      fail(res, e);
+    }
+  });
+  app.delete('/api/files/:id/conversation', (req, res) => {
+    if (!docPermission(req, res, 'view') || !noAgent(req, res)) return;
+    clearConversation(req.params.id, identityOf(req).login || '');
     res.json({ ok: true });
   });
   // sharing & folders: {public, shares, folder}; folder alone may be changed by editors

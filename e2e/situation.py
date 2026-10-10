@@ -434,6 +434,8 @@ def main():
         check("11. an assumption past its review date is asked to be reconfirmed, once, and ranks among the uncertainties", len(review) == 1 and "prioritise liquidity" in review[0]["text"] and any(x["kind"] == "review" for x in u["uncertain"]), review and review[0]["text"][:160])
 
         # ================================================================ 12. return after an interruption: the decision context is restored without rereading anything
+        open_ask()
+        msgs_before = page.evaluate("() => [...document.querySelectorAll('.ai-panel .msg')].map((m) => m.textContent || '')")
         page.goto(f"{BASE}/?file={fid}", wait_until="networkidle")
         page.wait_for_selector(".canvas-host canvas", timeout=30000)
         time.sleep(0.8)
@@ -443,6 +445,20 @@ def main():
         nxt = page.text_content(".next-move .next-text") or ""
         check("12. after a reload the situation is there — objective, constraints, exclusions, what it rests on, decisions standing, the next move — above the chat, nothing to reread", ("release cash tied up in stock" in st or "cash is sitting in vehicles" in st) and "demonstrator" in st and "Based on" in st and "decision" in st and lead and nxt and page.evaluate("() => document.querySelector('.companion .situation').getBoundingClientRect().top < document.querySelector('.ai-panel .chat').getBoundingClientRect().top"), f"{lead} | {nxt[:80]}")
         page.screenshot(path=f"{OUT}/situation-04-return.png")
+        # the conversation came back from the server, not from this browser: the questions asked earlier are there
+        page.wait_for_selector(".ai-panel .msg", timeout=10000)
+        msgs = page.evaluate("() => [...document.querySelectorAll('.ai-panel .msg')].map((m) => m.textContent || '')")
+        stored = rest("GET", f"/api/files/{fid}/conversation")
+        check("   the conversation is restored with the situation — owned by the server, the same after a reload", len(msgs) >= 1 and msgs == msgs_before and any("cash is sitting in vehicles" in m for m in msgs) and len(stored["messages"]) == len(msgs) and stored["messages"][0]["role"] == "user", f"{len(msgs)} messages shown ({len(msgs_before)} before), {len(stored['messages'])} stored")
+        # …and on another device: a fresh browser context with no storage of its own sees the same transcript
+        other = browser.new_context(viewport={"width": 1300, "height": 900}).new_page()
+        other.goto(f"{BASE}/?file={fid}", wait_until="networkidle")
+        other.wait_for_selector(".canvas-host canvas", timeout=30000)
+        other.evaluate("() => window.__gw.getState().set({ panel: 'ai' })")
+        other.wait_for_selector(".ai-panel .msg", timeout=10000)
+        other_msgs = other.evaluate("() => [...document.querySelectorAll('.ai-panel .msg')].map((m) => m.textContent || '')")
+        check("   another authorised device shows the same conversation, objective, decisions and jobs", len(other_msgs) == len(msgs) and any("cash is sitting in vehicles" in m for m in other_msgs) and "demonstrator" in (other.text_content(".companion .situation") or ""), f"{len(other_msgs)} messages on the other device")
+        other.context.close()
 
         # ================================================================ the measures
         c = companion()

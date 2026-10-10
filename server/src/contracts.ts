@@ -97,3 +97,5 @@ export const PlacementSchema = z.object({
 export const RunRequestSchema = z.object({ code: text(100_000), purpose: optText(200), investigation: optText(64), client: optText(80) });
 
 export const InvestigateSchema = z.object({ question: optText(2000), issue: optText(64), thread: z.string().regex(/^[a-zA-Z0-9:_-]{1,80}$/).optional(), client: optText(80) });
+
+export const ConversationSchema = z.object({ messages: z.array(z.object({ role: z.enum(['user', 'assistant']), content: z.string() }).passthrough()).max(400) });

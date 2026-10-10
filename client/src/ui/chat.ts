@@ -1,6 +1,8 @@
 // The assistant's conversation lives here, per document, independent of the panel that shows it: a
 // question typed and not yet sent, a reply still streaming, a proposal not yet applied all survive a
-// trip to another panel. The panel is a view of this state, never its owner.
+// trip to another panel. The panel is a view of this state, never its owner — and neither is this
+// browser: the server keeps the transcript per document and person, so a reload or another
+// authorised device shows the same conversation (loadConversation / persist).
 
 import { create } from 'zustand';
 import { api, type ToolEvent } from '../api/client';
@@ -56,7 +58,7 @@ export function patchConversation(key: string, patch: Partial<Conversation> | ((
   });
 }
 
-/** When an unsaved document is saved for the first time, its conversation follows it. */
+/** When an unsaved document is saved for the first time, its conversation follows it — to the server too. */
 export function adoptUnsaved(fileId: string) {
   const s = useChat.getState();
   const c = s.byDoc['(unsaved)'];
@@ -64,6 +66,46 @@ export function adoptUnsaved(fileId: string) {
   const next = { ...s.byDoc, [fileId]: c };
   delete next['(unsaved)'];
   useChat.setState({ byDoc: next });
+  if (c.messages.length) void persist(fileId);
+}
+
+const loaded = new Set<string>();
+/**
+ * The server owns the transcript: on opening a document it is loaded (unless a reply is streaming
+ * here), so that it is the same after a reload and on another authorised device.
+ */
+export async function loadConversation(fileId: string) {
+  try {
+    const c = await api.files.conversation(fileId);
+    const cur = conversationOf(fileId);
+    if (cur.busy) return;
+    const msgs = (Array.isArray(c.messages) ? c.messages : []) as Msg[];
+    // what this browser already holds for the document stays if the server has nothing yet (an exchange made before the first save)
+    if (!msgs.length && cur.messages.length) {
+      if (!loaded.has(fileId)) void persist(fileId);
+    } else patchConversation(fileId, { messages: msgs });
+    loaded.add(fileId);
+  } catch {
+    /* offline or not permitted: the local transcript stands */
+  }
+}
+
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
+/** The transcript as held here, sent whole after each exchange (coalesced). */
+export function persist(key: string) {
+  if (key === '(unsaved)') return;
+  if (persistTimer) clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    const c = conversationOf(key);
+    const messages = c.messages.map((m) => ({ ...m, tools: m.tools?.map((t) => ({ id: t.id, name: t.name, args: t.args, ok: t.ok, summary: t.summary })) }));
+    void api.files.saveConversation(key, messages).catch(() => undefined);
+  }, 300);
+}
+
+export async function clearConversation(key: string) {
+  patchConversation(key, { messages: [], error: null });
+  if (key !== '(unsaved)') await api.files.clearConversation(key).catch(() => undefined);
 }
 
 const aborts = new Map<string, AbortController>();
@@ -117,9 +159,11 @@ export async function sendMessage(key: string, opts: { tools: boolean; autoApply
   } finally {
     patchConversation(key, { busy: false });
     aborts.delete(key);
+    persist(key);
   }
 }
 
 export function updateMessage(key: string, index: number, patch: Partial<Msg>) {
   patchConversation(key, (c) => ({ messages: c.messages.map((m, i) => (i === index ? { ...m, ...patch } : m)) }));
+  persist(key);
 }
