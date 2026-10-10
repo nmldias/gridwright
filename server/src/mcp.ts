@@ -12,7 +12,8 @@ import { a1, engineAvailable, openDocument, tableByName, tableMetas, tableRows, 
 import { currentSeq, describeOp, recentEntries } from './history.js';
 import { identityOf, type Identity } from './identity.js';
 import { createProposal, listProposals, type Action } from './proposals.js';
-import { addRecord, addWatch, affectedBy, brief as companionBrief, contextForModel, graphOf, openIssues, RECORD_KINDS, type RecordKind } from './companion.js';
+import { addRecord, addWatch, affectedBy, brief as companionBrief, contextForModel, graphOf, openIssues } from './companion.js';
+import { RecordInputSchema, WatchDefSchema } from './contracts.js';
 import { runQuery } from './sql.js';
 import { authorizeQuery, canSeeConnection, isReadOnlySql } from './sqlpolicy.js';
 import { listConnections, listFiles, readFile } from './storage.js';
@@ -261,7 +262,7 @@ export function buildServer(who: Identity): McpServer {
   );
   server.registerTool(
     'remember',
-    { title: 'Propose a context record', description: 'File an objective, constraint, exclusion, fact (with source and period), hypothesis, contradiction (with what depends on resolving it), decision (with why and the conditions behind it), question (with what it bears on) or expectation (what should happen, by when, in which source, recognised by which text) into the document\'s context. An agent\'s record is marked proposed until a person confirms it; it grants nothing.', inputSchema: { id: z.string(), kind: z.enum(RECORD_KINDS as [RecordKind, ...RecordKind[]]), text: z.string(), source: z.string().optional(), period: z.string().optional(), bearing: z.string().optional(), due: z.string().optional(), match: z.string().optional(), why: z.string().optional(), conditions: z.array(z.string()).optional() } },
+    { title: 'Propose a context record', description: 'File an objective, constraint, exclusion, fact (with source and period), hypothesis, contradiction (with what depends on resolving it), decision (with why and the conditions behind it), question (with what it bears on) or expectation (what should happen, by when, in which source, recognised by which text) into the document\'s context. An agent\'s record is marked proposed until a person confirms it; it grants nothing.', inputSchema: { id: z.string(), ...RecordInputSchema.pick({ kind: true, text: true, source: true, period: true, bearing: true, due: true, match: true, why: true }).shape, conditions: z.array(z.string().max(400)).max(20).optional() } },
     async ({ id, kind, text: t, source, period, bearing, due, match, why, conditions }) => {
       try {
         visibleDoc(id, who);
@@ -274,7 +275,7 @@ export function buildServer(who: Identity): McpServer {
   );
   server.registerTool(
     'propose_watch',
-    { title: 'Propose a watch', description: 'Propose a watch: a Gridwright formula evaluated against the live document with a threshold (kind threshold, op, value), a check that must stay TRUE (kind check), or a change detector (kind change); sustain = consecutive comparable observations before it is reported; sources + freshnessHours = tables that must be fresh. Proposed watches wait for approval; thresholds are the person\'s to set.', inputSchema: { id: z.string(), purpose: z.string(), formula: z.string(), scope: z.string().optional(), table: z.string().optional(), kind: z.enum(['threshold', 'check', 'change', 'worsening']).optional(), op: z.enum(['>', '>=', '<', '<=', '=', '!=']).optional(), value: z.number().optional(), bad: z.enum(['up', 'down']).optional(), sustain: z.number().int().optional(), response: z.enum(['note', 'brief', 'case']).optional(), sources: z.array(z.string()).optional(), freshnessHours: z.number().optional(), complement: z.string().optional() } },
+    { title: 'Propose a watch', description: 'Propose a watch: a Gridwright formula evaluated against the live document with a threshold (kind threshold, op, value), a check that must stay TRUE (kind check), or a change detector (kind change); sustain = consecutive comparable observations before it is reported; sources + freshnessHours = tables that must be fresh. Proposed watches wait for approval; thresholds are the person\'s to set.', inputSchema: { id: z.string(), ...WatchDefSchema.omit({ client: true }).extend({ purpose: z.string().min(1).max(200), formula: z.string().min(1).max(2000) }).shape } },
     async ({ id, ...def }) => {
       try {
         visibleDoc(id, who);
