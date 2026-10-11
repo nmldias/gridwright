@@ -75,6 +75,8 @@ jobs:
         run: cd client && npm ci --no-audit --no-fund && npm run build
       - name: Build server
         run: cd server && npm ci --no-audit --no-fund && npm run build
+      - name: Engine limits on the shipped WebAssembly build
+        run: node e2e/engine_limits.mjs server/engine
 
       - name: Seed the test database
         run: |

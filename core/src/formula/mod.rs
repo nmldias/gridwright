@@ -354,9 +354,278 @@ mod tests {
         assert_eq!(ev(&wb, "DAY(\"2026-10-08\")"), Value::Number(8.0));
         assert_eq!(ev(&wb, "TODAY()"), Value::Number(46000.0));
         assert_eq!(ev(&wb, "EOMONTH(DATE(2026,2,10),0)"), Value::Number(46081.0)); // 2026-02-28
-        assert_eq!(ev(&wb, "EDATE(DATE(2026,1,31),1)"), Value::Number(46084.0)); // 2026-03-03 (overflow like Excel)
+        // Excel caps the day at the target month's end: 31 Jan + 1 month = 28 Feb (not 3 Mar)
+        assert_eq!(ev(&wb, "EDATE(DATE(2026,1,31),1)"), Value::Number(46081.0));
         assert_eq!(ev(&wb, "TEXT(DATE(2026,10,8),\"yyyy-mm-dd\")"), Value::Text("2026-10-08".into()));
         assert_eq!(ev(&wb, "WEEKDAY(DATE(2026,10,8))"), Value::Number(5.0)); // Thursday
+    }
+
+    /// Formulas that used to crash, hang or exhaust memory return an error value instead.
+    #[test]
+    fn resource_limits() {
+        let wb = book();
+        let num = Value::Error(ErrorKind::Num);
+        let val = Value::Error(ErrorKind::Value);
+        // arrays: overflow-safe size checks
+        assert_eq!(ev(&wb, "SEQUENCE(65537,65537)"), num); // rows*cols overflowed u32
+        assert_eq!(ev(&wb, "SEQUENCE(1E10,1E10)"), num);
+        assert_eq!(ev(&wb, "SUM(SEQUENCE(1000,1000))"), Value::Number(500_000_500_000.0)); // 1M cells still allowed
+        assert_eq!(ev(&wb, "WRAPROWS({1,2,3},1E9)"), num);
+        assert_eq!(ev(&wb, "WRAPCOLS({1,2,3},1E9)"), num);
+        assert_eq!(ev(&wb, "EXPAND(1,1E5,1E5)"), num);
+        assert_eq!(ev(&wb, "EXPAND(1,1E9,1E9)"), num);
+        match evaluate_full(&wb, 1, None, "WRAPROWS({1,2,3,4,5},2)") {
+            Arg::Array(a) => {
+                assert_eq!((a.rows, a.cols), (3, 2));
+                assert_eq!(a.data[5], Value::Error(ErrorKind::NA)); // padding
+            }
+            other => panic!("{:?}", other),
+        }
+        match evaluate_full(&wb, 1, None, "EXPAND({1,2},2,3,0)") {
+            Arg::Array(a) => assert_eq!((a.rows, a.cols, a.data[5].clone()), (2, 3, Value::Number(0.0))),
+            other => panic!("{:?}", other),
+        }
+        // text: Excel's 32,767-character limit, checked before the string is built
+        assert_eq!(ev(&wb, "REPT(\"x\",1E10)"), val);
+        assert_eq!(ev(&wb, "REPT(\"x\",32768)"), val);
+        assert_eq!(ev(&wb, "LEN(REPT(\"x\",32767))"), Value::Number(32767.0));
+        assert_eq!(ev(&wb, "REPT(\"ab\",3)"), Value::Text("ababab".into()));
+        assert_eq!(ev(&wb, "REPT(\"x\",-1)"), val);
+        assert_eq!(ev(&wb, "REPT(REPT(\"x\",30000),30000)"), val);
+        assert_eq!(ev(&wb, "SUBSTITUTE(REPT(\"a\",30000),\"a\",\"bb\")"), val);
+        assert_eq!(ev(&wb, "LEN(SUBSTITUTE(REPT(\"a\",30000),\"a\",\"\"))"), Value::Number(0.0));
+        assert_eq!(ev(&wb, "CONCAT(REPT(\"a\",20000),REPT(\"b\",20000))"), val);
+        assert_eq!(ev(&wb, "REPT(\"a\",20000)&REPT(\"b\",20000)"), val);
+        assert_eq!(ev(&wb, "TEXTJOIN(\",\",TRUE,REPT(\"a\",20000),REPT(\"b\",20000))"), val);
+        assert_eq!(ev(&wb, "TEXTJOIN(\"-\",TRUE,\"a\",\"\",\"b\")"), Value::Text("a-b".into())); // skipped "" (was a--b)
+        assert_eq!(ev(&wb, "TEXTJOIN(\"-\",FALSE,\"a\",\"\",\"b\")"), Value::Text("a--b".into()));
+        assert_eq!(ev(&wb, "TEXTJOIN(\"-\",TRUE,{\"a\",\"\",\"b\"})"), Value::Text("a-b".into()));
+        assert_eq!(ev(&wb, "FIXED(1,1E9)"), val);
+        assert_eq!(ev(&wb, "FIXED(1234.567,1)"), Value::Text("1,234.6".into()));
+        assert_eq!(ev(&wb, "BASE(1,2,1E9)"), num);
+        assert_eq!(ev(&wb, "BASE(5,2,8)"), Value::Text("00000101".into()));
+        assert_eq!(ev(&wb, "BASE(2^53,16)"), num);
+        // loops bounded by arithmetic
+        assert_eq!(ev(&wb, "COMBIN(1E18,1E17)"), num);
+        assert_eq!(ev(&wb, "PERMUT(1E18,1E17)"), num);
+        assert_eq!(ev(&wb, "COMBIN(10,3)"), Value::Number(120.0));
+        assert_eq!(ev(&wb, "COMBIN(1000,998)"), Value::Number(499_500.0)); // uses C(n,k) = C(n,n-k)
+        assert_eq!(ev(&wb, "PERMUT(10,3)"), Value::Number(720.0));
+        assert_eq!(ev(&wb, "NETWORKDAYS(0,1E12)"), num);
+        assert_eq!(ev(&wb, "WORKDAY(0,1E12)"), num);
+        assert_eq!(ev(&wb, "NETWORKDAYS.INTL(0,1E12,1)"), num);
+        assert_eq!(ev(&wb, "WORKDAY.INTL(0,1E12,1)"), num);
+        assert_eq!(ev(&wb, "WORKDAY(0,2.5E6)"), num); // would land after 31 Dec 9999
+        assert!(matches!(ev(&wb, "WORKDAY(1,2E6)"), Value::Number(_))); // a long span still works, quickly
+        assert_eq!(ev(&wb, "NETWORKDAYS(1,2958465)"), ev(&wb, "NETWORKDAYS.INTL(1,2958465,\"0000011\")"));
+        // dates outside Excel's range (0 .. 31 Dec 9999)
+        assert_eq!(ev(&wb, "YEAR(1E300)"), num);
+        assert_eq!(ev(&wb, "YEAR(-1)"), num);
+        assert_eq!(ev(&wb, "DATE(1E9,1,1)"), num);
+        assert_eq!(ev(&wb, "DATE(10000,1,1)"), num);
+        assert_eq!(ev(&wb, "DATE(9999,12,31)"), Value::Number(2_958_465.0));
+        assert_eq!(ev(&wb, "DATE(99,1,1)"), ev(&wb, "DATE(1999,1,1)")); // Excel adds 1900 to years 0–1899
+        assert_eq!(ev(&wb, "DATE(2026,1,1E15)"), num);
+        assert_eq!(ev(&wb, "EDATE(0,1E15)"), num);
+        assert_eq!(ev(&wb, "EOMONTH(0,1E15)"), num);
+        assert_eq!(ev(&wb, "EDATE(DATE(9999,12,1),1)"), num);
+        assert_eq!(ev(&wb, "TEXT(1E300,\"dd/mm/yyyy\")"), val);
+        assert!(matches!(ev(&wb, "TEXT(1E300,\"0\")"), Value::Text(_))); // a number pattern still formats
+    }
+
+    /// Repetition and amplification are bounded by the per-evaluation work budget; UNIQUE and
+    /// array XLOOKUP are linear and give the same results as comparing every pair.
+    #[test]
+    fn work_budget_and_linear_lookups() {
+        let wb = book();
+        let num = Value::Error(ErrorKind::Num);
+        // a long text broadcast over a big array stops with #NUM!, and IFERROR cannot hide it
+        assert_eq!(ev(&wb, "ROWS(IF(SEQUENCE(1E6),REPT(\"x\",32767)))"), num);
+        assert_eq!(ev(&wb, "ROWS(SEQUENCE(1E6)&REPT(\"x\",32767))"), num);
+        assert_eq!(ev(&wb, "IFERROR(ROWS(SEQUENCE(1E6)&REPT(\"x\",1000)),7)"), num);
+        // repeating an allowed computation: just under the budget works, just over is refused
+        let terms = |k: usize| vec!["LEN(REPT(\"x\",32767))"; k].join("+");
+        assert_eq!(ev(&wb, &terms(2900)), Value::Number(2900.0 * 32767.0));
+        assert_eq!(ev(&wb, &terms(3200)), num);
+        // each evaluation starts with a fresh budget
+        assert_eq!(ev(&wb, "SUM(SEQUENCE(1000,1000))"), Value::Number(500_000_500_000.0));
+        assert_eq!(ev(&wb, "ROWS(SEQUENCE(1E6)&\"x\")"), Value::Number(1e6));
+        // joining text respects Excel's 32,767-character limit
+        assert_eq!(ev(&wb, "ARRAYTOTEXT(SEQUENCE(1000,1000))"), Value::Error(ErrorKind::Value));
+        assert_eq!(ev(&wb, "ARRAYTOTEXT({1,2;3,4})"), Value::Text("1, 2; 3, 4".into()));
+
+        let col = |f: &str| match evaluate_full(&wb, 1, None, f) {
+            Arg::Array(a) => a.data,
+            Arg::Scalar(v) => vec![v],
+        };
+        let txt = |s: &str| Value::Text(s.into());
+        // UNIQUE: text ignores case (first spelling kept), -0 is 0, types stay apart
+        assert_eq!(col("UNIQUE({\"a\";\"A\";\"b\";\"a\";1;-0;0;\"1\";TRUE;1})"),
+            vec![txt("a"), txt("b"), Value::Number(1.0), Value::Number(-0.0), txt("1"), Value::Bool(true)]);
+        assert_eq!(col("UNIQUE({\"a\";\"A\";\"b\";\"c\";\"c\"},FALSE,TRUE)"), vec![txt("b")]);
+        assert_eq!(col("UNIQUE({1,1,2;1,1,2},TRUE)"), vec![Value::Number(1.0), Value::Number(2.0), Value::Number(1.0), Value::Number(2.0)]);
+        assert_eq!(ev(&wb, "ROWS(UNIQUE(MOD(SEQUENCE(200000),1000)))"), Value::Number(1000.0));
+        // XLOOKUP with many lookup values: first match, ignoring case, default when missing
+        let keys = "{\"a\";\"b\";\"B\";2;\"b\"}";
+        let vals = "{10;20;30;40;50}";
+        assert_eq!(col(&format!("XLOOKUP({{\"b\";\"B\";\"z\";2}},{keys},{vals},\"none\")")),
+            vec![Value::Number(20.0), Value::Number(20.0), txt("none"), Value::Number(40.0)]);
+        for (k, want) in [("\"B\"", Value::Number(20.0)), ("2", Value::Number(40.0)), ("\"2\"", txt("none"))] {
+            assert_eq!(ev(&wb, &format!("XLOOKUP({k},{keys},{vals},\"none\")")), want, "scalar {k}");
+        }
+        assert_eq!(ev(&wb, "SUM(XLOOKUP(SEQUENCE(100000),SEQUENCE(100000),SEQUENCE(100000)))"), Value::Number(5_000_050_000.0));
+        // a name defined as INDIRECT of itself is a cycle, not a stack overflow
+        on_wasm_sized_stack(|| {
+            let mut wb = book();
+            wb.names.push(crate::model::NamedRange { name: "Loop".into(), reference: "INDIRECT(\"Loop\")".into() });
+            assert_eq!(ev(&wb, "Loop"), Value::Error(ErrorKind::Cycle));
+            assert_eq!(ev(&wb, "IFERROR(Loop,7)"), Value::Number(7.0));
+            // a short legitimate chain still works: A -> INDIRECT("B") -> B
+            wb.names.push(crate::model::NamedRange { name: "A".into(), reference: "INDIRECT(\"B\")*2".into() });
+            wb.names.push(crate::model::NamedRange { name: "B".into(), reference: "INDIRECT(\"C\")+1".into() });
+            wb.names.push(crate::model::NamedRange { name: "C".into(), reference: "20".into() });
+            assert_eq!(ev(&wb, "A"), Value::Number(42.0));
+        });
+    }
+    /// Run `f` on a small, fixed stack: 1 MB (the wasm engine's default stack) in release
+    /// builds. Unoptimised debug builds use about five times more stack per call, so they get
+    /// 4 MB. The shipped wasm engine itself is checked by `e2e/engine_limits.mjs`.
+    fn on_wasm_sized_stack(f: impl FnOnce() + Send + 'static) {
+        let size = if cfg!(debug_assertions) { 4 << 20 } else { 1 << 20 };
+        std::thread::Builder::new().stack_size(size).spawn(f).unwrap().join().unwrap();
+    }
+
+    /// Deeply nested or very long formulas are refused or evaluated without exhausting the stack.
+    #[test]
+    fn nesting_and_length_limits() {
+        on_wasm_sized_stack(|| {
+            let wb = book();
+            let name = Value::Error(ErrorKind::Name);
+            let parens = |k: usize| format!("{}1{}", "(".repeat(k), ")".repeat(k));
+            assert_eq!(ev(&wb, &parens(255)), Value::Number(1.0)); // 255 + the formula itself = 256 levels
+            assert_eq!(ev(&wb, &parens(256)), name);
+            assert_eq!(ev(&wb, &parens(5000)), name); // used to overflow the stack
+            assert_eq!(ev(&wb, &format!("{}1", "-".repeat(255))), Value::Number(-1.0));
+            assert_eq!(ev(&wb, &format!("{}1", "-".repeat(5000))), name);
+            let calls = |k: usize| format!("{}1{}", "ABS(".repeat(k), ")".repeat(k));
+            assert_eq!(ev(&wb, &calls(64)), Value::Number(1.0)); // Excel's own nesting limit
+            assert_eq!(ev(&wb, &calls(300)), name);
+            // operator chains are flat, so their length costs no stack: 20,000 terms is well past
+            // Excel's 8,192-character limit, and still evaluates, prints and re-parses
+            let chain = format!("{}1", "1+".repeat(19_999));
+            assert_eq!(ev(&wb, &chain), Value::Number(20_000.0));
+            let tree = parse(&chain).unwrap();
+            assert_eq!(parse(&to_string(&tree)).unwrap(), tree);
+            // the engine's own printing can be far longer than the input: still re-parses
+            let big = format!("{}1E300", "1E300+".repeat(500));
+            assert!(to_string(&parse(&big).unwrap()).len() > 100_000);
+            assert_eq!(parse(&to_string(&parse(&big).unwrap())).unwrap(), parse(&big).unwrap());
+            // `(1+2)+3` and `1+2+3` are one chain, so they print alike
+            assert_eq!(parse("(1+2)+3").unwrap(), parse("1+2+3").unwrap());
+            assert_eq!(to_string(&parse("1-(2-3)").unwrap()), "1 - (2 - 3)");
+            assert_eq!(ev(&wb, &format!("1{}", "%".repeat(300))), name); // each % nests a level
+            // chains keep left-to-right order and operator precedence
+            assert_eq!(ev(&wb, "10-2-3"), Value::Number(5.0));
+            assert_eq!(ev(&wb, "2^3^2"), Value::Number(64.0));
+            assert_eq!(ev(&wb, "1+2*3-4/2=5"), Value::Bool(true));
+            assert_eq!(ev(&wb, "\"a\"&1+1&\"b\""), Value::Text("a2b".into()));
+            match evaluate_full(&wb, 1, None, "A1:A4+1+A1:A4") {
+                Arg::Array(a) => assert_eq!(a.data[3], Value::Number(81.0)),
+                other => panic!("{:?}", other),
+            }
+            // a long chain of references survives the other walks over the formula tree
+            let refs = format!("{}A1", "A1+".repeat(2700));
+            assert_eq!(ev(&wb, &refs), Value::Number(27_010.0));
+            assert!(!dependencies(&wb, 1, &refs).is_empty());
+            let shifted = shift_relative(&refs, 1, 0); // printed with spaces: `A2 + A2 + …`
+            assert!(shifted.starts_with("A2 + A2 + ") && !shifted.contains("A1"));
+            assert_eq!(shift_relative(&parens(255), 1, 0), shifted_parens(255));
+            let moved = adjust_for_insert_delete(&refs, true, "Table 1", true, 0, 1);
+            assert!(moved.starts_with("A2 + ") && !moved.contains("A1"));
+            let renamed = rename_table(&format!("{}Sales::B1", "Sales::B1+".repeat(700)), "Sales", "Revenue");
+            assert!(renamed.starts_with("Revenue::B1 + ") && !renamed.contains("Sales"));
+        });
+    }
+
+    /// `to_string` of the nested-parentheses formula, as `shift_relative` prints it.
+    fn shifted_parens(k: usize) -> String {
+        to_string(&parse(&format!("{}1{}", "(".repeat(k), ")".repeat(k))).unwrap())
+    }
+
+    /// Weekday with Monday = 0, computed independently of the engine (serial 25569 = Thu 1 Jan 1970).
+    fn mon0(d: i64) -> usize {
+        (d - 2).rem_euclid(7) as usize
+    }
+
+    /// The work-day functions now count arithmetically. Check them against the plain day-by-day
+    /// count they replaced, over random spans, weekend masks and holiday lists (with duplicates
+    /// and holidays on weekends), plus Microsoft's published examples.
+    #[test]
+    fn workdays_match_day_by_day_count() {
+        let wb = book();
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = move |n: i64| -> i64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as i64
+        };
+        for case in 0..3000 {
+            let s = 40_000 + rnd(7000);
+            let e = s + rnd(801) - 400;
+            let days = rnd(601) - 300;
+            let mask: Vec<bool> = loop {
+                let m: Vec<bool> = (0..7).map(|_| rnd(3) == 0).collect();
+                if m.iter().any(|w| !*w) {
+                    break m;
+                }
+            };
+            let mask_text: String = mask.iter().map(|w| if *w { '1' } else { '0' }).collect();
+            let hols: Vec<i64> = (0..rnd(7)).map(|_| s.min(e) + rnd(400) - 50).collect();
+            let hols_text = if hols.is_empty() {
+                "{0}".to_string() // serial 0 never falls inside the spans tested here
+            } else {
+                format!("{{{}}}", hols.iter().map(|h| h.to_string()).collect::<Vec<_>>().join(","))
+            };
+            let working = |d: i64| !mask[mon0(d)] && !hols.contains(&d);
+            // NETWORKDAYS.INTL, counted day by day
+            let (lo, hi, sign) = if s <= e { (s, e, 1) } else { (e, s, -1) };
+            let expect_count = sign * (lo..=hi).filter(|d| working(*d)).count() as i64;
+            let got = ev(&wb, &format!("NETWORKDAYS.INTL({s},{e},\"{mask_text}\",{hols_text})"));
+            assert_eq!(got, Value::Number(expect_count as f64), "case {case}: NETWORKDAYS.INTL({s},{e},{mask_text},{hols_text})");
+            // WORKDAY.INTL, stepped day by day
+            let mut d = s;
+            let mut left = days.abs();
+            while left > 0 {
+                d += days.signum();
+                if working(d) {
+                    left -= 1;
+                }
+            }
+            let got = ev(&wb, &format!("WORKDAY.INTL({s},{days},\"{mask_text}\",{hols_text})"));
+            assert_eq!(got, Value::Number(d as f64), "case {case}: WORKDAY.INTL({s},{days},{mask_text},{hols_text})");
+        }
+        // Saturday/Sunday versions agree with the masked ones
+        assert_eq!(ev(&wb, "NETWORKDAYS(45000,45500,{45100,45101})"), ev(&wb, "NETWORKDAYS.INTL(45000,45500,1,{45100,45101})"));
+        assert_eq!(ev(&wb, "WORKDAY(45000,-77,{44950})"), ev(&wb, "WORKDAY.INTL(45000,-77,1,{44950})"));
+        // Microsoft's documented examples
+        assert_eq!(ev(&wb, "NETWORKDAYS(DATE(2012,10,1),DATE(2013,3,1))"), Value::Number(110.0));
+        assert_eq!(ev(&wb, "NETWORKDAYS(DATE(2012,10,1),DATE(2013,3,1),DATE(2012,11,22))"), Value::Number(109.0));
+        assert_eq!(
+            ev(&wb, "NETWORKDAYS(DATE(2012,10,1),DATE(2013,3,1),{\"2012/11/22\",\"2012/12/4\",\"2013/1/21\"})"),
+            Value::Number(107.0)
+        );
+        assert_eq!(ev(&wb, "WORKDAY(DATE(2008,10,1),151)"), ev(&wb, "DATE(2009,4,30)"));
+        assert_eq!(ev(&wb, "WORKDAY(DATE(2008,10,1),151,{\"2008/11/26\",\"2008/12/4\",\"2009/1/21\"})"), ev(&wb, "DATE(2009,5,5)"));
+        assert_eq!(ev(&wb, "NETWORKDAYS.INTL(DATE(2006,1,1),DATE(2006,1,31))"), Value::Number(22.0));
+        assert_eq!(ev(&wb, "NETWORKDAYS.INTL(DATE(2006,2,28),DATE(2006,1,31))"), Value::Number(-21.0));
+        assert_eq!(ev(&wb, "NETWORKDAYS.INTL(DATE(2006,1,1),DATE(2006,2,1),7,{\"2006/1/2\",\"2006/1/16\"})"), Value::Number(22.0));
+        assert_eq!(ev(&wb, "NETWORKDAYS.INTL(DATE(2006,1,1),DATE(2006,2,1),\"0010001\",{\"2006/1/2\",\"2006/1/16\"})"), Value::Number(20.0));
+        assert_eq!(ev(&wb, "WORKDAY.INTL(DATE(2012,1,1),90,11)"), Value::Number(41013.0));
+        assert_eq!(ev(&wb, "WORKDAY.INTL(DATE(2012,1,1),30,17)"), ev(&wb, "DATE(2012,2,5)"));
+        // a start date on a weekend with 0 days is returned unchanged
+        assert_eq!(ev(&wb, "WORKDAY(DATE(2026,10,10),0)"), ev(&wb, "DATE(2026,10,10)"));
+        assert_eq!(ev(&wb, "WORKDAY.INTL(1,5,\"1111111\")"), Value::Error(ErrorKind::Value));
     }
 
     #[test]

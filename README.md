@@ -233,7 +233,10 @@ Measured in headless Chromium with software WebGL (SwiftShader): filling a 5 000
 ## Tests
 
 ```bash
-cd core && cargo test                                   # engine: 38 tests (the agent runtime kept on a cell among them) (incl. a check that every listed function resolves)
+cd core && cargo test                                   # engine: 42 tests (the agent runtime kept on a cell among them) (incl. a check that every listed function resolves,
+                                                        # formula resource limits, and the work-day functions against a day-by-day count)
+node e2e/engine_limits.mjs server/engine                # the shipped wasm engine: 44 formulas that used to crash, hang or exhaust memory
+                                                        # return an error quickly and leave the engine working (one process each, 20 s limit)
 python3 e2e/smoke.py http://localhost:8787 --python     # editing, handles, code cells, save/open (22 checks)
 node e2e/mock-llm.mjs &                                 # mock model for the assistant (also plays a tool round)
 python3 e2e/features.py http://localhost:8787 --pg host:port:db:user:pass --mock-llm http://127.0.0.1:8899/v1
@@ -335,6 +338,7 @@ CI (`.github/workflows/ci.yml`) runs all of this on every push against PostgreSQ
 
 ## Limitations (honest list)
 
+- Formulas are bounded so that none can crash or hang the engine: text up to Excel's 32,767 characters, dates from 1900 to 31 Dec 9999, arrays generated from size arguments (`SEQUENCE`, `EXPAND`, `WRAPROWS`/`WRAPCOLS`) up to one million cells, arrays read from ranges or computed element-wise up to ten million, 64 nested function calls (Excel's limit) and 256 levels of brackets, and roughly a second of work per evaluation. Past a limit the formula returns `#NUM!` (sizes, dates, work) or `#VALUE!` (text), and `IFERROR` cannot turn a stopped evaluation into a value. `XLOOKUP` matches exactly, first to last: its `match_mode` and `search_mode` arguments are not implemented yet.
 - No freeze panes beyond the sticky header row of the selected table; merged cells cannot span a header/body boundary meaningfully; row heights do not auto-grow for wrapped text.
 - Charts cover the exhibit styles above (no pie, scatter or secondary axes); a chart reads its ranges on every change, so keep series under a few thousand points.
 - Multiplayer: two people changing the *structure* of the same table at once (inserting rows while another resizes) still resolve by resyncing from the server's log — correct but visible as a brief reload. Code-cell outputs are recomputed by every client rather than shared.
