@@ -23,6 +23,7 @@ Usage: python3 e2e/guided_import.py [http://127.0.0.1:8787]   (screenshots in $E
 """
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -289,6 +290,102 @@ def main():
         check("19. a document missing here is traced to its line in the first file", f"The line in “{NAME_A}" in miss, miss[:200])
         chg = next((b for n, b in seen.items() if n.startswith("Every difference")), "")
         check("19. a changed document shows the comparison row apart from the file's line", "The row in this table" in chg and "The line in the file" in chg)
+
+        # ---- 19b. a placement whose broadcast never reaches this browser still shows up, and only once. A new
+        # workbook opens its own live connection; the server sends the placed tables to whoever is in the room when
+        # it commits them; a browser that joins later must catch up from the log. Here the op, welcome and rejected
+        # frames and the page's own saves are held back while placing, then the frames are delivered late (the
+        # placement catches up to the position the server reports; repeated updates must change nothing).
+        held = {"on": False, "frames": [], "seen": 0, "urls": [], "ws": None}
+        HOLD = ('{"type":"op"', '{"type":"welcome"', '{"type":"rejected"')
+
+        def relay(ws):
+            held["urls"].append(ws.url)
+            held["ws"] = ws
+            server = ws.connect_to_server()
+
+            def from_server(m):
+                held["seen"] += 1
+                if held["on"] and isinstance(m, str) and m.startswith(HOLD):
+                    held["frames"].append((ws, m))
+                    return
+                ws.send(m)
+            server.on_message(from_server)
+            ws.on_message(lambda m: server.send(m))
+        p3 = browser.new_context(viewport={"width": 1600, "height": 1000}).new_page()
+        p3.on("pageerror", lambda e: errors.append("p3: " + str(e)))
+        p3.on("dialog", lambda dl: dl.accept())
+        p3.route_web_socket(re.compile(r"/ws\?"), relay)
+        p3.route(re.compile(r"/api/files/[0-9a-f]+$"), lambda route: route.abort() if held["on"] and route.request.method == "PUT" else route.continue_())
+        p3.goto(BASE + "/", wait_until="networkidle")
+        p3.wait_for_selector(".topbar", timeout=60_000)
+        p3.get_by_role("button", name="Guided import of a large export").click()
+        p3.locator(".studio .dataset-row", has_text=NAME_A).first.click()
+        p3.wait_for_selector(".results .place-card button.primary", timeout=60_000)
+        pc = p3.locator(".results .place-card")
+        fresh = pc.locator("input[type=radio]").first.is_checked()
+        held["on"] = True
+        pc.locator("button.primary").click()
+        p3.wait_for_function("() => { const c = document.querySelector('.results .place-card'); return c && [...c.querySelectorAll('.green-text, .err')].some(e => /Placed|error|failed|denied/i.test(e.textContent)); }", timeout=120_000)
+        msg3 = pc.locator(".green-text, .err").first.inner_text()
+        m3 = re.match(r"Placed (\d+) tables?", msg3)
+        n3 = int(m3.group(1)) if m3 else -1
+        p3.click("button[aria-label='Close the guided import']")
+        got = False
+        try:
+            p3.wait_for_function("(n) => { const s = window.__gw && window.__gw.getState(); return s && s.importedTables.size >= n && [...s.importedTables.keys()].every((k) => s.tables.get(k)); }", arg=n3, timeout=30_000)
+            got = True
+        except Exception:
+            pass
+        names = lambda: p3.evaluate("() => [...window.__gw.getState().tables.values()].map((t) => t.name)")  # noqa: E731
+        before3 = names()
+        check("19b. placed in a new workbook while its live updates were held back: the tables still show (caught up from the log)",
+              fresh and n3 > 0 and got and len(held["frames"]) > 0 and len(before3) == n3, (msg3[:60], len(held["frames"]), held["seen"], held["urls"][-2:], before3))
+        held["on"] = False
+        for ws, m in held["frames"]:
+            ws.send(m)
+        # and a broadcast of the placement arriving after the catch-up (as one can, on its own connection): the
+        # logged entry that added the first placed table, sent again exactly as the server sends it
+        doc3 = p3.evaluate("() => window.__gw.getState().fileId")
+        st, H3 = call("GET", f"/api/files/{doc3}/history?limit=1000")
+        add = next((e for e in reversed(H3.get("entries", [])) if (e.get("op") or {}).get("type") == "add_table"), None)  # oldest first
+        if add and held["ws"]:
+            held["ws"].send(json.dumps({"type": "op", "seq": add["seq"], "client": "server", "op": add["op"], "origin": add.get("origin"), "author": add.get("author")}))
+        p3.wait_for_timeout(1500)
+        after3 = names()
+        check("19b. …and updates delivered late (the held frames, a repeated broadcast) leave the workbook as it is",
+              add is not None and after3 == before3 and len(set(after3)) == len(after3), (add and add["seq"], after3))
+
+        # ---- 19c. someone else's edit that arrives while this browser is resynchronising is kept: the server answers
+        # the resync's reload at once (without the edit), but the answer reaches the page only after a second
+        # editor's change has (the reload must not replace the copy that change was meant for).
+        p4 = browser.new_context(viewport={"width": 1400, "height": 900}).new_page()
+        p4.on("pageerror", lambda e: errors.append("p4: " + str(e)))
+        p4.goto(f"{BASE}/?file={doc3}", wait_until="networkidle")
+        p4.wait_for_function("(n) => { const s = window.__gw && window.__gw.getState(); return s && s.fileId && s.tables.size >= n; }", arg=n3, timeout=60_000)
+        p4.wait_for_timeout(1000)
+        parked = []
+        p3.route(re.compile(r"/history/replay\?"), lambda route: parked.append((route, route.fetch())))
+        tid = p3.evaluate("() => [...window.__gw.getState().tables.keys()][0]")
+        held["ws"].send(json.dumps({"type": "rejected", "cid": "e2e-none", "reason": "e2e: resynchronise"}))
+        for _ in range(100):
+            if parked:
+                break
+            p3.wait_for_timeout(100)
+        seen0 = held["seen"]
+        p4.evaluate("([t]) => window.__gw.book.apply({ type: 'set_cell', table: t, row: 3, col: 0, input: 'edited meanwhile' })", [tid])
+        for _ in range(50):
+            if held["seen"] > seen0:
+                break
+            p3.wait_for_timeout(100)
+        arrived = held["seen"] > seen0
+        for r, resp in parked:
+            r.fulfill(response=resp)
+        p3.wait_for_timeout(2500)
+        kept = p3.evaluate("() => window.__gw.book.getBook().to_json().includes('edited meanwhile')")
+        check("19c. an edit by someone else that arrives during a resync is kept", bool(parked) and arrived and kept, (len(parked), arrived, kept))
+        p4.context.close()
+        p3.context.close()
         check("20. no uncaught errors in the page", not errors, "; ".join(errors[:2])[:200])
         browser.close()
 
