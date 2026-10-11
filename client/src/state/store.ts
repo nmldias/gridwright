@@ -140,6 +140,12 @@ interface State {
   start: boolean;
   /** what the Files panel shows */
   filesView: 'documents' | 'templates';
+  /** the guided import studio: open on the library (no dataset) or on one dataset and tab */
+  studio: { dataset?: string; tab?: 'prepare' | 'results' | 'related' | 'audit'; run?: string } | null;
+  /** "How was this made?" for a placed table (and a row of it) */
+  lineage: { table: number; row?: number; source?: number } | null;
+  /** tables of this document placed by a guided import, by table id */
+  importedTables: Map<number, { dataset: string; run: string; output: string; name: string }>;
   /** what the Clients & people panel shows (accounts mode) */
   adminView: 'members' | 'activity' | 'account' | 'clients' | 'people';
   /** open companion issues needing attention (the Ask badge) */
@@ -204,6 +210,9 @@ export const useStore = create<State>((set) => ({
   })(),
   start: false,
   filesView: 'documents',
+  studio: null,
+  lineage: null,
+  importedTables: new Map(),
   adminView: 'members',
   attention: 0,
   companionVersion: 0,

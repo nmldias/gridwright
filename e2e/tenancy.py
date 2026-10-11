@@ -124,7 +124,7 @@ class Client:
         self.bearer = bearer
         self.origin = origin
 
-    def call(self, method, path, body=None, headers=None):
+    def call(self, method, path, body=None, headers=None, data=None):
         h = {"content-type": "application/json"}
         if self.cookie:
             h["cookie"] = self.cookie
@@ -135,7 +135,7 @@ class Client:
         if self.origin:
             h["origin"] = self.origin
         h.update(headers or {})
-        req = urllib.request.Request(BASE + path, method=method, data=json.dumps(body).encode() if body is not None else None, headers=h)
+        req = urllib.request.Request(BASE + path, method=method, data=data if data is not None else json.dumps(body).encode() if body is not None else None, headers=h)
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 self._cookie(r.headers.get_all("set-cookie") or [])
@@ -169,6 +169,9 @@ class Client:
 
     def delete(self, p):
         return self.call("DELETE", p)
+
+    def upload(self, p, data):
+        return self.call("POST", p, headers={"content-type": "application/octet-stream"}, data=data)
 
 
 def ws_open(c, file, tenant):
@@ -342,6 +345,74 @@ st, _ = dave.post("/api/files", {"name": "x", "json": DOC})
 ok(st == 403, "a viewer cannot create documents")
 st, f = dave.get("/api/files")
 ok(f and f[0]["permission"] == "view", "…and only views the client's documents")
+
+# --- guided import: files, runs, recipes and lineage stay in their client; viewers only look
+SALES = ("Nº interno,Cliente,Data,Valor\n" + "".join(f"{1000 + i},C{i % 3},2026-0{1 + i % 6}-1{i % 9},{100 + i}\n" for i in range(40))).encode()
+
+
+def ds_wait(c, job):
+    for _ in range(240):
+        st, j = c.get(f"/api/datasets/jobs/{job}")
+        if st != 200:
+            return None
+        if j["job"]["status"] in ("done", "failed"):
+            return j["job"]
+        time.sleep(0.25)
+    return None
+
+
+st, r = alice.upload("/api/datasets?name=acme-sales.csv", SALES)
+ok(st == 201, "Alice brings in a file for a guided import")
+ADS, AJOB = r["dataset"]["id"], r["job"]["id"]
+j = ds_wait(alice, AJOB)
+ok(j and j["status"] == "done", "…it is read in the background")
+ok(bob.get(f"/api/datasets/jobs/{AJOB}")[0] == 404, "Bob cannot follow Acme's job")
+ok(ADS not in [d["id"] for d in bob.get("/api/datasets")[1]["datasets"]], "Globex's dataset list has nothing of Acme's")
+for what, path in (("the dataset", ""), ("its original file", "/source"), ("its raw rows", "/raw?sheet=0&offset=0&limit=5"), ("its related files", "/related")):
+    ok(bob.get(f"/api/datasets/{ADS}{path}")[0] == 404, f"Bob cannot read {what} by id")
+draft = alice.get(f"/api/datasets/{ADS}")[1]["dataset"]["draft"]
+RUNBODY = {"steps": draft["steps"], "roles": draft["roles"]}
+ok(bob.post(f"/api/datasets/{ADS}/run", RUNBODY)[0] == 404, "…nor run steps on it")
+ok(bob.call("DELETE", f"/api/datasets/{ADS}")[0] == 404, "…nor delete it")
+ok(dave.get(f"/api/datasets/{ADS}")[0] == 200, "Dave (viewer) sees Acme's datasets")
+ok(dave.post(f"/api/datasets/{ADS}/run", RUNBODY)[0] == 403, "…but cannot run steps")
+ok(dave.upload("/api/datasets?name=x.csv", SALES)[0] == 403, "…nor bring in files")
+ok(dave.post(f"/api/datasets/{ADS}/assist", {"question": "what is here?"})[0] == 403, "…nor ask the assistant to change steps")
+st, r = carol.post(f"/api/datasets/{ADS}/run", RUNBODY)
+j = ds_wait(carol, r["job"]["id"]) if st == 202 else None
+ok(j and j["status"] == "done", "Carol (editor) runs the steps")
+ARUN = j["result"]["run"]
+AOUT = [o["key"] for o in alice.get(f"/api/datasets/{ADS}/runs/{ARUN}")[1]["run"]["outputs"]][:1]
+ok(bob.get(f"/api/datasets/{ADS}/runs/{ARUN}")[0] == 404 and bob.get(f"/api/datasets/{ADS}/runs/{ARUN}/export/out_{AOUT[0]}")[0] == 404, "Bob cannot read or export Acme's run")
+st, rec = carol.post("/api/recipes", {"dataset": ADS, "run": ARUN, "name": "Acme sales", "auto": True})
+ok(st == 201, "Carol saves the steps as an automatic recipe")
+AREC = rec["recipe"]["id"]
+ok(AREC not in [x["id"] for x in bob.get("/api/recipes")[1]["recipes"]] and bob.get(f"/api/recipes/{AREC}")[0] == 404, "Globex does not see Acme's recipes")
+ok(bob.call("PATCH", f"/api/recipes/{AREC}", {"name": "mine"})[0] == 404 and bob.delete(f"/api/recipes/{AREC}")[0] == 404, "…nor change or delete them")
+ok(dave.delete(f"/api/recipes/{AREC}")[0] == 403, "a viewer cannot delete a recipe")
+st, r = bob.upload("/api/datasets?name=globex-sales.csv", SALES)
+GDS = r["dataset"]["id"]
+ds_wait(bob, r["job"]["id"])
+gm = bob.get(f"/api/datasets/{GDS}")[1]["dataset"]
+ok(not gm.get("match") and not gm.get("runs"), "the same layout in Globex: Acme's automatic recipe is neither offered nor run")
+gdraft = gm["draft"]
+st, r = bob.post(f"/api/datasets/{GDS}/run", {"steps": gdraft["steps"], "roles": gdraft["roles"]})
+ds_wait(bob, r["job"]["id"])
+st, rel = bob.get(f"/api/datasets/{GDS}/related")
+if st == 200 and rel.get("job"):
+    rel = (ds_wait(bob, rel["job"]["id"]) or {}).get("result") or {}
+ok(st == 200 and all(x.get("other") != ADS for x in rel.get("relations", [])), "related files never cross clients")
+st, r = bob.post(f"/api/datasets/{GDS}/merge", {"kind": "compare", "other": ADS, "key": {"a": "no_interno", "b": "no_interno"}})
+j = ds_wait(bob, r["job"]["id"]) if st in (200, 202) and r.get("job") else None
+ok(st in (400, 404) or (j and j["status"] == "failed"), "a comparison cannot reach another client's file")
+ok(bob.post(f"/api/files/{G1}/datasets/place", {"dataset": ADS, "run": ARUN, "outputs": AOUT})[0] == 404, "Bob cannot place Acme's tables in Globex's workbook")
+st, pl = alice.post(f"/api/files/{A1}/datasets/place", {"dataset": ADS, "run": ARUN, "outputs": AOUT})
+ok(st == 200, "Alice places the table in Acme's workbook")
+ok(dave.post(f"/api/files/{A1}/datasets/place", {"dataset": ADS, "run": ARUN, "outputs": AOUT})[0] == 403, "a viewer cannot place tables")
+PT = pl["placement"]["tables"][0]["table"]
+ok(dave.get(f"/api/files/{A1}/lineage?table={PT}&row=0")[0] == 200, "a viewer can ask how a placed table was made")
+ok(bob.get(f"/api/files/{A1}/lineage?table={PT}&row=0")[0] in (403, 404) and bob.get(f"/api/files/{A1}/lineage/tables")[0] in (403, 404), "…Bob cannot, not even which tables came from an import")
+ok(bob.delete(f"/api/datasets/{GDS}")[0] == 200, "Bob deletes his own dataset")
 
 # --- the WebSocket follows the same rules, live
 st, s = ws_open(bob, A1, ACME)

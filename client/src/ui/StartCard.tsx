@@ -1,9 +1,10 @@
 import { useStore } from '../state/store';
 import { newFile } from './files';
 import { pickAndImport } from './import';
+import { openStudio } from './studio/nav';
 
 /**
- * First use: three ways to start, and the example to try. Shown once per fresh document and gone
+ * First use: four ways to start, and the example to try. Shown once per fresh document and gone
  * at the first edit, the first open, or a click on its cross.
  */
 export function StartCard() {
@@ -25,6 +26,16 @@ export function StartCard() {
       >
         <span>Bring a file in — CSV, Excel, XML, JSON</span>
         <span className="muted small">read and checked first; you decide where it goes</span>
+      </button>
+      <button
+        className="start-choice"
+        onClick={() => {
+          dismiss();
+          openStudio();
+        }}
+      >
+        <span>Guided import of a large export</span>
+        <span className="muted small">cleaned, structured and analysed step by step — audited, and saved as a recipe for next month</span>
       </button>
       <button
         className="start-choice"

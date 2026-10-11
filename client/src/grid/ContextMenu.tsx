@@ -6,6 +6,7 @@ import { autoFitColumns, clearSelection, copySelection, deleteSelectedTable, mak
 import { colToLetters, refText } from '../engine/types';
 import type { Hit } from './geometry';
 import { exportTableXlsx } from '../ui/xlsx';
+import { openLineage } from '../ui/studio/Lineage';
 import { insertChart, traceActiveCell } from '../ui/review';
 import { openPrintView } from '../ui/print';
 
@@ -80,6 +81,12 @@ export function ContextMenu({ host }: { host: HTMLElement | null }) {
   return (
     <Overlay>
     <div className="context-menu" style={{ left, top }} onContextMenu={(e) => e.preventDefault()} onPointerDown={(e) => e.stopPropagation()}>
+      {tableId !== null && getState().importedTables.has(tableId) && (
+        <>
+          {item(sel && sel.table === tableId && sel.ar >= (getState().tables.get(tableId)?.header_rows ?? 1) ? 'How was this row made?' : 'How was this table made?', () => openLineage(tableId, sel && sel.table === tableId ? sel.ar : undefined))}
+          {sep}
+        </>
+      )}
       {sel && tableId !== null && (
         <>
           {item('Cut', () => void copySelection(true))}

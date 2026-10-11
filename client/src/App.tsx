@@ -18,6 +18,9 @@ import { SharePanel } from './ui/SharePanel';
 import { NavigatePanel } from './ui/NavigatePanel';
 import { StartCard } from './ui/StartCard';
 import { TrustBanner } from './ui/TrustBanner';
+import { StudioBoundary } from './ui/studio/Boundary';
+import { ImportStudio } from './ui/studio/Studio';
+import { LineageDialog, useImportedTables } from './ui/studio/Lineage';
 import { SidePanel } from './ui/SidePanel';
 import { loadProposals } from './ui/proposals';
 import { loadCompanion } from './ui/companion';
@@ -143,6 +146,7 @@ export function App() {
   useEffect(() => {
     if (fileId) void loadPendingIntakes(fileId);
   }, [fileId, companionVersion]);
+  useImportedTables();
   useEffect(() => {
     const url = new URL(location.href);
     if (fileId) url.searchParams.set('file', fileId);
@@ -186,6 +190,12 @@ export function App() {
         )}
       </main>
       <StatusBar />
+      <StudioBoundary label="Guided import">
+        <ImportStudio />
+      </StudioBoundary>
+      <StudioBoundary label="Lineage view">
+        <LineageDialog />
+      </StudioBoundary>
     </div>
   );
 }

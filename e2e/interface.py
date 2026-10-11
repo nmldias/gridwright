@@ -57,7 +57,7 @@ def main():
             return page.evaluate("(op) => window.__gw.book.apply(op)", op)
 
         # ------------------------------------------------------------------ first use
-        check("a fresh document offers the start choices: import, template, blank — and the example stays on the canvas", page.locator(".start-card .start-choice").count() == 3 and "Bring a file in" in page.text_content(".start-card") and state()["tables"][0]["name"] == "Table 1", "")
+        check("a fresh document offers the start choices: import, guided import, template, blank — and the example stays on the canvas", page.locator(".start-card .start-choice").count() == 4 and "Bring a file in" in page.text_content(".start-card") and "Guided import" in page.text_content(".start-card") and state()["tables"][0]["name"] == "Table 1", "")
         bar = [b for b in page.evaluate("() => [...document.querySelectorAll('.topbar > button, .topbar > .menu-wrap > button')].map((b) => b.textContent.trim().replace(/▾$/, '').trim())") if b]
         check("the primary bar: document · Save · Add · Python · Ask · Review · Share (+ Format with a selection, More)", bar[0] == "Untitled" and bar[1] == "Save" and bar[4:9] == ["Add", "Python", "Ask", "Review", "Share"] and bar[-1] == "More", str(bar))
 
