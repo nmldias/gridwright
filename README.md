@@ -309,7 +309,7 @@ python3 e2e/perf.py http://localhost:8787               # fill / edit / frame ti
 python3 e2e/guided_import.py http://localhost:8787      # guided import on synthetic exports with independent figures:
                                                         # profile, recipe, run, insights, placement, layout drift,
                                                         # automatic recipe, keyed comparison placed, right-click
-                                                        # lineage to the original line, hostile cells (63 checks)
+                                                        # lineage to the original line, hostile cells, ledger and supplier registers (68 checks)
 python3 e2e/tenancy.py                                  # multi-tenant: isolation, invitations, platform, tokens, migration,
                                                         # guided-import data per client (116 checks; starts its own servers)
 python3 e2e/tenancy_ui.py                               # the same in a browser: sign-in, client switcher, members,

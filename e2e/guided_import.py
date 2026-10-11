@@ -15,6 +15,9 @@ expected figures are computed independently of the server.
            documents only here / missing), the rows trace to the right file; an automatic recipe
            runs by itself on the next similar file; bad input and bad requests are refused; deleting
            a dataset removes it and leaves the placed tables in the workbook
+  API      registers that are not customer invoices: a ledger (an account description beside a cost
+           centre) yields no customer and no name rewriting; a supplier register keeps its supplier,
+           with one supplier's two spellings joined
 
 Usage: python3 e2e/guided_import.py [http://127.0.0.1:8787]   (screenshots in $E2E_OUT)
 """
@@ -27,7 +30,7 @@ import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from guided_fixture import build  # noqa: E402
+from guided_fixture import build, other_registers  # noqa: E402
 from playwright.sync_api import sync_playwright  # noqa: E402
 
 ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
@@ -256,7 +259,8 @@ def main():
         msg = place.locator(".green-text, .err").first.inner_text()
         check("17. the five comparison tables are placed", msg.startswith("Placed 5 tables"), msg)
         page.click("button[aria-label='Close the guided import']")
-        page.wait_for_timeout(2500)
+        # the workbook lists the placed tables before every table's cells have loaded: wait for both
+        page.wait_for_function("() => { const s = window.__gw && window.__gw.getState(); return s && s.importedTables.size >= 5 && [...s.importedTables.keys()].every((k) => s.tables.get(k)); }", timeout=60_000)
         imported = page.evaluate("() => [...window.__gw.getState().importedTables.entries()].map(([k, v]) => ({ table: k, name: v.name ?? '' }))")
         check("18. the workbook opens with the placed tables", len(imported) == 5, imported)
         seen = {}
@@ -371,6 +375,42 @@ def main():
     book = json.loads((f or {}).get("json") or "{}") if isinstance(f, dict) else {}
     check("27. after deleting the source, the placed tables stay in the workbook (their lineage goes with the source)", st == 200 and st2 == 404 and len(book.get("tables", [])) == 2, (st, st2, len(book.get("tables", []))))
     call("DELETE", f"/api/recipes/{REC}")
+
+    # ============================================================ 28. registers that are not customer invoices
+    def read_and_run(name, buf):
+        st, r = upload(name, buf)
+        ds = r["dataset"]["id"]
+        wait(r["job"]["id"])
+        st, d = call("GET", f"/api/datasets/{ds}")
+        m = d["dataset"]
+        labels = {c["key"]: c["label"] for c in (d.get("profiles") or [{}])[0].get("columns", [])}
+        j = wait(call("POST", f"/api/datasets/{ds}/run", {"steps": m["draft"]["steps"], "roles": m["draft"]["roles"]})[1]["job"]["id"])
+        run = j.get("result", {}).get("run")
+        st, rr = call("GET", f"/api/datasets/{ds}/runs/{run}") if run else (0, {})
+        return ds, d, m, labels, j, (rr or {}).get("run") or {}
+
+    regs = other_registers()
+    ds, d, m, labels, j, R = read_and_run(f"razao-geral-{TAG}.xlsx", regs["ledger"][0])
+    pairs = [(labels.get(x["code"]), labels.get(x["name"])) for x in (d.get("profiles") or [{}])[0].get("pairs", [])]
+    check("28. a ledger: an account description and the cost centre beside it are not read as a code with several names",
+          ("Descrição Conta", "Centro de Custo") not in pairs and ("Conta", "Centro de Custo") not in pairs, pairs)
+    roles, types = m["draft"]["roles"], [s["type"] for s in m["draft"]["steps"]]
+    check("28. a ledger: nothing is taken as the customer, and no step rewrites names", "customer" not in roles and "customerCode" not in roles and "canonical" not in types, (roles, types))
+    outs = [o["key"] for o in R.get("outputs", [])]
+    check("28. a ledger still runs: the cleaned lines, without customer tables", j["status"] == "done" and "documents" in outs and not {"customers", "top_customers"} & set(outs), (j["status"], outs))
+    call("DELETE", f"/api/datasets/{ds}")
+
+    XS = regs["suppliers"][1]
+    ds, d, m, labels, j, R = read_and_run(f"fornecedores-{TAG}.xlsx", regs["suppliers"][0])
+    roles, steps = m["draft"]["roles"], m["draft"]["steps"]
+    canon = next((s for s in steps if s["type"] == "canonical"), None)
+    check("28. a supplier register: the supplier (code and name) is the counterparty, and its two spellings get one name",
+          labels.get(roles.get("customerCode")) == "Cód. Fornecedor" and canon and labels.get(canon["name"]) == "Fornecedor" and roles.get("customer") == canon["into"]["key"], (roles, canon and canon.get("why")))
+    rows = table(ds, R.get("id"), "customers") if j["status"] == "done" else []
+    hit = [r for r in rows if XS["canonical"] in r.values()]
+    check("28. a supplier register: the supplier spelt two ways is one row, with every document's amount",
+          len(hit) == 1 and any(near(v, XS["variant_total"], 1) for v in hit[0].values() if isinstance(v, (int, float))) and not any("BETA DISTRIBUICAO SA" in r.values() for r in rows), hit or rows[:3])
+    call("DELETE", f"/api/datasets/{ds}")
 
     passed = sum(1 for _, ok, _ in results if ok)
     print(f"\n{passed}/{len(results)} checks passed")

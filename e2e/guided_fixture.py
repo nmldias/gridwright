@@ -179,3 +179,46 @@ if __name__ == "__main__":
     open(f"{out}/facturas-h1-corrigido.xlsx", "wb").write(b)
     json.dump(exp, open(f"{out}/facturas-expected.json", "w"), indent=1, default=str, ensure_ascii=False)
     print(len(a), len(b), json.dumps({k: v for k, v in exp["a"].items() if k != "by_month"}, default=str, ensure_ascii=False))
+
+
+ACCOUNTS = [("62110", "Rendas e alugueres"), ("62210", "Electricidade"), ("63110", "Remunerações"),
+            ("71110", "Vendas de mercadorias"), ("12110", "Depósitos à ordem"), ("24320", "IVA dedutível")]
+COST_CENTRES = ["CC01 Lisboa", "CC02 Luanda", "CC03 Porto"]
+SUPPLIERS = [("F001", "FORNECEDOR ALFA, LDA"), ("F002", "BETA DISTRIBUICAO, S.A."), ("F003", "GAMA SERVICOS, LDA"),
+             ("F004", "DELTA ENERGIA, S.A."), ("F005", "EPSILON TRANSPORTES, LDA")]
+SUPPLIER_VARIANT = ("F002", "BETA DISTRIBUICAO SA")  # the same supplier, spelt another way on some rows
+
+
+def other_registers(seed=7):
+    """Two registers that are not customer invoices, for the code/name pairing:
+
+      ledger     journal lines: an account code and its description, then the cost centre — every account
+                 is booked under every cost centre, so the description and the cost centre vary independently
+                 (not a code with several names, and nothing here is a customer)
+      suppliers  purchase invoices: a supplier code and name, one supplier spelt two ways on some rows
+
+    Returns {"ledger": (xlsx, expected), "suppliers": (xlsx, expected)}."""
+    rnd = random.Random(seed)
+    start = dt.date(2026, 1, 1)
+    ledger = [["Nº Lançamento", "Data", "Diário", "Conta", "Descrição Conta", "Centro de Custo", "Débito", "Crédito"]]
+    for n in range(1, 601):
+        acc, name = ACCOUNTS[n % len(ACCOUNTS)]
+        v = round(rnd.uniform(5_000, 900_000), 2)
+        debit = n % 2 == 0
+        ledger.append([50000 + n, start + dt.timedelta(days=rnd.randrange(180)), rnd.choice(["Compras", "Vendas", "Bancos"]),
+                       acc, name, COST_CENTRES[(n // len(ACCOUNTS)) % len(COST_CENTRES)], pt(v if debit else 0), pt(0 if debit else v)])
+    suppliers = [["Nº Documento", "Data Documento", "Cód. Fornecedor", "Fornecedor", "Valor", "Estado", "Moeda"]]
+    totals, variant_rows = {}, 0
+    for n in range(1, 501):
+        code, name = SUPPLIERS[rnd.randrange(len(SUPPLIERS))]
+        if code == SUPPLIER_VARIANT[0] and n % 5 == 0:
+            name, variant_rows = SUPPLIER_VARIANT[1], variant_rows + 1
+        v = round(rnd.uniform(10_000, 2_000_000), 2)
+        totals[code] = totals.get(code, 0) + v
+        suppliers.append([f"FF 2026/{n}", start + dt.timedelta(days=rnd.randrange(180)), code, name, pt(v), rnd.choice(["Pago", "Pendente"]), "AOA"])
+    canonical = dict(SUPPLIERS)
+    return {
+        "ledger": (xlsx(ledger), {"rows": 600}),
+        "suppliers": (xlsx(suppliers), {"rows": 500, "variant_rows": variant_rows, "variant_code": SUPPLIER_VARIANT[0],
+                                        "canonical": canonical[SUPPLIER_VARIANT[0]], "variant_total": round(totals[SUPPLIER_VARIANT[0]], 2)}),
+    }
