@@ -958,6 +958,44 @@ mod extended_tests {
         close(&wb, "FVSCHEDULE(1000,{0.09,0.11,0.1})", 1000.0 * 1.09 * 1.11 * 1.1, 1e-6);
         close(&wb, "MIRR({-120000,39000,30000,21000,37000,46000},0.1,0.12)", 0.126, 0.001);
     }
+    #[test]
+    fn excel_day_counts_and_two_digit_years() {
+        // Review 11 Oct, 2.3. Expected values are Excel's own: Microsoft's DAYS360 and YEARFRAC
+        // examples, reported Excel results, and (marked) Excel's published YEARFRAC algorithm.
+        let wb = book();
+        let eq = |f: &str, want: f64| assert_eq!(ev(&wb, f), Value::Number(want), "{f}");
+        // DAYS360, US method (Microsoft's examples)
+        eq("DAYS360(DATE(2011,1,30), DATE(2011,2,1))", 1.0);
+        eq("DAYS360(DATE(2011,1,1), DATE(2011,12,31))", 360.0);
+        eq("DAYS360(DATE(2011,1,1), DATE(2011,2,1))", 30.0);
+        // reported Excel results: an end on the last day of February is not adjusted, a start is
+        eq("DAYS360(DATE(2018,1,1), DATE(2018,1,31))", 30.0);
+        eq("DAYS360(DATE(2018,2,1), DATE(2018,2,28))", 27.0);
+        eq("DAYS360(DATE(2006,2,28), DATE(2006,2,28))", -2.0);
+        eq("DAYS360(DATE(2024,2,29), DATE(2024,3,31))", 30.0);
+        // European method: only the 31st changes
+        eq("DAYS360(DATE(2024,2,29), DATE(2024,3,31), TRUE)", 31.0);
+        // YEARFRAC (Microsoft's example: 1 Jan 2012 to 30 Jul 2012)
+        close(&wb, "YEARFRAC(DATE(2012,1,1), DATE(2012,7,30))", 0.58055556, 5e-9);
+        close(&wb, "YEARFRAC(DATE(2012,1,1), DATE(2012,7,30), 1)", 0.57650273, 5e-9);
+        close(&wb, "YEARFRAC(DATE(2012,1,1), DATE(2012,7,30), 3)", 0.57808219, 5e-9);
+        close(&wb, "YEARFRAC(DATE(2012,7,30), DATE(2012,1,1))", 0.58055556, 5e-9); // dates swapped
+        // actual/actual: a whole calendar year is 1, leap or not
+        eq("YEARFRAC(DATE(2024,1,1), DATE(2025,1,1), 1)", 1.0);
+        eq("YEARFRAC(DATE(2023,1,1), DATE(2024,1,1), 1)", 1.0);
+        // Excel's algorithm: more than a year apart uses the average length of the years touched
+        close(&wb, "YEARFRAC(DATE(2020,1,1), DATE(2022,6,30), 1)", 911.0 / ((366.0 + 365.0 + 365.0) / 3.0), 1e-12);
+        // Excel's algorithm: a start on the last day of February counts as the 30th (basis 0 only)
+        close(&wb, "YEARFRAC(DATE(2023,2,28), DATE(2023,3,31))", 31.0 / 360.0, 1e-12);
+        close(&wb, "YEARFRAC(DATE(2023,2,28), DATE(2023,3,31), 4)", 32.0 / 360.0, 1e-12);
+        assert_eq!(ev(&wb, "YEARFRAC(DATE(2012,1,1), DATE(2012,7,30), 5)"), Value::Error(ErrorKind::Num));
+        // two-digit years pivot as in Excel: 00-29 are 2000-2029, 30-99 are 1930-1999
+        assert_eq!(ev(&wb, "DATEVALUE(\"15/06/95\")"), ev(&wb, "DATE(1995,6,15)"));
+        assert_eq!(ev(&wb, "DATEVALUE(\"15/06/30\")"), ev(&wb, "DATE(1930,6,15)"));
+        assert_eq!(ev(&wb, "DATEVALUE(\"15/06/29\")"), ev(&wb, "DATE(2029,6,15)"));
+        assert_eq!(ev(&wb, "DATEVALUE(\"01/01/00\")"), ev(&wb, "DATE(2000,1,1)"));
+        assert_eq!(ev(&wb, "DATE(99,1,1)"), ev(&wb, "DATE(1999,1,1)"));
+    }
 }
 
 #[cfg(test)]

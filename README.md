@@ -233,10 +233,11 @@ Measured in headless Chromium with software WebGL (SwiftShader): filling a 5 000
 ## Tests
 
 ```bash
-cd core && cargo test                                   # engine: 44 tests (the agent runtime kept on a cell among them) (incl. a check that every listed function resolves,
-                                                        # formula resource limits, and the work-day functions against a day-by-day count)
-node e2e/engine_limits.mjs server/engine                # the shipped wasm engine: 44 formulas that used to crash, hang or exhaust memory, plus volatile functions
-                                                        # return an error quickly and leave the engine working (one process each, 20 s limit)
+cd core && cargo test                                   # engine: 45 tests (the agent runtime kept on a cell among them) (incl. a check that every listed function resolves,
+                                                        # formula resource limits, the work-day functions against a day-by-day count, Excel's DAYS360/YEARFRAC results)
+node e2e/engine_limits.mjs server/engine                # the shipped wasm engine, 61 cases (one process each, 20 s limit): 44 formulas that used to
+                                                        # crash, hang or exhaust memory return an error quickly; volatile functions; Excel's day counts
+node e2e/import_dates.mjs server/dist                   # dates read by the guided import, incl. Excel's two-digit-year pivot (18 checks)
 python3 e2e/smoke.py http://localhost:8787 --python     # editing, handles, code cells, save/open (22 checks)
 node e2e/mock-llm.mjs &                                 # mock model for the assistant (also plays a tool round)
 python3 e2e/features.py http://localhost:8787 --pg host:port:db:user:pass --mock-llm http://127.0.0.1:8899/v1

@@ -678,7 +678,8 @@ fn parse_date_only(s: &str) -> Option<(f64, &'static str)> {
             } else if parts[2].len() == 4 {
                 (nums[2], nums[1], nums[0], if seps[0] == '/' { "dd/mm/yyyy" } else if seps[0] == '.' { "dd.mm.yyyy" } else { "dd-mm-yyyy" })
             } else if parts[2].len() == 2 && seps[0] == '/' {
-                (2000 + nums[2], nums[1], nums[0], "dd/mm/yy")
+                // Excel's pivot: 00-29 are 2000-2029, 30-99 are 1930-1999
+                (nums[2] + if nums[2] < 30 { 2000 } else { 1900 }, nums[1], nums[0], "dd/mm/yy")
             } else {
                 return None;
             };
@@ -2252,33 +2253,49 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
                 Err(e) => return Arg::err(e),
             };
             let basis = if args.len() > 2 { try_num!(a(2)) as i64 } else { 0 };
-            let (s, e) = if start <= end { (start, end) } else { (end, start) };
+            // Excel truncates both dates and swaps them so the start comes first. Bases 0 and 1
+            // follow Excel's own algorithms (as published by D. A. Wheeler with Microsoft's
+            // reference programs, 2008), not the ISDA conventions their names suggest.
+            let (s, e) = if start <= end { (start.floor(), end.floor()) } else { (end.floor(), start.floor()) };
+            let (y0, m0, d0) = ymd_from_serial(s);
+            let (y1, m1, d1) = ymd_from_serial(e);
+            let feb_last = |y: i64, m: i64, d: i64| m == 2 && d == days_in_month(y, 2);
+            let leap = |y: i64| days_in_month(y, 2) == 29;
             match basis {
                 0 | 4 => {
-                    let (y0, m0, mut d0) = ymd_from_serial(s);
-                    let (y1, m1, mut d1) = ymd_from_serial(e);
-                    if basis == 0 {
-                        // US 30/360
-                        if d0 == 31 {
-                            d0 = 30;
-                        }
-                        if d1 == 31 && d0 >= 30 {
-                            d1 = 30;
-                        }
-                    } else {
-                        d0 = d0.min(30);
-                        d1 = d1.min(30);
+                    let (mut a0, mut a1) = (d0, d1);
+                    if basis == 4 {
+                        // European 30/360: any 31st is the 30th; February is never changed
+                        a0 = a0.min(30);
+                        a1 = a1.min(30);
+                    } else if d0 == 31 && d1 == 31 {
+                        a0 = 30;
+                        a1 = 30;
+                    } else if d0 == 31 {
+                        a0 = 30;
+                    } else if d0 == 30 && d1 == 31 {
+                        a1 = 30;
+                    } else if feb_last(y0, m0, d0) && feb_last(y1, m1, d1) {
+                        a0 = 30;
+                        a1 = 30;
+                    } else if feb_last(y0, m0, d0) {
+                        a0 = 30;
                     }
-                    n(((y1 - y0) * 360 + (m1 - m0) * 30 + (d1 - d0)) as f64 / 360.0)
+                    n(((y1 - y0) * 360 + (m1 - m0) * 30 + (a1 - a0)) as f64 / 360.0)
                 }
                 1 => {
-                    let (y0, _, _) = ymd_from_serial(s);
-                    let (y1, _, _) = ymd_from_serial(e);
-                    let days = e.floor() - s.floor();
-                    let year_len = if y0 == y1 {
-                        serial_from_ymd(y0 + 1, 1, 1) - serial_from_ymd(y0, 1, 1)
-                    } else {
+                    let days = e - s;
+                    // dates that look at most a year apart use that year's length; others the
+                    // average length of the calendar years they touch
+                    let within_a_year = y0 == y1 || (y0 + 1 == y1 && (m0 > m1 || (m0 == m1 && d0 >= d1)));
+                    let year_len = if !within_a_year {
                         (serial_from_ymd(y1 + 1, 1, 1) - serial_from_ymd(y0, 1, 1)) / (y1 - y0 + 1) as f64
+                    } else if y0 == y1 {
+                        if leap(y0) { 366.0 } else { 365.0 }
+                    } else if (leap(y0) && s <= serial_from_ymd(y0, 2, 29)) || (leap(y1) && e >= serial_from_ymd(y1, 2, 29)) {
+                        366.0
+                    } else {
+                        365.0
                     };
                     n(days / year_len)
                 }
@@ -3277,7 +3294,12 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
                     d2 = 30;
                 }
             } else {
-                if d1 == 31 {
+                // The US method as Excel computes it (which differs from its documentation): a start
+                // on the 31st or on the last day of February counts as the 30th; an end on the 31st
+                // counts as the 30th when the start (so adjusted) is the 30th; an end on the last day
+                // of February is left alone. DAYS360(1-Feb-2018, 28-Feb-2018) = 27 and
+                // DAYS360(28-Feb-2006, 28-Feb-2006) = -2 in Excel.
+                if d1 == 31 || (m1 == 2 && d1 == days_in_month(y1, 2)) {
                     d1 = 30;
                 }
                 if d2 == 31 && d1 == 30 {
