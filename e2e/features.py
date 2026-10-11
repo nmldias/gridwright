@@ -12,6 +12,7 @@ touch gestures on a phone-sized viewport.
 import io
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -54,7 +55,18 @@ def main():
         page = ctx.new_page()
         errors = []
         page.on("pageerror", lambda e: errors.append(str(e)))
-        page.on("console", lambda m: errors.append(m.text + " @ " + (m.location.get("url") if isinstance(m.location, dict) else str(m.location))) if m.type == "error" else None)
+        # An autosave that reaches the server after another editor's change is refused (409, by
+        # design) and the client catches up and saves again; the browser still logs the 409. Those
+        # are kept apart, and the test checks that the retried save landed.
+        stale_saves = []
+        STALE_SAVE = re.compile(r"status of 409 \(Conflict\) @ " + re.escape(BASE) + r"/api/files/[0-9a-f]+$")
+
+        def on_console(m):
+            if m.type != "error":
+                return
+            text = m.text + " @ " + (m.location.get("url") if isinstance(m.location, dict) else str(m.location))
+            (stale_saves if STALE_SAVE.search(text) else errors).append(text)
+        page.on("console", on_console)
         page.on("response", lambda r: errors.append(f"404 {r.url}") if r.status == 404 else None)
         page.goto(BASE, wait_until="networkidle")
         page.wait_for_selector(".canvas-host canvas", timeout=30000)
@@ -310,6 +322,16 @@ def main():
         s1, s2 = snap(page), snap(page2)
         check("concurrent edits converge on both clients", s1["a"] == "from p1" and s1["b"] == "from p2" and s1["c"] == s2["c"] and s2["a"] == "from p1" and s2["b"] == "from p2" and s1["c"] in ("p1 wins?", "p2 wins?"), f"{s1} / {s2}")
         check("both clients sit at the same log position", s1["seq"] == s2["seq"] and s1["seq"] > 0, f"{s1['seq']} vs {s2['seq']}")
+        # whichever page autosaves first may be refused because the other's edit landed first;
+        # it catches up and saves again, so the log ends with an accepted save of both edits
+        newest = {}
+        for _ in range(100):
+            es = rest("GET", f"/api/files/{fid}/history?limit=5")["entries"]
+            newest = es[0] if es else {}
+            if newest.get("checkpoint") and not page.evaluate("() => window.__gw.getState().dirty") and not page2.evaluate("() => window.__gw.getState().dirty"):
+                break
+            time.sleep(0.1)
+        check("after the concurrent edits the document is saved (a refused stale save is retried)", bool(newest.get("checkpoint")) and newest.get("seq", 0) > s1["seq"], f"newest seq {newest.get('seq')} checkpoint={bool(newest.get('checkpoint'))}; {len(stale_saves)} stale save(s) refused and retried")
         page2.close()
 
         # ------------------------------------------------------------------ touch (phone viewport)
