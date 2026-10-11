@@ -361,7 +361,7 @@ export const datasets = {
   merge: (id: string, kind: 'append' | 'reconcile' | 'compare', other: string, key?: { a: string; b: string }) => call<{ job: Job }>('POST', `/api/datasets/${id}/merge`, { kind, other, key }),
   mergeTable: (id: string, merge: string, table: string, offset = 0, limit = 100) => call<Page>('GET', `/api/datasets/${id}/merges/${merge}/table/${enc(table)}?${qs({ offset, limit })}`),
   recipeDiff: (id: string, recipe: string, version?: number) => call<{ diff: LayoutDiff; roles: Roles }>('GET', `/api/datasets/${id}/recipe-diff/${recipe}?${qs({ version })}`),
-  place: (doc: string, dataset: string, run: string | undefined, outputs: string[], maxRows?: number, merge?: string) => call<{ placement: DatasetMeta['placements'][number] }>('POST', `/api/files/${doc}/datasets/place`, { dataset, run, merge, outputs, maxRows }),
+  place: (doc: string, dataset: string, run: string | undefined, outputs: string[], maxRows?: number, merge?: string) => call<{ placement: DatasetMeta['placements'][number]; seq?: number }>('POST', `/api/files/${doc}/datasets/place`, { dataset, run, merge, outputs, maxRows }),
   lineage: (doc: string, table: number, row?: number, source?: number) => call<{ lineage: Lineage }>('GET', `/api/files/${doc}/lineage?${qs({ table, row, source })}`),
   lineageTables: (doc: string) => call<{ tables: { table: number; dataset: string; run: string; output: string; name: string }[] }>('GET', `/api/files/${doc}/lineage/tables`),
 };

@@ -3,6 +3,7 @@
 // right-click on it explains how it was made.
 import { useEffect, useState } from 'react';
 import { fmtNum, type DatasetMeta } from '../../api/datasets';
+import { catchUp } from '../../api/ws';
 import { useStore } from '../../state/store';
 import { apply } from '../../engine/book';
 import { newFile, saveCurrentFile } from '../files';
@@ -37,7 +38,7 @@ export function PlaceTables({
   help?: string;
   /** the name of a new workbook */
   name?: string;
-  onPlace: (doc: string, keys: string[], cap: number) => Promise<{ placement: Placement }>;
+  onPlace: (doc: string, keys: string[], cap: number) => Promise<{ placement: Placement; seq?: number }>;
 }) {
   const fileId = useStore((s) => s.fileId);
   const fileName = useStore((s) => s.fileName);
@@ -72,6 +73,10 @@ export function PlaceTables({
       const doc = useStore.getState().fileId;
       if (!doc) throw new Error('save the workbook first');
       const r = await onPlace(doc, items.filter((o) => chosen.has(o.key)).map((o) => o.key), cap);
+      // The tables arrive over the workbook's live connection. A browser that joined a new workbook's room after
+      // they were broadcast would never see them: catch up from the log to the position the server reported.
+      const have = useStore.getState().tables;
+      if (typeof r.seq === 'number' && (r.seq > useStore.getState().seq || r.placement.tables.some((t) => !have.has(t.table)))) await catchUp(r.seq);
       window.dispatchEvent(new Event('gw-imported'));
       const cut = r.placement.tables.filter((t) => t.truncated);
       setMsg({ ok: true, text: `Placed ${plural(r.placement.tables.length, 'table')} in “${useStore.getState().fileName}”${cut.length ? ` (${cut.map((t) => t.name).join(', ')} cut to ${fmtNum(cap)} rows — the full table stays here and in the CSV)` : ''}. Right-click a placed table and choose “How was this made?” to see its steps.` });

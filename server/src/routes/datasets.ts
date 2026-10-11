@@ -40,6 +40,7 @@ import { DEFAULT_TENANT } from '../storage.js';
 import { ACCOUNTS } from '../tenancy.js';
 import { authorOf, body, docPermission, fail as failAs, requireRole } from './common.js';
 import type { RunOutput } from '../dsrun.js';
+import { currentSeq } from '../history.js';
 
 /** The client the request acts in, or a 400 when accounts mode has none. */
 function tenantOf(req: Request, res: Response): string | null {
@@ -390,7 +391,9 @@ export function registerDatasetRoutes(app: Express) {
     if (!b) return;
     try {
       if (!b.run && !b.merge) return void res.status(400).json({ error: 'choose a run or a merge to place' });
-      res.json({ placement: placeOutputs(t, b.dataset, b.run, req.params.id, authorOf(req), b.outputs, (e) => broadcastEntries(req.params.id, e), b.maxRows, b.merge ? { merge: b.merge } : undefined) });
+      const placement = placeOutputs(t, b.dataset, b.run, req.params.id, authorOf(req), b.outputs, (e) => broadcastEntries(req.params.id, e), b.maxRows, b.merge ? { merge: b.merge } : undefined);
+      // the log position after the placement: a browser that missed the broadcast catches up to it
+      res.json({ placement, seq: currentSeq(req.params.id) });
     } catch (e) {
       fail(res, e);
     }

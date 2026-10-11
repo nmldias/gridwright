@@ -23,6 +23,8 @@ let retry = 0;
 let nextCid = 1;
 let lastRunNotice = 0;
 let resyncing = false;
+/** Remote ops that arrive while a resync is loading the log: applied after it, if they are past what it loaded. */
+const heldDuringResync: { seq: number; op: Op }[] = [];
 
 interface Pending {
   cid: number;
@@ -99,6 +101,14 @@ function connect() {
         break;
       }
       case 'op': {
+        // ops come over one connection in log order, so a remote op at or below this copy's position is already in
+        // it (a catch-up or a refused save reloaded the document from the log): applying it again would double it
+        if (msg.client !== clientId && typeof msg.seq === 'number' && msg.seq <= getState().seq) break;
+        // while a resync loads the log, a remote op applied now would land on the copy about to be replaced
+        if (resyncing && msg.client !== clientId && msg.op && typeof msg.seq === 'number') {
+          heldDuringResync.push({ seq: msg.seq, op: msg.op as Op });
+          break;
+        }
         if (typeof msg.seq === 'number') useStore.setState({ seq: Math.max(getState().seq, msg.seq) });
         if (msg.client === clientId) {
           const idx = pending.findIndex((p) => p.cid === msg.cid);
@@ -383,11 +393,15 @@ function opRect(op: Op): { table: number; r0: number; c0: number; r1: number; c1
 /** Rebuild the document from the server's log (checkpoint + ops) once nothing is in flight. */
 /** Catch up with the log up to `seq` (the head the server reported), e.g. before saving again. */
 export async function catchUp(seq: number): Promise<void> {
+  // a resync already running may be loading an older position: let it finish, then catch up to `seq`
+  for (let i = 0; i < 200 && resyncing; i++) await new Promise((r) => setTimeout(r, 50));
   await resync('catch-up', seq);
 }
 async function resync(reason: string, target?: number) {
   if (!fileId || resyncing) return;
   resyncing = true;
+  let loaded = -1; // the log position the reloaded copy holds (-1: nothing reloaded, keep every held op)
+  const fid0 = fileId;
   try {
     // wait for acks of in-flight ops (bounded)
     for (let i = 0; i < 40 && pending.length > 0; i++) await new Promise((r) => setTimeout(r, 50));
@@ -399,12 +413,20 @@ async function resync(reason: string, target?: number) {
     const st = getState();
     const json = await book.replayDocument(bundle.json, bundle.ops.map((e) => e.op as Op), st.fileName);
     await book.loadBook(json, st.fileName, st.fileId, { keepView: true });
+    loaded = seq;
     useStore.setState({ seq: Math.max(getState().seq, seq), dirty: true });
     if (reason !== 'reconnect' && reason !== 'catch-up') setStatus('Synchronised with the other editors', 2000);
   } catch (e) {
     setStatus(`Could not resynchronise: ${(e as Error).message}`, 6000);
   } finally {
     resyncing = false;
+    // remote ops that came in meanwhile: those past the reloaded position still apply, in log order (the rest are
+    // already in the reloaded copy); none apply if the user switched documents
+    const held = heldDuringResync.splice(0).filter((h) => h.seq > loaded && fileId === fid0).sort((a, b) => a.seq - b.seq);
+    for (const h of held) {
+      applyRemote(h.op);
+      useStore.setState({ seq: Math.max(getState().seq, h.seq) });
+    }
   }
 }
 
@@ -421,6 +443,7 @@ export function leave() {
   }
   fileId = null;
   pending.length = 0;
+  heldDuringResync.length = 0;
   if (ws) {
     const s = ws;
     ws = null;
