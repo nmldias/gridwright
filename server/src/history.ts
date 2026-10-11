@@ -114,7 +114,9 @@ function db(): typeof q & object {
   ensureHistoryDir();
   const d = new DatabaseSync(join(HISTORY_DIR(), 'log.sqlite'));
   // an audit log: every commit reaches the disk (FULL), readers never block the writer (WAL)
-  d.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 10000; PRAGMA foreign_keys = ON;');
+  // WAL + NORMAL: a committed entry survives a crash of the server and the file is never corrupted; a power cut
+  // may lose the last moments (as the earlier JSONL log could). FULL would fsync every op before it is broadcast.
+  d.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 10000; PRAGMA foreign_keys = ON;');
   d.exec(`CREATE TABLE IF NOT EXISTS entries (
     id INTEGER PRIMARY KEY,
     file TEXT NOT NULL,
