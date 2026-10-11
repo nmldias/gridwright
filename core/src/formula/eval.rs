@@ -302,18 +302,10 @@ fn walk_deps(e: &Expr, wb: &Workbook, current: TableId, out: &mut Vec<Rect>, dep
                     }
                 }
             }
-            if name.eq_ignore_ascii_case("OFFSET") {
-                // the window may move: depend on the whole table of the base reference
-                if let Some(Expr::Ref(r)) = args.first() {
-                    if let Ok(rect) = resolve_ref(r, wb, current) {
-                        if let Some(t) = wb.table(rect.table) {
-                            if t.rows > 0 && t.cols > 0 {
-                                out.push(Rect { table: t.id, r0: 0, c0: 0, r1: t.rows - 1, c1: t.cols - 1 });
-                            }
-                        }
-                    }
-                }
-            }
+            // OFFSET's window is computed while evaluating, so it is volatile (re-evaluated on every
+            // recalculation; see formula::VOLATILE_FUNCTIONS) rather than given a dependency on the
+            // whole table of its base reference, which contained the formula's own cell whenever
+            // the formula was in that table and made every such OFFSET a false #CYCLE!.
             if name.eq_ignore_ascii_case("FX") {
                 if let Some(t) = fx_table(wb) {
                     if t.rows > 0 && t.cols > 0 {
@@ -4394,14 +4386,25 @@ fn normal_inv(p: f64) -> f64 {
     x - u / (1.0 + x * u / 2.0)
 }
 
-/// Deterministic-per-call pseudo random number in [0, 1) (xorshift seeded from the clock).
+thread_local! {
+    static RANDOM_STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0x9E37_79B9_7F4A_7C15) };
+}
+/// Mix entropy from the host into RAND's state. WebAssembly has no clock or entropy source of its
+/// own (`SystemTime::now()` aborts there, which used to crash `=RAND()`), so the host's clock,
+/// passed to `set_now` with millisecond precision, seeds it.
+pub fn seed_random(bits: u64) {
+    RANDOM_STATE.with(|s| {
+        // splitmix64 of the mixed bits; never zero, which xorshift cannot leave
+        let mut z = (s.get() ^ bits).wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        s.set((z ^ (z >> 31)) | 1);
+    })
+}
+/// Pseudo random number in [0, 1) (xorshift64, seeded by `seed_random`).
 fn pseudo_random() -> f64 {
-    use std::cell::Cell;
-    thread_local! {
-        static STATE: Cell<u64> = Cell::new(0x9E3779B97F4A7C15);
-    }
-    STATE.with(|s| {
-        let mut x = s.get() ^ (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1) | 1);
+    RANDOM_STATE.with(|s| {
+        let mut x = s.get();
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;

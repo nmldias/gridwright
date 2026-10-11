@@ -60,9 +60,10 @@ impl Book {
         self.engine.wb.name = name.to_string();
     }
 
-    /// Serial date-time for NOW()/TODAY() (days since 1899-12-30, UTC).
-    pub fn set_now(&mut self, serial: f64) {
-        self.engine.wb.now_serial = serial;
+    /// Serial date-time for NOW()/TODAY() (days since 1899-12-30, local time): re-evaluates the volatile
+    /// formulas and returns JSON `Changes`. Call it after `from_json`.
+    pub fn set_now(&mut self, serial: f64) -> String {
+        js(&self.engine.set_now(serial))
     }
 
     /// Apply an operation (JSON `Op`); returns JSON `Changes`.

@@ -48,6 +48,52 @@ pub fn rename_table(src: &str, old: &str, new: &str) -> String {
     }
 }
 
+/// Functions whose result can change while every cell they read stays the same: the clock
+/// (TODAY, NOW, and FX, FXRATE, AGEING and AGE_BUCKET, which default to today), random numbers,
+/// and references computed while evaluating (INDIRECT, OFFSET). A formula using one, directly or
+/// through a name, is re-evaluated on every recalculation and when the host sets the clock, as in
+/// Excel.
+pub const VOLATILE_FUNCTIONS: &[&str] = &[
+    "NOW", "TODAY", "RAND", "RANDBETWEEN", "INDIRECT", "OFFSET", "FX", "FXRATE", "AGEING", "AGING",
+    "AGE_BUCKET",
+];
+/// A formula's dependency rectangles and whether it is volatile, from one parse.
+pub fn analyse(wb: &Workbook, table: TableId, src: &str) -> (Vec<Rect>, bool) {
+    match parse(src) {
+        Ok(expr) => (collect_deps(&expr, wb, table), expr_volatile(&expr, wb, 0)),
+        Err(_) => (vec![], false),
+    }
+}
+/// Whether `src` (a formula body) uses a volatile function.
+pub fn is_volatile(wb: &Workbook, src: &str) -> bool {
+    parse(src).map(|e| expr_volatile(&e, wb, 0)).unwrap_or(false)
+}
+fn expr_volatile(e: &Expr, wb: &Workbook, depth: u32) -> bool {
+    match e {
+        Expr::Call(name, args) => {
+            let upper = name.to_ascii_uppercase();
+            let bare = upper.strip_prefix("_XLFN.").unwrap_or(&upper);
+            VOLATILE_FUNCTIONS.contains(&bare) || args.iter().any(|a| expr_volatile(a, wb, depth))
+        }
+        Expr::Neg(x) | Expr::Percent(x) => expr_volatile(x, wb, depth),
+        Expr::Chain(first, rest) => {
+            expr_volatile(first, wb, depth) || rest.iter().any(|(_, x)| expr_volatile(x, wb, depth))
+        }
+        Expr::Array(rows) => rows.iter().flatten().any(|x| expr_volatile(x, wb, depth)),
+        // a name defined by a volatile formula makes its users volatile (names can refer to names;
+        // the depth bound also stops a name that refers to itself)
+        Expr::Name(n) => {
+            depth < 16
+                && wb
+                    .names
+                    .iter()
+                    .find(|r| r.name.eq_ignore_ascii_case(n))
+                    .and_then(|r| parse(formula_body(&r.reference)).ok())
+                    .is_some_and(|x| expr_volatile(&x, wb, depth + 1))
+        }
+        Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Ref(_) | Expr::ErrorLit(_) => false,
+    }
+}
 /// Rectangles a formula depends on (empty when it does not parse).
 pub fn dependencies(wb: &Workbook, table: TableId, src: &str) -> Vec<Rect> {
     match parse(src) {

@@ -118,6 +118,63 @@ const CASES = [
     const after = JSON.parse(b.cell(t, 2999, 1)).v;
     return { n: last && last.n, after: after && after.n };
   }, (v) => v.n === 3000 && v.after === 3001, ''],
+  // volatile functions: the clock, random numbers, references computed while evaluating
+  ['RAND and RANDBETWEEN', (b) => {
+    const t = table(b, 5, 3);
+    const at = (f) => JSON.parse(b.eval_at(t, 0, 0, f));
+    return { r: at('=RAND()'), d: at('=RANDBETWEEN(1,6)') };
+  }, (v) => v.r.n >= 0 && v.r.n < 1 && Number.isInteger(v.d.n) && v.d.n >= 1 && v.d.n <= 6,
+  'crash (WebAssembly has no clock: SystemTime::now() aborts)'],
+  ['a saved workbook shows today once loaded', (b) => {
+    const t = table(b, 5, 3);
+    const set = (row, col, input) => b.apply(JSON.stringify({ type: 'set_cell', table: t, row, col, input }));
+    set(0, 0, '=TODAY()');
+    set(0, 1, '=A1+30');
+    const loaded = b.constructor.from_json(b.to_json());
+    const before = JSON.parse(loaded.cell(t, 0, 0)).v;
+    const now = Date.now() / 86400000 + 25569; // what the client and the server pass
+    const ch = JSON.parse(loaded.set_now(now));
+    const v = (col) => JSON.parse(loaded.cell(t, 0, col)).v;
+    return { before: before.n, today: v(0).n, plus: v(1).n, expect: Math.floor(now), reported: (ch.cells?.[t] || []).length };
+  }, (v) => v.before === 0 && v.today === v.expect && v.plus === v.expect + 30 && v.reported === 2,
+  'showed 30 Dec 1899 (set_now did not recalculate)'],
+  ['INDIRECT and OFFSET follow the cells they point at', (b) => {
+    const t = table(b, 6, 3);
+    const set = (row, col, input) => b.apply(JSON.stringify({ type: 'set_cell', table: t, row, col, input }));
+    set(1, 0, '5');
+    set(2, 0, '=INDIRECT("A"&2)*2');
+    set(3, 0, '=OFFSET(A1,1,0)+1');
+    set(1, 0, '7');
+    const v = (row) => JSON.parse(b.cell(t, row, 0)).v;
+    return { indirect: v(2), offset: v(3) };
+  }, (v) => v.indirect.n === 14 && v.offset.n === 8, 'INDIRECT kept 10; OFFSET was a false #CYCLE!'],
+  ['INDIRECT of a computed address in a loaded workbook', (b) => {
+    const t = table(b, 5, 4);
+    const set = (row, col, input) => b.apply(JSON.stringify({ type: 'set_cell', table: t, row, col, input }));
+    set(0, 2, '5');
+    set(0, 1, '=C1*2');
+    set(0, 3, 'B1');
+    set(0, 0, '=INDIRECT(D1)');
+    // the saved file's C1 differs from the value its formulas were computed from (edited elsewhere)
+    const doc = JSON.parse(b.to_json());
+    const tab = doc.tables.find((x) => x.id === t);
+    const c1 = tab.cells.find((x) => x.r === 0 && x.c === 2).cell;
+    c1.input = '6';
+    c1.value = { n: 6 };
+    const loaded = b.constructor.from_json(JSON.stringify(doc));
+    const v = (col) => JSON.parse(loaded.cell(t, 0, col)).v;
+    return { b1: v(1), a1: v(0) };
+  }, (v) => v.b1.n === 12 && v.a1.n === 12, 'INDIRECT read B1 before it was recomputed'],
+  ['10,000 TODAY() formulas, then an unrelated edit', (b) => {
+    const t = table(b, 10000, 2);
+    const values = [];
+    for (let r = 0; r < 10000; r++) values.push([`=TODAY()-${r}`, '']);
+    b.apply(JSON.stringify({ type: 'set_cells', table: t, row: 0, col: 0, values }));
+    const t0 = Date.now();
+    const ch = JSON.parse(b.apply(JSON.stringify({ type: 'set_cell', table: t, row: 0, col: 1, input: '1' })));
+    // re-evaluated, as in Excel, but only a changed result is reported to the grid
+    return { ms: Date.now() - t0, reported: (ch.cells?.[t] || []).length };
+  }, (v) => v.reported === 1 && v.ms < 2000, ''],
 ];
 
 function runCase(engineDir, i) {

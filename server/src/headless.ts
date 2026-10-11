@@ -14,7 +14,7 @@ interface BookApi {
   free(): void;
   to_json(): string;
   name(): string;
-  set_now(serial: number): void;
+  set_now(serial: number): string; // JSON Changes: re-evaluates TODAY(), NOW(), RAND() and other volatile formulas
   apply(opJson: string): string;
   tables(): string;
   cells(table: number): string;
@@ -76,7 +76,8 @@ export function engineAvailable(): boolean {
   }
 }
 
-export const nowSerial = () => Date.now() / 86400000 + 25569;
+/** The clock for TODAY() and NOW(): the server's local time, as in Excel (an Excel serial date-time). */
+export const nowSerial = () => (Date.now() - new Date().getTimezoneOffset() * 60000) / 86400000 + 25569;
 
 export interface TableMetaView {
   id: number;

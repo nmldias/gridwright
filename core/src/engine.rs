@@ -1914,18 +1914,111 @@ impl Engine {
         if todo.is_empty() {
             return;
         }
-        let computed: Vec<(CellRef, Vec<Rect>)> = todo
+        let computed: Vec<(CellRef, (Vec<Rect>, bool))> = todo
             .iter()
-            .map(|(r, input)| (*r, formula::dependencies(&self.wb, r.table, formula::formula_body(input))))
+            .map(|(r, input)| (*r, formula::analyse(&self.wb, r.table, formula::formula_body(input))))
             .collect();
-        for (r, deps) in computed {
+        for (r, (deps, volatile)) in computed {
             if let Some(t) = self.wb.table_mut(r.table) {
                 if let Some(c) = t.cells.get_mut(&r.key()) {
                     c.deps = deps;
                     c.deps_valid = true;
+                    c.volatile = volatile;
                 }
             }
         }
+    }
+    /// Formula cells using a volatile function (see `formula::VOLATILE_FUNCTIONS`).
+    fn volatile_cells(&self) -> Vec<CellRef> {
+        let mut out = vec![];
+        for t in &self.wb.tables {
+            for (k, c) in &t.cells {
+                if c.kind == CellKind::Formula && c.volatile {
+                    out.push(CellRef::new(t.id, k.row, k.col));
+                }
+            }
+        }
+        out
+    }
+    /// A formula's result: its value, the cells its spill covers, and their values.
+    fn result_snapshot(&self, r: CellRef) -> (Value, Vec<CellRef>, Vec<Value>) {
+        let Some(c) = self.wb.cell(r) else {
+            return (Value::Empty, vec![], vec![]);
+        };
+        let mut area = vec![];
+        if let Some((sr, sc)) = c.spill_size {
+            for i in 0..sr {
+                for j in 0..sc {
+                    area.push(CellRef::new(r.table, r.row + i, r.col + j));
+                }
+            }
+        }
+        let values = area.iter().map(|a| self.wb.cell(*a).map(|x| x.value.clone()).unwrap_or(Value::Empty)).collect();
+        (c.value.clone(), area, values)
+    }
+    /// Re-evaluate the volatile formulas, then everything reading those whose result changed.
+    /// What they read (the clock, a random number, a reference computed while evaluating) is not
+    /// in their dependency rectangles, so Excel re-evaluates them on every recalculation; so does
+    /// this, after the ordinary recalculation, so that a computed reference sees fresh values. Only
+    /// a changed result propagates and is reported, so an unchanged TODAY() re-runs no code cell.
+    /// Returns the cells recomputed because of it.
+    fn recalc_volatile(&mut self, ch: &mut Changes) -> HashSet<CellRef> {
+        let mut recomputed = HashSet::new();
+        let volatile = self.volatile_cells();
+        if volatile.is_empty() {
+            return recomputed;
+        }
+        let before: Vec<_> = volatile.iter().map(|r| self.result_snapshot(*r)).collect();
+        let all = self.formula_cells();
+        let mut scratch = Changes::default();
+        self.evaluate_dirty(&all, &volatile, &mut scratch);
+        for id in scratch.tables.iter().map(|m| m.id).collect::<Vec<_>>() {
+            ch.push_table(&self.wb, id);
+        }
+        let mut frontier: Vec<CellRef> = vec![];
+        let mut seen = HashSet::new();
+        for (r, was) in volatile.iter().zip(before) {
+            let now = self.result_snapshot(*r);
+            if now != was {
+                // re-evaluating the formula below reports it and its new spill; cells of its old
+                // spill that the new one no longer covers were cleared here and must be redrawn
+                for c in &was.1 {
+                    if !now.1.contains(c) {
+                        ch.push_cell(&self.wb, *c);
+                    }
+                }
+                for c in std::iter::once(*r).chain(was.1).chain(now.1) {
+                    if seen.insert(c) {
+                        frontier.push(c);
+                    }
+                }
+            }
+        }
+        let mut rounds = 0;
+        while !frontier.is_empty() && rounds < MAX_SPILL_ROUNDS {
+            rounds += 1;
+            recomputed.extend(frontier.iter().cloned());
+            frontier = self.recalc_round(&frontier, ch);
+        }
+        recomputed.extend(frontier);
+        recomputed
+    }
+    /// Set the clock for TODAY() and NOW() (serial days since 1899-12-30) and re-evaluate the
+    /// volatile formulas. A host calls this right after loading a workbook, which is evaluated
+    /// before the host can say what time it is, and whenever it wants the clock to move. It also
+    /// seeds RAND, and re-checks validation rules (a rule may compare with TODAY()).
+    pub fn set_now(&mut self, serial: f64) -> Changes {
+        self.wb.now_serial = serial;
+        formula::eval::seed_random(serial.to_bits());
+        let mut ch = Changes::default();
+        self.recalc_from(&[], &mut ch);
+        let ids: Vec<TableId> = self.wb.tables.iter().filter(|t| !t.validations.is_empty()).map(|t| t.id).collect();
+        for id in ids {
+            for r in self.revalidate(id, None) {
+                ch.push_cell(&self.wb, r);
+            }
+        }
+        ch
     }
 
     fn formula_cells(&self) -> Vec<(CellRef, Vec<Rect>)> {
@@ -1955,6 +2048,9 @@ impl Engine {
             rounds += 1;
             extra = self.recalc_round(&extra, ch);
         }
+        // a computed reference (INDIRECT, OFFSET) may have read its target before it was
+        // recomputed: it is not one of the formula's dependencies
+        self.recalc_volatile(ch);
         self.recompute_pivots(None, ch);
         for t in self.wb.tables.iter_mut() {
             t.apply_filters();
@@ -2000,6 +2096,8 @@ impl Engine {
             frontier = next;
         }
         all_changed.extend(frontier.iter().cloned());
+        let volatile_changed = self.recalc_volatile(ch);
+        all_changed.extend(volatile_changed);
         // pivots whose source table changed
         let touched: HashSet<TableId> = all_changed.iter().map(|r| r.table).collect();
         self.recompute_pivots(Some(&touched), ch);
@@ -3220,5 +3318,130 @@ mod tests {
         set(&mut e, 4, 0, 2, "=AGE_BUCKET(A2:A5)");
         assert_eq!(val(&e, 4, 2, 2), Value::Text("91+".into()));
         assert_eq!(val(&e, 4, 3, 2), Value::Text("Not due".into()));
+    }
+
+    /// Cells a change reports, as (row, col), for table `t`; each must be reported once.
+    fn reported(ch: &Changes, t: TableId) -> HashSet<(u32, u32)> {
+        let list: Vec<(u32, u32)> = ch.cells.get(&t).map(|v| v.iter().map(|c| (c.r, c.c)).collect()).unwrap_or_default();
+        let set: HashSet<(u32, u32)> = list.iter().cloned().collect();
+        assert_eq!(set.len(), list.len(), "a cell reported twice: {list:?}");
+        set
+    }
+    fn num(v: Value) -> f64 {
+        match v {
+            Value::Number(n) => n,
+            other => panic!("expected a number, got {other:?}"),
+        }
+    }
+    /// Review of 11 Oct, 2.2: a loaded workbook showed TODAY() as 30 Dec 1899, set_now changed
+    /// nothing, and INDIRECT/OFFSET on a computed address went stale. Volatile formulas now follow
+    /// the clock and every recalculation, and only a changed result is reported or re-runs code.
+    #[test]
+    fn volatile_formulas_follow_the_clock_and_every_recalculation() {
+        let day = crate::formula::eval::serial_from_ymd(2026, 10, 11);
+        let mut e = engine();
+        set(&mut e, 1, 0, 0, "=TODAY()");
+        set(&mut e, 1, 0, 1, "=A1+30");
+        set(&mut e, 1, 0, 2, "=YEAR(NOW())");
+        e.apply(Op::SetName { name: "AsOf".into(), reference: Some("TODAY()-1".into()) });
+        set(&mut e, 1, 0, 3, "=AsOf");
+        // a Python cell that reads A1
+        e.apply(Op::SetCell {
+            table: 1,
+            row: 5,
+            col: 0,
+            input: "q.cells('A1')".into(),
+            kind: Some(CellKind::Python),
+            conn: None,
+            refresh: None,
+            runtime: None,
+            gpu: None,
+        });
+        e.wb.table_mut(1).unwrap().cells.get_mut(&CellKey::new(5, 0)).unwrap().code_deps =
+            vec![Rect { table: 1, r0: 0, c0: 0, r1: 0, c1: 0 }];
+
+        // a saved workbook is evaluated while loading, before the host can say what time it is
+        let json = serde_json::to_string(&e.wb).unwrap();
+        let mut e = Engine::new(serde_json::from_str(&json).unwrap());
+        e.wb.table_mut(1).unwrap().cells.get_mut(&CellKey::new(5, 0)).unwrap().code_deps =
+            vec![Rect { table: 1, r0: 0, c0: 0, r1: 0, c1: 0 }];
+        assert_eq!(val(&e, 1, 0, 0), Value::Number(0.0), "TODAY() before the host sets the clock");
+        let ch = e.set_now(day + 0.5);
+        assert_eq!(val(&e, 1, 0, 0), Value::Number(day));
+        assert_eq!(val(&e, 1, 0, 1), Value::Number(day + 30.0), "a formula reading TODAY() follows it");
+        assert_eq!(val(&e, 1, 0, 2), Value::Number(2026.0));
+        assert_eq!(val(&e, 1, 0, 3), Value::Number(day - 1.0), "a name defined with TODAY() is volatile");
+        let r = reported(&ch, 1);
+        for cell in [(0, 0), (0, 1), (0, 2), (0, 3)] {
+            assert!(r.contains(&cell), "set_now reports {cell:?}: {r:?}");
+        }
+        assert!(ch.rerun_code.contains(&CellRef::new(1, 5, 0)), "code reading TODAY() re-runs when it moves");
+
+        // later the same day nothing anyone can see changes: nothing is reported or re-run
+        let ch = e.set_now(day + 0.75);
+        assert!(reported(&ch, 1).is_empty(), "unchanged results are not reported: {:?}", reported(&ch, 1));
+        assert!(ch.rerun_code.is_empty(), "an unchanged TODAY() re-runs no code: {:?}", ch.rerun_code);
+        // the next day TODAY() and what reads it move
+        let ch = e.set_now(day + 1.25);
+        assert_eq!(val(&e, 1, 0, 0), Value::Number(day + 1.0));
+        assert_eq!(val(&e, 1, 0, 1), Value::Number(day + 31.0));
+        assert_eq!(val(&e, 1, 0, 3), Value::Number(day));
+        assert!(ch.rerun_code.contains(&CellRef::new(1, 5, 0)));
+
+        // references computed while evaluating are not in the dependency rectangles: they used to
+        // keep the value from before an edit
+        set(&mut e, 1, 1, 0, "5");
+        set(&mut e, 1, 2, 0, "=INDIRECT(\"A\"&2)*2");
+        set(&mut e, 1, 3, 0, "=OFFSET(A1,1,0)+1");
+        assert_eq!(val(&e, 1, 2, 0), Value::Number(10.0));
+        assert_eq!(val(&e, 1, 3, 0), Value::Number(6.0));
+        let ch = set(&mut e, 1, 1, 0, "7");
+        assert_eq!(val(&e, 1, 2, 0), Value::Number(14.0), "INDIRECT follows the cell it points at");
+        assert_eq!(val(&e, 1, 3, 0), Value::Number(8.0), "OFFSET follows the cell it points at");
+        assert!(reported(&ch, 1).contains(&(2, 0)) && reported(&ch, 1).contains(&(3, 0)));
+        // an unrelated edit re-evaluates them but reports only what changed
+        let ch = set(&mut e, 1, 1, 1, "1");
+        assert_eq!(reported(&ch, 1), HashSet::from([(1, 1)]), "only the edited cell is reported");
+        assert!(ch.rerun_code.is_empty());
+
+        // RAND and RANDBETWEEN (these aborted the WebAssembly engine: it has no clock to seed from)
+        set(&mut e, 1, 4, 0, "=RAND()");
+        set(&mut e, 1, 4, 1, "=RANDBETWEEN(1,6)");
+        let r1 = num(val(&e, 1, 4, 0));
+        assert!((0.0..1.0).contains(&r1));
+        let d = num(val(&e, 1, 4, 1));
+        assert!((1.0..=6.0).contains(&d) && d.fract() == 0.0, "RANDBETWEEN(1,6) = {d}");
+        set(&mut e, 1, 4, 2, "x");
+        assert_ne!(num(val(&e, 1, 4, 0)), r1, "every recalculation draws a new RAND(), as in Excel");
+    }
+
+    /// A full recalculation (loading a workbook, a structural change, a name) evaluates in
+    /// dependency order, and the cell an INDIRECT points at is not one of its dependencies: the
+    /// volatile pass after it gives INDIRECT the target's fresh value.
+    #[test]
+    fn indirect_is_fresh_after_a_full_recalculation() {
+        let mut e = engine();
+        set(&mut e, 1, 0, 2, "5");
+        set(&mut e, 1, 0, 1, "=C1*2");
+        // the address is computed (a literal one is resolved as an ordinary dependency)
+        set(&mut e, 1, 0, 3, "B1");
+        set(&mut e, 1, 0, 0, "=INDIRECT(D1)");
+        assert_eq!(val(&e, 1, 0, 0), Value::Number(10.0));
+        // C1 changes without a recalculation (as in a saved file edited elsewhere) ...
+        let c = e.wb.table_mut(1).unwrap().cells.get_mut(&CellKey::new(0, 2)).unwrap();
+        c.input = "6".into();
+        c.value = Value::Number(6.0);
+        // ... then a name definition recalculates everything
+        e.apply(Op::SetName { name: "Rate".into(), reference: Some("0.1".into()) });
+        assert_eq!(val(&e, 1, 0, 1), Value::Number(12.0));
+        assert_eq!(val(&e, 1, 0, 0), Value::Number(12.0), "INDIRECT reads B1 after B1 is recomputed");
+        // and a workbook loaded from JSON
+        let c = e.wb.table_mut(1).unwrap().cells.get_mut(&CellKey::new(0, 2)).unwrap();
+        c.input = "7".into();
+        c.value = Value::Number(7.0);
+        let json = serde_json::to_string(&e.wb).unwrap();
+        let e = Engine::new(serde_json::from_str(&json).unwrap());
+        assert_eq!(val(&e, 1, 0, 1), Value::Number(14.0));
+        assert_eq!(val(&e, 1, 0, 0), Value::Number(14.0), "INDIRECT is fresh in a loaded workbook");
     }
 }
