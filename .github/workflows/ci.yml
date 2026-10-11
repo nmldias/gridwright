@@ -119,6 +119,12 @@ jobs:
         run: python3 e2e/intake.py http://127.0.0.1:8787 --inbox /tmp/gw-inbox --pg 127.0.0.1:54329:demo:gw:gw
       - name: Sources (a SQL snapshot defines its source and recipe; a refresh job reconciles and places the next version; unchanged, drift, older, held, declined, failed; authority)
         run: python3 e2e/sources.py http://127.0.0.1:8787 --pg 127.0.0.1:54329:demo:gw:gw
+      - name: Guided import (a large export to clean tables and analysis, a recipe reused on a drifted layout, a keyed comparison placed in a workbook, right-click lineage — synthetic exports with independent figures)
+        run: python3 e2e/guided_import.py http://127.0.0.1:8787
+      - name: Multi-tenancy (clients isolated, people per client, roles; guided-import files, runs, recipes and lineage per client)
+        run: python3 e2e/tenancy.py --port 8798 --data /tmp/gw-tenancy
+      - name: Security regression (the 2026-10 audit's findings, each defence checked from outside)
+        run: python3 e2e/security.py 8851
       - name: Crash recovery (a placement interrupted after its commit completes once from the log; concurrent placement; an investigation and a claimed job interrupted by a restart)
         run: python3 e2e/recovery.py --mock-llm http://127.0.0.1:8899/v1 --port 8797 --data /tmp/gw-recovery
       - name: Control gates (reviewer isolation, approval integrity, revocation, execution permissions)
