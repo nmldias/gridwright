@@ -53,8 +53,9 @@ export function getBook(): Book {
   return book;
 }
 
+/** The clock for TODAY() and NOW(): local time, as in Excel (an Excel serial date-time). */
 export function nowSerial(): number {
-  return Date.now() / 86400000 + 25569;
+  return (Date.now() - new Date().getTimezoneOffset() * 60000) / 86400000 + 25569;
 }
 
 /** Replace the current workbook with a fresh one or a loaded JSON document. */

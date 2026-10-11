@@ -420,6 +420,9 @@ pub struct Cell {
     pub deps: Vec<Rect>,
     #[serde(skip)]
     pub deps_valid: bool,
+    /// Formula cells: whether the formula uses a volatile function (rebuilt with `deps`).
+    #[serde(skip)]
+    pub volatile: bool,
     /// Set when the input breaks a (non-strict) validation rule covering the cell.
     #[serde(skip)]
     pub invalid: bool,
