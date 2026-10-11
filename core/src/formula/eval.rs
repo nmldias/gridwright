@@ -7,6 +7,91 @@
 use super::parser::{BinOp, Expr, RefExpr, RefKind};
 use crate::model::{CellKey, ErrorKind, Rect, TableId, Value, Workbook};
 
+// ---------------------------------------------------------------------------
+// Resource limits. A formula that would exceed one returns an error value
+// instead of exhausting memory or stalling the tab.
+// ---------------------------------------------------------------------------
+
+/// Largest array a function may generate from its size arguments (SEQUENCE, EXPAND,
+/// WRAPROWS, WRAPCOLS): one million cells, the limit SEQUENCE always had.
+pub const MAX_GENERATED_CELLS: u64 = 1_000_000;
+/// Largest array read from a range or produced element-wise from arrays (`A1:Z100000*2`).
+/// Ranges reflect data the workbook already holds, so this is higher; it stops a reference
+/// to a huge, mostly empty table from being materialised cell by cell.
+pub const MAX_ARRAY_CELLS: u64 = 10_000_000;
+/// Excel's limit on the length of a text value.
+pub const MAX_TEXT_CHARS: u64 = 32_767;
+/// Excel's last date: 31 December 9999. Serial 0 is the day before 1 January 1900.
+pub const MAX_DATE_SERIAL: f64 = 2_958_465.0;
+
+/// Work one formula evaluation may do: each array element produced, cell read from a range and
+/// byte of text created costs one unit. The size limits above bound a single result; this bounds
+/// their repetition (`SUM(SEQUENCE(1000,1000))+…` thousands of times, or a long text broadcast over
+/// a big array), which would otherwise hang the browser, or the server when it evaluates a
+/// workbook. Roughly a second of work; a formula that needs more returns #NUM!.
+pub const MAX_EVAL_WORK: u64 = 100_000_000;
+thread_local! {
+    static WORK_LEFT: std::cell::Cell<u64> = const { std::cell::Cell::new(MAX_EVAL_WORK) };
+    static WORK_EXHAUSTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Evaluations in progress on this thread: only the outermost one starts a fresh budget.
+    static EVAL_NESTING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+/// Charge `units` to the current evaluation. False once the budget is spent, and from then on,
+/// so loops stop at once and everything left in the formula is cheap.
+fn spend(units: u64) -> bool {
+    WORK_LEFT.with(|w| {
+        let left = w.get();
+        if units > left || WORK_EXHAUSTED.with(|x| x.get()) {
+            w.set(0);
+            WORK_EXHAUSTED.with(|x| x.set(true));
+            false
+        } else {
+            w.set(left - units);
+            true
+        }
+    })
+}
+/// What holding a value costs: one unit, plus its text.
+fn value_cost(v: &Value) -> u64 {
+    1 + match v {
+        Value::Text(s) => s.len() as u64,
+        _ => 0,
+    }
+}
+fn arg_cost(a: &Arg) -> u64 {
+    match a {
+        Arg::Scalar(v) => value_cost(v),
+        Arg::Array(arr) => arr.data.iter().map(value_cost).sum(),
+    }
+}
+/// Whether a `rows × cols` array fits under `cap`, computed without overflow.
+fn fits(rows: u64, cols: u64, cap: u64) -> bool {
+    rows.checked_mul(cols).is_some_and(|cells| cells <= cap)
+}
+fn text_too_long(chars: u64) -> bool {
+    chars > MAX_TEXT_CHARS
+}
+/// A text result, or #VALUE! when it is longer than Excel allows.
+fn text_result(s: String) -> Arg {
+    if text_too_long(s.chars().count() as u64) {
+        Arg::err(ErrorKind::Value)
+    } else {
+        t(s)
+    }
+}
+/// Whether a date serial (with any time fraction) lies in Excel's date range.
+fn date_in_range(x: f64) -> bool {
+    (0.0..MAX_DATE_SERIAL + 1.0).contains(&x)
+}
+/// A date result, or #NUM! when it falls outside Excel's date range.
+fn date_result(x: f64) -> Arg {
+    if date_in_range(x) {
+        n(x)
+    } else {
+        Arg::err(ErrorKind::Num)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Array {
     pub rows: u32,
@@ -24,7 +109,7 @@ impl Array {
     pub fn from_rows(rows: Vec<Vec<Value>>) -> Array {
         let nrows = rows.len() as u32;
         let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
-        let mut data = Vec::with_capacity((nrows * ncols) as usize);
+        let mut data = Vec::with_capacity((nrows as usize).saturating_mul(ncols as usize).min(MAX_ARRAY_CELLS as usize));
         for r in rows {
             for c in 0..ncols as usize {
                 data.push(r.get(c).cloned().unwrap_or(Value::Empty));
@@ -245,9 +330,9 @@ fn walk_deps(e: &Expr, wb: &Workbook, current: TableId, out: &mut Vec<Rect>, dep
             args.iter().for_each(|a| walk_deps(a, wb, current, out, depth))
         }
         Expr::Neg(x) | Expr::Percent(x) => walk_deps(x, wb, current, out, depth),
-        Expr::Binary(_, l, r) => {
-            walk_deps(l, wb, current, out, depth);
-            walk_deps(r, wb, current, out, depth);
+        Expr::Chain(first, rest) => {
+            walk_deps(first, wb, current, out, depth);
+            rest.iter().for_each(|(_, x)| walk_deps(x, wb, current, out, depth));
         }
         Expr::Array(rows) => rows.iter().flatten().for_each(|x| walk_deps(x, wb, current, out, depth)),
         _ => {}
@@ -261,10 +346,17 @@ fn range_arg(rect: Rect, wb: &Workbook) -> Arg {
     };
     let rows = rect.rows();
     let cols = rect.cols();
-    let mut data = Vec::with_capacity((rows * cols) as usize);
+    if !fits(rows as u64, cols as u64, MAX_ARRAY_CELLS) {
+        return Arg::err(ErrorKind::Num);
+    }
+    let mut data = Vec::with_capacity((rows as usize) * (cols as usize));
     for r in rect.r0..=rect.r1 {
         for c in rect.c0..=rect.c1 {
-            data.push(table.value_at(CellKey::new(r, c)));
+            let v = table.value_at(CellKey::new(r, c));
+            if !spend(value_cost(&v)) {
+                return Arg::err(ErrorKind::Num);
+            }
+            data.push(v);
         }
     }
     Arg::Array(Array { rows, cols, data })
@@ -412,6 +504,33 @@ fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
 
 fn same_type(a: &Value, b: &Value) -> bool {
     std::mem::discriminant(a) == std::mem::discriminant(b)
+}
+
+/// A hashable stand-in for a value: two values have the same key exactly when
+/// `compare(a, b) == Equal && same_type(a, b)` (text ignores case, -0 equals 0, every error
+/// equals every other). Lets UNIQUE and XLOOKUP group or index values instead of comparing every
+/// pair. `None` for NaN, which `compare` treats as equal to every number: callers then fall back
+/// to comparing pairs, so results never change.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum ValueKey {
+    Empty,
+    Number(u64),
+    Text(String),
+    Bool(bool),
+    Error,
+}
+fn value_key(v: &Value) -> Option<ValueKey> {
+    Some(match v {
+        Value::Empty => ValueKey::Empty,
+        Value::Number(x) if x.is_nan() => return None,
+        Value::Number(x) => ValueKey::Number(if *x == 0.0 { 0.0f64.to_bits() } else { x.to_bits() }),
+        Value::Text(s) => ValueKey::Text(s.to_lowercase()),
+        Value::Bool(b) => ValueKey::Bool(*b),
+        Value::Error(_) => ValueKey::Error,
+    })
+}
+fn row_key(vs: &[Value]) -> Option<Vec<ValueKey>> {
+    vs.iter().map(value_key).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -610,9 +729,15 @@ fn days_in_month(y: i64, m: i64) -> i64 {
 }
 
 fn date_arg(v: &Value) -> Result<f64, ErrorKind> {
-    match v {
-        Value::Text(s) => parse_date_time_text(s).map(|x| x.0).ok_or(ErrorKind::Value),
-        other => to_number(other),
+    let x = match v {
+        Value::Text(s) => parse_date_time_text(s).map(|x| x.0).ok_or(ErrorKind::Value)?,
+        other => to_number(other)?,
+    };
+    // Excel rejects serials before 0 or after 31 Dec 9999 with #NUM!.
+    if date_in_range(x) {
+        Ok(x)
+    } else {
+        Err(ErrorKind::Num)
     }
 }
 
@@ -714,7 +839,23 @@ fn matches_criteria(v: &Value, c: &Criteria) -> bool {
 // ---------------------------------------------------------------------------
 
 pub fn eval(e: &Expr, ctx: &Ctx) -> Arg {
-    eval_depth(e, ctx, 0)
+    // Nothing inside an evaluation calls back in here today; if something ever does, it shares
+    // the outer budget (a fresh one would make it unbounded) and cannot nest deeply.
+    let nesting = EVAL_NESTING.with(|n| n.get());
+    if nesting >= 4 {
+        return Arg::err(ErrorKind::Cycle);
+    }
+    if nesting == 0 {
+        WORK_LEFT.with(|w| w.set(MAX_EVAL_WORK));
+        WORK_EXHAUSTED.with(|x| x.set(false));
+    }
+    EVAL_NESTING.with(|n| n.set(nesting + 1));
+    let out = eval_depth(e, ctx, 0);
+    EVAL_NESTING.with(|n| n.set(nesting));
+    if nesting == 0 && WORK_EXHAUSTED.with(|x| x.get()) {
+        return Arg::err(ErrorKind::Num);
+    }
+    out
 }
 
 fn eval_depth(e: &Expr, ctx: &Ctx, depth: u32) -> Arg {
@@ -728,7 +869,11 @@ fn eval_depth(e: &Expr, ctx: &Ctx, depth: u32) -> Arg {
         Expr::Ref(r) => match resolve_ref_at(r, ctx.wb, ctx.table, ctx.at) {
             Ok(rect) => {
                 if rect.r0 == rect.r1 && rect.c0 == rect.c1 {
-                    Arg::Scalar(ctx.wb.value(crate::model::CellRef::new(rect.table, rect.r0, rect.c0)))
+                    let v = ctx.wb.value(crate::model::CellRef::new(rect.table, rect.r0, rect.c0));
+                    if !spend(value_cost(&v)) {
+                        return Arg::err(ErrorKind::Num);
+                    }
+                    Arg::Scalar(v)
                 } else {
                     range_arg(rect, ctx.wb)
                 }
@@ -737,9 +882,15 @@ fn eval_depth(e: &Expr, ctx: &Ctx, depth: u32) -> Arg {
         },
         Expr::Name(name) => {
             if let Some((_, v)) = ctx.locals.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+                // each use copies the value
+                if !spend(arg_cost(v)) {
+                    return Arg::err(ErrorKind::Num);
+                }
                 return v.clone();
             }
             match ctx.wb.named_range(name) {
+                // each use parses the name's formula again
+                Some(nr) if !spend(nr.reference.len() as u64) => Arg::err(ErrorKind::Num),
                 Some(nr) => match super::parser::parse(&nr.reference) {
                     Ok(parsed) => eval_depth(&parsed, ctx, depth + 1),
                     Err(_) => Arg::err(ErrorKind::Name),
@@ -755,14 +906,19 @@ fn eval_depth(e: &Expr, ctx: &Ctx, depth: u32) -> Arg {
             let x = try_num!(v);
             n(x / 100.0)
         }),
-        Expr::Binary(op, l, r) => {
-            let lv = eval_depth(l, ctx, depth);
-            let rv = eval_depth(r, ctx, depth);
-            if lv.is_multi() || rv.is_multi() {
-                broadcast2(&lv, &rv, |a, bb| binary(*op, a, bb))
-            } else {
-                binary(*op, lv.scalar(), rv.scalar())
+        Expr::Chain(first, rest) => {
+            // operands evaluated left to right, operators applied in order
+            let mut acc = eval_depth(first, ctx, depth);
+            for (op, r) in rest {
+                let op = *op;
+                let rv = eval_depth(r, ctx, depth);
+                acc = if acc.is_multi() || rv.is_multi() {
+                    broadcast2(&acc, &rv, |a, bb| binary(op, a, bb))
+                } else {
+                    binary(op, acc.scalar(), rv.scalar())
+                };
             }
+            acc
         }
         Expr::Array(rows) => {
             let nrows = rows.len() as u32;
@@ -787,7 +943,14 @@ fn eval_depth(e: &Expr, ctx: &Ctx, depth: u32) -> Arg {
 fn lift1(a: Arg, f: impl Fn(Value) -> Arg) -> Arg {
     match a {
         Arg::Array(arr) if arr.rows * arr.cols != 1 => {
-            let data = arr.data.into_iter().map(|v| f(v).scalar()).collect();
+            let mut data = Vec::with_capacity(arr.data.len());
+            for v in arr.data {
+                let out = f(v).scalar();
+                if !spend(value_cost(&out)) {
+                    return Arg::err(ErrorKind::Num);
+                }
+                data.push(out);
+            }
             Arg::Array(Array {
                 rows: arr.rows,
                 cols: arr.cols,
@@ -803,10 +966,21 @@ fn broadcast2(l: &Arg, r: &Arg, f: impl Fn(Value, Value) -> Arg) -> Arg {
     let (rr, rc) = r.shape();
     let rows = lr.max(rr);
     let cols = lc.max(rc);
-    let mut data = Vec::with_capacity((rows * cols) as usize);
+    if !fits(rows as u64, cols as u64, MAX_ARRAY_CELLS) {
+        return Arg::err(ErrorKind::Num);
+    }
+    let mut data = Vec::with_capacity((rows as usize) * (cols as usize));
     for i in 0..rows {
         for j in 0..cols {
-            data.push(f(l.at_broadcast(i, j), r.at_broadcast(i, j)).scalar());
+            let (x, y) = (l.at_broadcast(i, j), r.at_broadcast(i, j));
+            if !spend(value_cost(&x) + value_cost(&y)) {
+                return Arg::err(ErrorKind::Num);
+            }
+            let out = f(x, y).scalar();
+            if !spend(value_cost(&out)) {
+                return Arg::err(ErrorKind::Num);
+            }
+            data.push(out);
         }
     }
     Arg::Array(Array { rows, cols, data }).normalise()
@@ -821,15 +995,26 @@ fn broadcast_n(args: &[Arg], f: impl Fn(&[Value]) -> Arg) -> Arg {
         rows = rows.max(r);
         cols = cols.max(c);
     }
-    let mut data = Vec::with_capacity((rows * cols) as usize);
+    if !fits(rows as u64, cols as u64, MAX_ARRAY_CELLS) {
+        return Arg::err(ErrorKind::Num);
+    }
+    let mut data = Vec::with_capacity((rows as usize) * (cols as usize));
     let mut scalars = Vec::with_capacity(args.len());
     for i in 0..rows {
         for j in 0..cols {
             scalars.clear();
             for a in args {
-                scalars.push(a.at_broadcast(i, j));
+                let v = a.at_broadcast(i, j);
+                if !spend(value_cost(&v)) {
+                    return Arg::err(ErrorKind::Num);
+                }
+                scalars.push(v);
             }
-            data.push(f(&scalars).scalar());
+            let out = f(&scalars).scalar();
+            if !spend(value_cost(&out)) {
+                return Arg::err(ErrorKind::Num);
+            }
+            data.push(out);
         }
     }
     Arg::Array(Array { rows, cols, data }).normalise()
@@ -854,7 +1039,13 @@ fn binary(op: BinOp, l: Value, r: Value) -> Arg {
             n(try_num!(l) / d)
         }
         BinOp::Pow => n(try_num!(l).powf(try_num!(r))),
-        BinOp::Concat => t(format!("{}{}", try_text!(l), try_text!(r))),
+        BinOp::Concat => {
+            let (ls, rs) = (try_text!(l), try_text!(r));
+            if text_too_long(ls.chars().count() as u64 + rs.chars().count() as u64) {
+                return Arg::err(ErrorKind::Value);
+            }
+            t(ls + &rs)
+        }
         BinOp::Eq => b(compare(&l, &r) == std::cmp::Ordering::Equal),
         BinOp::Ne => b(compare(&l, &r) != std::cmp::Ordering::Equal),
         BinOp::Lt => b(compare(&l, &r) == std::cmp::Ordering::Less),
@@ -918,6 +1109,16 @@ const LIFTED: &[&str] = &[
 ];
 
 fn call(name: &str, raw_args: &[Expr], ctx: &Ctx, depth: u32) -> Arg {
+    if !spend(1) {
+        return Arg::err(ErrorKind::Num);
+    }
+    let out = call_inner(name, raw_args, ctx, depth);
+    if !spend(arg_cost(&out)) {
+        return Arg::err(ErrorKind::Num);
+    }
+    out
+}
+fn call_inner(name: &str, raw_args: &[Expr], ctx: &Ctx, depth: u32) -> Arg {
     let ev = |e: &Expr| eval_depth(e, ctx, depth);
     // lazy functions first
     match name {
@@ -1109,7 +1310,7 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx, depth: u32) -> Arg {
                 11 => "VARP",
                 _ => return Arg::err(ErrorKind::Value),
             };
-            return call_eager(fname, &[arr], ctx);
+            return call_eager(fname, &[arr], ctx, depth);
         }
         _ => {}
     }
@@ -1118,13 +1319,13 @@ fn call(name: &str, raw_args: &[Expr], ctx: &Ctx, depth: u32) -> Arg {
     if LIFTED.contains(&name) && args.iter().any(|a| a.is_multi()) {
         return broadcast_n(&args, |vals| {
             let scalars: Vec<Arg> = vals.iter().map(|v| Arg::Scalar(v.clone())).collect();
-            call_eager(name, &scalars, ctx)
+            call_eager(name, &scalars, ctx, depth)
         });
     }
-    call_eager(name, &args, ctx)
+    call_eager(name, &args, ctx, depth)
 }
 
-fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
+fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
     let a = |i: usize| arg_at(args, i);
     let empty_arr = || Array::empty();
 
@@ -1453,8 +1654,14 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
         "TRIM" => t(try_text!(a(0)).split_whitespace().collect::<Vec<_>>().join(" ")),
         "CONCAT" | "CONCATENATE" => {
             let mut s = String::new();
+            let mut len = 0u64;
             for v in args.iter().flat_map(|x| x.values()) {
-                s.push_str(&try_text!(v));
+                let part = try_text!(v);
+                len += part.chars().count() as u64;
+                if text_too_long(len) {
+                    return Arg::err(ErrorKind::Value);
+                }
+                s.push_str(&part);
             }
             t(s)
         }
@@ -1465,9 +1672,15 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
                 .iter()
                 .skip(2)
                 .flat_map(|x| x.values())
-                .filter(|v| !(skip_empty && v.is_empty()))
+                // like Excel, "ignore empty" skips blank cells and empty text such as ""
+                .filter(|v| !(skip_empty && (v.is_empty() || matches!(v, Value::Text(s) if s.is_empty()))))
                 .map(|v| v.to_display())
                 .collect();
+            let delim_len = delim.chars().count() as u64;
+            let len = parts.iter().map(|p| p.chars().count() as u64).sum::<u64>() + delim_len * parts.len().saturating_sub(1) as u64;
+            if text_too_long(len) {
+                return Arg::err(ErrorKind::Value);
+            }
             t(parts.join(&delim))
         }
         "LEFT" => {
@@ -1507,8 +1720,31 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
                 None => Arg::err(ErrorKind::Value),
             }
         }
-        "SUBSTITUTE" => t(try_text!(a(0)).replace(&try_text!(a(1)), &try_text!(a(2)))),
-        "REPT" => t(try_text!(a(0)).repeat(try_num!(a(1)).max(0.0) as usize)),
+        "SUBSTITUTE" => {
+            let (s, old, new) = (try_text!(a(0)), try_text!(a(1)), try_text!(a(2)));
+            if !old.is_empty() {
+                // the result's length is known before replacing: refuse oversized output up front
+                let hits = s.matches(old.as_str()).count() as u64;
+                let len = s.chars().count() as u64 - hits * old.chars().count() as u64 + hits * new.chars().count() as u64;
+                if text_too_long(len) {
+                    return Arg::err(ErrorKind::Value);
+                }
+            }
+            t(s.replace(&old, &new))
+        }
+        "REPT" => {
+            let s = try_text!(a(0));
+            let times = try_num!(a(1));
+            if times < 0.0 {
+                return Arg::err(ErrorKind::Value);
+            }
+            // Excel: #VALUE! when the result would exceed 32,767 characters
+            let times = times.floor();
+            if !s.is_empty() && times * s.chars().count() as f64 > MAX_TEXT_CHARS as f64 {
+                return Arg::err(ErrorKind::Value);
+            }
+            t(if s.is_empty() { String::new() } else { s.repeat(times as usize) })
+        }
         "VALUE" => match crate::model::parse_number_literal(&try_text!(a(0))).or_else(|| parse_date_time_text(&a(0).to_display()).map(|x| x.0)) {
             Some(x) => n(x),
             None => Arg::err(ErrorKind::Value),
@@ -1516,7 +1752,11 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
         "TEXT" => {
             let v = a(0);
             let fmt = try_text!(a(1));
-            t(format_text(&v, &fmt))
+            // Excel: a date pattern applied to a number outside the date range is #VALUE!
+            if is_date_pattern(fmt.trim()) && matches!(&v, Value::Number(x) if !date_in_range(*x)) {
+                return Arg::err(ErrorKind::Value);
+            }
+            text_result(format_text(&v, &fmt))
         }
         "EXACT" => b(try_text!(a(0)) == try_text!(a(1))),
         // ---------------- lookup ----------------
@@ -1563,9 +1803,10 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
             }
             let keys = args[1].as_array();
             let vals = args[2].as_array();
-            let lookup = |key: &Value| -> Arg {
-                for (i, kv) in keys.data.iter().enumerate() {
-                    if compare(kv, key) == std::cmp::Ordering::Equal && same_type(kv, key) {
+            let find = |key: &Value| keys.data.iter().position(|kv| compare(kv, key) == std::cmp::Ordering::Equal && same_type(kv, key));
+            let lookup_at = |found: Option<usize>| -> Arg {
+                if let Some(i) = found {
+                    {
                         // return the matching row (or column) of the return array
                         if vals.rows == keys.rows && vals.cols > 1 && keys.cols == 1 {
                             return Arg::Array(Array {
@@ -1594,14 +1835,32 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
             };
             match &args[0] {
                 Arg::Array(ks) if ks.rows * ks.cols != 1 => {
-                    let data: Vec<Value> = ks.data.iter().map(|k| lookup(k).scalar()).collect();
+                    // many lookup values: index the keys once (first match wins, as in a scan)
+                    // rather than scanning them for each value
+                    let index: Option<std::collections::HashMap<ValueKey, usize>> = keys.data.iter().enumerate().rev().map(|(i, kv)| value_key(kv).map(|k| (k, i))).collect();
+                    let data: Vec<Value> = match &index {
+                        Some(index) => ks.data.iter().map(|k| lookup_at(match value_key(k) {
+                            Some(key) => index.get(&key).copied(),
+                            None => find(k),
+                        }).scalar()).collect(),
+                        None => {
+                            let mut data = Vec::with_capacity(ks.data.len());
+                            for k in &ks.data {
+                                if !spend(keys.data.len() as u64) {
+                                    return Arg::err(ErrorKind::Num);
+                                }
+                                data.push(lookup_at(find(k)).scalar());
+                            }
+                            data
+                        }
+                    };
                     Arg::Array(Array {
                         rows: ks.rows,
                         cols: ks.cols,
                         data,
                     })
                 }
-                _ => lookup(&a(0)),
+                _ => lookup_at(find(&a(0))),
             }
         }
         "MATCH" => {
@@ -1698,12 +1957,29 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
             let items: Vec<Vec<Value>> = if by_col { (0..arr.cols).map(|c| arr.column(c)).collect() } else { (0..arr.rows).map(|r| arr.row(r)).collect() };
             let eq = |x: &Vec<Value>, y: &Vec<Value>| x.len() == y.len() && x.iter().zip(y).all(|(p, q)| compare(p, q) == std::cmp::Ordering::Equal && same_type(p, q));
             let mut out: Vec<Vec<Value>> = vec![];
-            for it in &items {
-                if !out.iter().any(|o| eq(o, it)) {
-                    if exactly_once && items.iter().filter(|x| eq(x, it)).count() != 1 {
-                        continue;
+            let keys: Option<Vec<Vec<ValueKey>>> = items.iter().map(|it| row_key(it)).collect();
+            if let Some(keys) = keys {
+                let mut counts: std::collections::HashMap<&Vec<ValueKey>, usize> = std::collections::HashMap::new();
+                for k in &keys {
+                    *counts.entry(k).or_insert(0) += 1;
+                }
+                let mut seen: std::collections::HashSet<&Vec<ValueKey>> = std::collections::HashSet::new();
+                for (it, k) in items.iter().zip(&keys) {
+                    if seen.insert(k) && (!exactly_once || counts[k] == 1) {
+                        out.push(it.clone());
                     }
-                    out.push(it.clone());
+                }
+            } else {
+                for it in &items {
+                    if !spend(out.len() as u64 + 1) {
+                        return Arg::err(ErrorKind::Num);
+                    }
+                    if !out.iter().any(|o| eq(o, it)) {
+                        if exactly_once && items.iter().filter(|x| eq(x, it)).count() != 1 {
+                            continue;
+                        }
+                        out.push(it.clone());
+                    }
                 }
             }
             if by_col {
@@ -1839,7 +2115,7 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
             let cols = if args.len() > 1 { try_num!(a(1)).max(0.0) as u32 } else { 1 };
             let start = if args.len() > 2 { try_num!(a(2)) } else { 1.0 };
             let step = if args.len() > 3 { try_num!(a(3)) } else { 1.0 };
-            if rows * cols > 1_000_000 {
+            if !fits(rows as u64, cols as u64, MAX_GENERATED_CELLS) {
                 return Arg::err(ErrorKind::Num);
             }
             let data = (0..rows * cols).map(|i| Value::Number(start + step * i as f64)).collect();
@@ -1848,7 +2124,16 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
         // ---------------- dates ----------------
         "TODAY" => n(ctx.now.floor()),
         "NOW" => n(ctx.now),
-        "DATE" => n(serial_from_ymd(try_num!(a(0)) as i64, try_num!(a(1)) as i64, try_num!(a(2)) as i64)),
+        "DATE" => {
+            let (y, m, d) = (try_num!(a(0)).trunc(), try_num!(a(1)).trunc(), try_num!(a(2)).trunc());
+            // Excel: years 0–1899 are taken as 1900–3799; below 0 or from 10000 on is #NUM!.
+            // Months and days may overflow into neighbouring years, but not past the date range.
+            if !(0.0..10000.0).contains(&y) || !(m.abs() <= 120_000.0) || !(d.abs() <= 4_000_000.0) {
+                return Arg::err(ErrorKind::Num);
+            }
+            let y = if y < 1900.0 { y + 1900.0 } else { y };
+            date_result(serial_from_ymd(y as i64, m as i64, d as i64))
+        }
         "TIME" => n(((try_num!(a(0)) * 3600.0 + try_num!(a(1)) * 60.0 + try_num!(a(2))) / 86400.0).rem_euclid(1.0)),
         "YEAR" | "MONTH" | "DAY" => {
             let v = a(0);
@@ -1884,18 +2169,27 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
                 Ok(x) => x,
                 Err(e) => return Arg::err(e),
             };
-            let months = try_num!(a(1)) as i64;
+            let months = try_num!(a(1)).trunc();
+            if !(months.abs() <= 120_000.0) {
+                return Arg::err(ErrorKind::Num);
+            }
             let (y, m, d) = ymd_from_serial(s);
-            n(serial_from_ymd(y, m + months, d))
+            // Excel keeps the day but caps it at the target month's length: 31 Jan + 1 = 29 Feb
+            let total = y * 12 + (m - 1) + months as i64;
+            let (ty, tm) = (total.div_euclid(12), total.rem_euclid(12) + 1);
+            date_result(serial_from_ymd(ty, tm, d.min(days_in_month(ty, tm))))
         }
         "EOMONTH" => {
             let s = match date_arg(&a(0)) {
                 Ok(x) => x,
                 Err(e) => return Arg::err(e),
             };
-            let months = try_num!(a(1)) as i64;
+            let months = try_num!(a(1)).trunc();
+            if !(months.abs() <= 120_000.0) {
+                return Arg::err(ErrorKind::Num);
+            }
             let (y, m, _) = ymd_from_serial(s);
-            n(serial_from_ymd(y, m + months + 1, 1) - 1.0)
+            date_result(serial_from_ymd(y, m + months as i64 + 1, 1) - 1.0)
         }
         "WEEKDAY" => {
             let s = match date_arg(&a(0)) {
@@ -2010,36 +2304,25 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
                 Ok(x) => x.floor(),
                 Err(e) => return Arg::err(e),
             };
-            let holidays: Vec<f64> = args.get(2).map(|h| h.values().iter().filter_map(|v| to_number(v).ok().map(|x| x.floor())).collect()).unwrap_or_default();
+            let holidays = holiday_list(args.get(2));
+            let weekend = weekend_mask(1);
+            let hs = working_holidays(&holidays, &weekend);
             let (s, e, sign) = if start <= end { (start, end, 1.0) } else { (end, start, -1.0) };
-            let mut count = 0;
-            let mut d = s;
-            while d <= e {
-                let wd = weekday_mon0(d);
-                if wd < 5 && !holidays.contains(&d) {
-                    count += 1;
-                }
-                d += 1.0;
-            }
-            n(count as f64 * sign)
+            n(count_workdays(s as i64, e as i64, &weekend, &hs) as f64 * sign)
         }
         "WORKDAY" => {
             let start = match date_arg(&a(0)) {
                 Ok(x) => x.floor(),
                 Err(e) => return Arg::err(e),
             };
-            let days = try_num!(a(1)) as i64;
-            let holidays: Vec<f64> = args.get(2).map(|h| h.values().iter().filter_map(|v| to_number(v).ok().map(|x| x.floor())).collect()).unwrap_or_default();
-            let step = if days >= 0 { 1.0 } else { -1.0 };
-            let mut left = days.abs();
-            let mut d = start;
-            while left > 0 {
-                d += step;
-                if weekday_mon0(d) < 5 && !holidays.contains(&d) {
-                    left -= 1;
-                }
+            let days = try_num!(a(1));
+            let holidays = holiday_list(args.get(2));
+            let weekend = weekend_mask(1);
+            let hs = working_holidays(&holidays, &weekend);
+            match add_workdays(start as i64, days, &weekend, &hs) {
+                Some(d) => date_result(d as f64),
+                None => Arg::err(ErrorKind::Num),
             }
-            n(d)
         }
         // ---------------- financial ----------------
         "NPV" => {
@@ -2208,17 +2491,27 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
         "COMBIN" | "PERMUT" => {
             let nn = try_num!(a(0)).floor();
             let k = try_num!(a(1)).floor();
-            if nn < 0.0 || k < 0.0 || k > nn {
+            if !nn.is_finite() || !k.is_finite() || nn < 0.0 || k < 0.0 || k > nn {
                 return Arg::err(ErrorKind::Num);
             }
-            let mut r = 1.0;
+            // COMBIN(n,k) = COMBIN(n,n-k), and C(n,k') >= 2^k' for k' <= n/2, so beyond
+            // k' = 1024 the result exceeds the largest double. PERMUT(n,k) >= k!, which
+            // overflows from k = 171. Either way the loop below stays short.
+            let k = if name == "COMBIN" { k.min(nn - k) } else { k };
+            if (name == "COMBIN" && k > 1024.0) || (name == "PERMUT" && k > 170.0) {
+                return Arg::err(ErrorKind::Num);
+            }
+            let mut r = 1.0f64;
             for i in 0..(k as u64) {
                 r *= nn - i as f64;
                 if name == "COMBIN" {
                     r /= (i + 1) as f64;
                 }
+                if !r.is_finite() {
+                    return Arg::err(ErrorKind::Num);
+                }
             }
-            n(r.round())
+            n(if r < 9_007_199_254_740_992.0 { r.round() } else { r })
         }
         "MROUND" => {
             let x = try_num!(a(0));
@@ -2290,10 +2583,15 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
         "BASE" => {
             let x = try_num!(a(0)).floor();
             let radix = try_num!(a(1)).floor() as u32;
-            if !(2..=36).contains(&radix) || x < 0.0 {
+            // Excel: radix 2–36, 0 <= number < 2^53, minimum length at most 255
+            if !(2..=36).contains(&radix) || !(0.0..9_007_199_254_740_992.0).contains(&x) {
                 return Arg::err(ErrorKind::Num);
             }
-            let min_len = args.get(2).map(|v| v.clone().scalar()).map(|v| to_number(&v).unwrap_or(0.0) as usize).unwrap_or(0);
+            let min_len = args.get(2).map(|v| v.clone().scalar()).map(|v| to_number(&v).unwrap_or(0.0)).unwrap_or(0.0);
+            if !(0.0..=255.0).contains(&min_len) {
+                return Arg::err(ErrorKind::Num);
+            }
+            let min_len = min_len as usize;
             let mut v = x as u64;
             let digits = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
             let mut out = vec![];
@@ -2571,6 +2869,9 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
                 None | Some(Value::Empty) => 2.0,
                 Some(v) => try_num!(v),
             };
+            if !(d <= 127.0) {
+                return Arg::err(ErrorKind::Value);
+            }
             let no_commas = args.len() > 2 && try_bool!(a(2));
             let pattern = if no_commas { format!("0{}", if d > 0.0 { format!(".{}", "0".repeat(d as usize)) } else { String::new() }) } else { format!("#,##0{}", if d > 0.0 { format!(".{}", "0".repeat(d as usize)) } else { String::new() }) };
             t(format_text(&Value::Number(round_to(x, d, 0)), &pattern))
@@ -2671,16 +2972,19 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
                 return t(if concise || !matches!(v, Value::Text(_)) { v.to_display() } else { format!("\"{}\"", v.to_display()) });
             }
             let rows: Vec<String> = (0..arr.rows).map(|r| arr.row(r).iter().map(|v| if concise || !matches!(v, Value::Text(_)) { v.to_display() } else { format!("\"{}\"", v.to_display()) }).collect::<Vec<_>>().join(if concise { ", " } else { "," })).collect();
-            t(if concise { rows.join("; ") } else { format!("{{{}}}", rows.join(";")) })
+            text_result(if concise { rows.join("; ") } else { format!("{{{}}}", rows.join(";")) })
         }
         "JOIN" => {
             let delim = try_text!(a(0));
             let parts: Vec<String> = args.iter().skip(1).flat_map(|x| x.values()).map(|v| v.to_display()).collect();
-            t(parts.join(&delim))
+            text_result(parts.join(&delim))
         }
         // ---------------- more lookup & array shaping ----------------
         "INDIRECT" => {
             let text = try_text!(a(0));
+            if !spend(text.len() as u64) {
+                return Arg::err(ErrorKind::Num);
+            }
             match super::parser::parse(text.trim().trim_start_matches('=')) {
                 Ok(Expr::Ref(r)) => match resolve_ref_at(&r, ctx.wb, ctx.table, ctx.at) {
                     Ok(rect) => {
@@ -2692,8 +2996,16 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
                     }
                     Err(e) => Arg::err(e),
                 },
+                // evaluated like a direct use of the name: inside this evaluation's depth limit
+                // and work budget (a name defined as INDIRECT("itself") used to recurse until
+                // the stack overflowed). A hop holds this function's large frame on the stack,
+                // so it counts as 8 levels: a few hops are allowed, never a deep chain.
                 Ok(Expr::Name(nm)) => match ctx.wb.named_range(&nm) {
-                    Some(nr) => super::evaluate_full(ctx.wb, ctx.table, ctx.at, &nr.reference),
+                    Some(nr) if !spend(nr.reference.len() as u64) => Arg::err(ErrorKind::Num),
+                    Some(nr) => match super::parser::parse(&nr.reference) {
+                        Ok(parsed) => eval_depth(&parsed, ctx, depth + 8),
+                        Err(_) => Arg::err(ErrorKind::Name),
+                    },
                     None => Arg::err(ErrorKind::Ref),
                 },
                 _ => Arg::err(ErrorKind::Ref),
@@ -2886,6 +3198,12 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
             if width == 0 {
                 return Arg::err(ErrorKind::Num);
             }
+            // the last row is padded out to `width`: bound the padding and the result
+            let len = arr.data.len() as u64;
+            let rows = len.div_ceil(width as u64).max(1);
+            if !fits(rows, width as u64, MAX_ARRAY_CELLS) || rows * width as u64 - len > MAX_GENERATED_CELLS {
+                return Arg::err(ErrorKind::Num);
+            }
             let pad = args.get(2).map(|v| v.clone().scalar()).unwrap_or(Value::Error(ErrorKind::NA));
             let vals = arr.data.clone();
             let chunks: Vec<Vec<Value>> = vals.chunks(width).map(|c| {
@@ -2916,6 +3234,10 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
             };
             if rows < arr.rows || cols < arr.cols {
                 return Arg::err(ErrorKind::Value);
+            }
+            let added = (rows as u64) * (cols as u64) - (arr.rows as u64) * (arr.cols as u64);
+            if !fits(rows as u64, cols as u64, MAX_ARRAY_CELLS) || added > MAX_GENERATED_CELLS {
+                return Arg::err(ErrorKind::Num);
             }
             let pad = args.get(3).map(|v| v.clone().scalar()).unwrap_or(Value::Error(ErrorKind::NA));
             let data: Vec<Value> = (0..rows).flat_map(|r| (0..cols).map(move |c| (r, c))).map(|(r, c)| if r < arr.rows && c < arr.cols { arr.get(r, c).clone() } else { pad.clone() }).collect();
@@ -3011,38 +3333,24 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx) -> Arg {
                 Some(Value::Text(s)) if s.len() == 7 && s.chars().all(|c| c == '0' || c == '1') => s.chars().map(|c| c == '1').collect::<Vec<bool>>(),
                 Some(v) => weekend_mask(try_num!(v) as i64),
             };
-            let holidays: Vec<f64> = args.get(3).map(|h| h.values().iter().filter_map(|v| to_number(v).ok().map(|x| x.floor())).collect()).unwrap_or_default();
-            let is_workday = |d: f64| !weekend[weekday_mon0(d) as usize] && !holidays.contains(&d);
+            let holidays = holiday_list(args.get(3));
+            let hs = working_holidays(&holidays, &weekend);
             if name == "NETWORKDAYS.INTL" {
                 let end = match date_arg(&a(1)) {
                     Ok(x) => x.floor(),
                     Err(e) => return Arg::err(e),
                 };
                 let (s, e, sign) = if start <= end { (start, end, 1.0) } else { (end, start, -1.0) };
-                let mut count = 0;
-                let mut d = s;
-                while d <= e {
-                    if is_workday(d) {
-                        count += 1;
-                    }
-                    d += 1.0;
-                }
-                n(count as f64 * sign)
+                n(count_workdays(s as i64, e as i64, &weekend, &hs) as f64 * sign)
             } else {
-                let days = try_num!(a(1)) as i64;
+                let days = try_num!(a(1));
                 if weekend.iter().all(|w| *w) {
                     return Arg::err(ErrorKind::Value);
                 }
-                let step = if days >= 0 { 1.0 } else { -1.0 };
-                let mut left = days.abs();
-                let mut d = start;
-                while left > 0 {
-                    d += step;
-                    if is_workday(d) {
-                        left -= 1;
-                    }
+                match add_workdays(start as i64, days, &weekend, &hs) {
+                    Some(d) => date_result(d as f64),
+                    None => Arg::err(ErrorKind::Num),
                 }
-                n(d)
             }
         }
         // ---------------- more finance ----------------
@@ -3917,6 +4225,93 @@ fn serial_to_civil_offset() -> i64 {
 }
 
 /// Weekend mask for NETWORKDAYS.INTL / WORKDAY.INTL codes (index 0 = Monday).
+/// Holiday dates from a work-day function's argument. Like Excel, text dates count
+/// (`"2006/1/2"`); blanks and values that are not dates are skipped.
+fn holiday_list(arg: Option<&Arg>) -> Vec<f64> {
+    arg.map(|h| h.values().iter().filter(|v| !v.is_empty()).filter_map(|v| date_arg(v).ok()).map(|x| x.floor()).collect())
+        .unwrap_or_default()
+}
+
+/// Distinct whole-day holidays that fall on a working day (sorted), so each is subtracted once.
+fn working_holidays(holidays: &[f64], weekend: &[bool]) -> Vec<i64> {
+    let mut hs: Vec<i64> = holidays
+        .iter()
+        .filter(|h| date_in_range(**h))
+        .map(|h| h.floor() as i64)
+        .filter(|h| !weekend[weekday_mon0(*h as f64) as usize])
+        .collect();
+    hs.sort_unstable();
+    hs.dedup();
+    hs
+}
+
+/// Working days from `s` to `e` inclusive (`s <= e`): whole weeks contribute the mask's
+/// working days each, the remaining 0–6 days are checked one by one, and holidays in the
+/// span are subtracted. Constant time apart from the holiday binary search.
+fn count_workdays(s: i64, e: i64, weekend: &[bool], hs: &[i64]) -> i64 {
+    if e < s {
+        return 0;
+    }
+    let per_week = weekend.iter().filter(|w| !**w).count() as i64;
+    let weeks = (e - s + 1) / 7;
+    let mut count = weeks * per_week;
+    let mut d = s + weeks * 7;
+    while d <= e {
+        if !weekend[weekday_mon0(d as f64) as usize] {
+            count += 1;
+        }
+        d += 1;
+    }
+    let first = hs.partition_point(|h| *h < s);
+    let last = hs.partition_point(|h| *h <= e);
+    count - (last - first) as i64
+}
+
+/// The date `days` working days after (or before, if negative) `start`, as WORKDAY counts:
+/// `start` itself is not counted. Binary search on `count_workdays`, which only grows with the
+/// end date, so the answer is found in about fifty steps for any input. `None` when the result
+/// would leave Excel's date range. The weekend mask must leave at least one working day.
+fn add_workdays(start: i64, days: f64, weekend: &[bool], hs: &[i64]) -> Option<i64> {
+    if !days.is_finite() {
+        return None;
+    }
+    let days = days.trunc();
+    if days == 0.0 {
+        return Some(start);
+    }
+    // more working days than the whole date range holds can only end outside it
+    if days.abs() > MAX_DATE_SERIAL + 1.0 {
+        return None;
+    }
+    let want = days.abs() as i64;
+    let per_week = weekend.iter().filter(|w| !**w).count() as i64;
+    // enough weeks to collect `want` working days even if every holiday falls inside
+    let span = ((want + hs.len() as i64) / per_week + 2) * 7;
+    if days > 0.0 {
+        let (mut lo, mut hi) = (start + 1, start + span);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if count_workdays(start + 1, mid, weekend, hs) >= want {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        Some(lo)
+    } else {
+        let (mut lo, mut hi) = (start - span, start - 1);
+        while lo < hi {
+            let mid = hi - (hi - lo) / 2;
+            if count_workdays(mid, start - 1, weekend, hs) >= want {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        Some(lo)
+    }
+}
+
 fn weekend_mask(code: i64) -> Vec<bool> {
     let mut m = vec![false; 7];
     match code {

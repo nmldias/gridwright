@@ -60,7 +60,11 @@ pub enum Expr {
     Call(String, Vec<Expr>),
     Neg(Box<Expr>),
     Percent(Box<Expr>),
-    Binary(BinOp, Box<Expr>, Box<Expr>),
+    /// Operators of one precedence level applied left to right: `1 + 2 - 3` is
+    /// `Chain(1, [(Add, 2), (Sub, 3)])`. A flat list rather than a left-deep tree, so a long
+    /// formula such as `A1+A2+…+A2000` is a short, wide tree: every walk over it is a loop and
+    /// the tree's height depends only on nesting, never on the formula's length.
+    Chain(Box<Expr>, Vec<(BinOp, Expr)>),
     /// Array literal `{1,2;3,4}`
     Array(Vec<Vec<Expr>>),
     /// Error literal such as `#REF!`
@@ -78,9 +82,36 @@ impl From<LexError> for ParseError {
     }
 }
 
+/// Deepest nesting of parentheses, function calls, array literals, unary signs and `%`
+/// accepted. Excel allows 64 levels of nested functions; this is generous but keeps the
+/// recursive descent, and every later walk over the tree, well inside a browser's stack.
+///
+/// Nesting is the only thing that makes the tree tall: operators of one precedence form a
+/// flat `Chain`, so a formula's length does not affect stack use and needs no limit of its
+/// own here. (A length limit would also break formulas the engine rewrites: it prints them
+/// with spaces and numbers in full, which can be much longer than what was typed.)
+pub const MAX_NESTING: u32 = 256;
+
+/// Build a chain from `first` and the operators that follow it at one precedence level.
+/// A first operand that is itself a chain at the same level, as in `(1+2)+3`, is extended
+/// instead of nested: applying the operators left to right gives the same result, and the
+/// formula keeps one shape however it was parenthesised.
+fn chain(first: Expr, ops: Vec<(BinOp, Expr)>) -> Expr {
+    if ops.is_empty() {
+        return first;
+    }
+    match first {
+        Expr::Chain(head, mut rest) if prec(rest[0].0) == prec(ops[0].0) => {
+            rest.extend(ops);
+            Expr::Chain(head, rest)
+        }
+        other => Expr::Chain(Box::new(other), ops),
+    }
+}
+
 pub fn parse(src: &str) -> Result<Expr, ParseError> {
     let tokens = tokenize(src)?;
-    let mut p = Parser { tokens, pos: 0 };
+    let mut p = Parser { tokens, pos: 0, depth: 0 };
     let e = p.expr()?;
     if p.peek() != &Token::Eof {
         return Err(ParseError(format!("unexpected token {:?}", p.peek())));
@@ -91,9 +122,18 @@ pub fn parse(src: &str) -> Result<Expr, ParseError> {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Current nesting depth (parentheses, calls, array literals, unary signs).
+    depth: u32,
 }
 
 impl Parser {
+    fn enter(&mut self) -> Result<(), ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_NESTING {
+            return Err(ParseError(format!("formula is nested more than {MAX_NESTING} levels deep")));
+        }
+        Ok(())
+    }
     fn peek(&self) -> &Token {
         &self.tokens[self.pos]
     }
@@ -114,11 +154,15 @@ impl Parser {
     }
 
     fn expr(&mut self) -> Result<Expr, ParseError> {
-        self.comparison()
+        self.enter()?;
+        let e = self.comparison();
+        self.depth -= 1;
+        e
     }
 
     fn comparison(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.concat()?;
+        let left = self.concat()?;
+        let mut ops = Vec::new();
         loop {
             let op = match self.peek() {
                 Token::Op(o) => match o.as_str() {
@@ -133,24 +177,24 @@ impl Parser {
                 _ => break,
             };
             self.next();
-            let right = self.concat()?;
-            left = Expr::Binary(op, Box::new(left), Box::new(right));
+            ops.push((op, self.concat()?));
         }
-        Ok(left)
+        Ok(chain(left, ops))
     }
 
     fn concat(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.additive()?;
+        let left = self.additive()?;
+        let mut ops = Vec::new();
         while matches!(self.peek(), Token::Op(o) if o == "&") {
             self.next();
-            let right = self.additive()?;
-            left = Expr::Binary(BinOp::Concat, Box::new(left), Box::new(right));
+            ops.push((BinOp::Concat, self.additive()?));
         }
-        Ok(left)
+        Ok(chain(left, ops))
     }
 
     fn additive(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.term()?;
+        let left = self.term()?;
+        let mut ops = Vec::new();
         loop {
             let op = match self.peek() {
                 Token::Op(o) if o == "+" => BinOp::Add,
@@ -158,14 +202,14 @@ impl Parser {
                 _ => break,
             };
             self.next();
-            let right = self.term()?;
-            left = Expr::Binary(op, Box::new(left), Box::new(right));
+            ops.push((op, self.term()?));
         }
-        Ok(left)
+        Ok(chain(left, ops))
     }
 
     fn term(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.power()?;
+        let left = self.power()?;
+        let mut ops = Vec::new();
         loop {
             let op = match self.peek() {
                 Token::Op(o) if o == "*" => BinOp::Mul,
@@ -173,32 +217,36 @@ impl Parser {
                 _ => break,
             };
             self.next();
-            let right = self.power()?;
-            left = Expr::Binary(op, Box::new(left), Box::new(right));
+            ops.push((op, self.power()?));
         }
-        Ok(left)
+        Ok(chain(left, ops))
     }
 
     fn power(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.unary()?;
+        let left = self.unary()?;
+        let mut ops = Vec::new();
         while matches!(self.peek(), Token::Op(o) if o == "^") {
             self.next();
-            let right = self.unary()?;
-            left = Expr::Binary(BinOp::Pow, Box::new(left), Box::new(right));
+            ops.push((BinOp::Pow, self.unary()?));
         }
-        Ok(left)
+        Ok(chain(left, ops))
     }
 
     fn unary(&mut self) -> Result<Expr, ParseError> {
         match self.peek() {
             Token::Op(o) if o == "-" => {
                 self.next();
+                self.enter()?;
                 let e = self.unary()?;
+                self.depth -= 1;
                 Ok(Expr::Neg(Box::new(e)))
             }
             Token::Op(o) if o == "+" => {
                 self.next();
-                self.unary()
+                self.enter()?;
+                let e = self.unary();
+                self.depth -= 1;
+                e
             }
             _ => self.postfix(),
         }
@@ -206,10 +254,13 @@ impl Parser {
 
     fn postfix(&mut self) -> Result<Expr, ParseError> {
         let mut e = self.primary()?;
+        let depth = self.depth;
         while self.peek() == &Token::Percent {
             self.next();
+            self.enter()?;
             e = Expr::Percent(Box::new(e));
         }
+        self.depth = depth;
         Ok(e)
     }
 
@@ -552,9 +603,14 @@ pub fn to_string(e: &Expr) -> String {
             }
             Expr::Neg(x) => format!("-{}", go(x, 6)),
             Expr::Percent(x) => format!("{}%", go(x, 7)),
-            Expr::Binary(op, l, r) => {
-                let p = prec(*op);
-                let s = format!("{} {} {}", go(l, p), op_str(*op), go(r, p + 1));
+            Expr::Chain(first, rest) => {
+                // same layout as a left-deep tree: the first operand at this precedence,
+                // each later one a level tighter so `1 - (2 - 3)` keeps its parentheses
+                let p = prec(rest[0].0);
+                let mut s = go(first, p);
+                for (op, r) in rest {
+                    s.push_str(&format!(" {} {}", op_str(*op), go(r, p + 1)));
+                }
                 if p < parent_prec {
                     format!("({})", s)
                 } else {
@@ -602,9 +658,9 @@ pub fn map_refs(e: &mut Expr, f: &mut dyn FnMut(&mut RefExpr) -> bool) {
             map_refs(x, f);
             false
         }
-        Expr::Binary(_, l, r) => {
-            map_refs(l, f);
-            map_refs(r, f);
+        Expr::Chain(first, rest) => {
+            map_refs(first, f);
+            rest.iter_mut().for_each(|(_, x)| map_refs(x, f));
             false
         }
         Expr::Array(rows) => {
@@ -624,9 +680,9 @@ pub fn for_each_ref_mut(e: &mut Expr, f: &mut dyn FnMut(&mut RefExpr)) {
         Expr::Ref(r) => f(r),
         Expr::Call(_, args) => args.iter_mut().for_each(|a| for_each_ref_mut(a, f)),
         Expr::Neg(x) | Expr::Percent(x) => for_each_ref_mut(x, f),
-        Expr::Binary(_, l, r) => {
-            for_each_ref_mut(l, f);
-            for_each_ref_mut(r, f);
+        Expr::Chain(first, rest) => {
+            for_each_ref_mut(first, f);
+            rest.iter_mut().for_each(|(_, x)| for_each_ref_mut(x, f));
         }
         Expr::Array(rows) => rows.iter_mut().flatten().for_each(|x| for_each_ref_mut(x, f)),
         _ => {}
@@ -638,9 +694,9 @@ pub fn for_each_ref(e: &Expr, f: &mut dyn FnMut(&RefExpr)) {
         Expr::Ref(r) => f(r),
         Expr::Call(_, args) => args.iter().for_each(|a| for_each_ref(a, f)),
         Expr::Neg(x) | Expr::Percent(x) => for_each_ref(x, f),
-        Expr::Binary(_, l, r) => {
-            for_each_ref(l, f);
-            for_each_ref(r, f);
+        Expr::Chain(first, rest) => {
+            for_each_ref(first, f);
+            rest.iter().for_each(|(_, x)| for_each_ref(x, f));
         }
         Expr::Array(rows) => rows.iter().flatten().for_each(|x| for_each_ref(x, f)),
         _ => {}
