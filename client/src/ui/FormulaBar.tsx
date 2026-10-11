@@ -19,7 +19,7 @@ export function FormulaBar() {
   const cell = selection ? cellAt(selection.table, selection.ar, selection.ac) : undefined;
   const isCode = cell && isCodeKind(cell.k);
   const label = meta && selection ? `${meta.name}::${a1(selection.ar, selection.ac)}` : '';
-  const shown = editing ? editorText : (cell?.s ? '' : (cell?.i ?? ''));
+  const shown = editing ? editorText : (cell?.s ? '' : book.editText(cell?.i ?? ''));
 
   useEffect(() => {
     if (!editing && ref.current && document.activeElement === ref.current) ref.current.blur();
@@ -27,7 +27,7 @@ export function FormulaBar() {
 
   const commit = () => {
     if (!selection || !ref.current) return;
-    const text = ref.current.value;
+    const text = book.normalizeTyped(ref.current.value);
     const prev = cell?.i ?? '';
     if (text !== prev && !cell?.s) book.apply({ type: 'set_cell', table: selection.table, row: selection.ar, col: selection.ac, input: text }, { trustCode: true });
     useStore.setState({ editing: null, editorText: text });
@@ -78,7 +78,7 @@ export function FormulaBar() {
           readOnly={!!cell?.s}
           spellCheck={false}
           onFocus={() => {
-            if (selection && !editing && !cell?.s) useStore.setState({ editing: { table: selection.table, r: selection.ar, c: selection.ac, initial: cell?.i ?? '', replace: false, source: 'bar' }, editorText: cell?.i ?? '' });
+            if (selection && !editing && !cell?.s) useStore.setState({ editing: { table: selection.table, r: selection.ar, c: selection.ac, initial: book.editText(cell?.i ?? ''), replace: false, source: 'bar' }, editorText: book.editText(cell?.i ?? '') });
           }}
           onChange={(e) => useStore.setState({ editorText: e.target.value })}
           onKeyDown={(e) => {
@@ -87,7 +87,7 @@ export function FormulaBar() {
               commit();
             } else if (e.key === 'Escape') {
               e.preventDefault();
-              useStore.setState({ editing: null, editorText: cell?.i ?? '' });
+              useStore.setState({ editing: null, editorText: book.editText(cell?.i ?? '') });
               ref.current?.blur();
             }
             e.stopPropagation();

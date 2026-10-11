@@ -80,7 +80,8 @@ fn compare_bounds(wb: &Workbook, table: TableId, x: f64, rule: &Validation, what
     let op = rule.op.as_deref().unwrap_or("between");
     let a = rule.values.first().and_then(|s| bound(wb, table, s)).unwrap_or(f64::NEG_INFINITY);
     let b = rule.values.get(1).and_then(|s| bound(wb, table, s)).unwrap_or(f64::INFINITY);
-    let fmt = |v: f64| crate::model::format_number(v);
+    // the message is read by a person: numbers as the workbook shows them ("1,5" with a decimal comma)
+    let fmt = |v: f64| crate::model::edit_text(&crate::model::format_number(v), wb.decimal_comma);
     let ok = match op {
         "between" => x >= a && x <= b,
         "not_between" => x < a || x > b,

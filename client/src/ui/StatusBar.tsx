@@ -1,7 +1,6 @@
 import { useMemo } from 'react';
 import { cellAt, useStore } from '../state/store';
-import { formatNumberPlain } from '../engine/types';
-import { displayOf } from '../grid/format';
+import { displayOf, formatNumber } from '../grid/format';
 import { numberOverflows } from '../grid/renderer';
 import { autoFitColumn } from '../grid/actions';
 
@@ -14,6 +13,8 @@ export function StatusBar() {
   const runs = useStore((s) => s.runs);
   const fileId = useStore((s) => s.fileId);
   const zoom = useStore((s) => s.zoom);
+  // Sum/Avg follow the workbook's number convention (1.234,56 or 1,234.56)
+  useStore((s) => s.decimalComma);
   const me = useStore((s) => s.me);
   const cellsVersion = useStore((s) => s.cellsVersion);
   void cellsVersion;
@@ -68,7 +69,7 @@ export function StatusBar() {
       )}
       {stats && stats.n > 0 && (
         <span className="muted">
-          Sum {formatNumberPlain(Math.round(stats.sum * 1e6) / 1e6)} · Avg {formatNumberPlain(Math.round((stats.sum / stats.n) * 1e6) / 1e6)} · Count {stats.count}
+          Sum {formatNumber(Math.round(stats.sum * 1e6) / 1e6)} · Avg {formatNumber(Math.round((stats.sum / stats.n) * 1e6) / 1e6)} · Count {stats.count}
         </span>
       )}
       {stats && stats.n === 0 && <span className="muted">Count {stats.count}</span>}

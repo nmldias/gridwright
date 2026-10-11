@@ -216,6 +216,8 @@ export interface Changes {
   names?: NamedRange[];
   charts?: Chart[];
   created_chart?: number;
+  /** the workbook's decimal-comma setting, when it changed */
+  decimal_comma?: boolean;
   /** undo/redo: restore ops that reproduce the change on other clients */
   ops?: Op[];
 }
@@ -283,7 +285,9 @@ export type Op =
   | { type: 'restore_cells'; cells: RestoredCell[] }
   | { type: 'restore_tables'; tables: RestoredTable[] }
   | { type: 'restore_names'; names: NamedRange[] }
-  | { type: 'restore_charts'; charts: Chart[] };
+  | { type: 'restore_charts'; charts: Chart[] }
+  /** type and show numbers with a decimal comma ("1.234,56") in this workbook */
+  | { type: 'set_decimal_comma'; on: boolean };
 
 /** Ops that change the shape of a table (row/column indices shift). */
 export const STRUCTURAL_OPS = new Set<Op['type']>(['resize_table', 'insert_rows', 'delete_rows', 'insert_cols', 'delete_cols', 'delete_table', 'add_table', 'set_pivot', 'rename_table', 'set_header_rows', 'restore_tables']);

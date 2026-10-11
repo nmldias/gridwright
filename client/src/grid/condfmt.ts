@@ -26,6 +26,20 @@ let cacheVersion = -1;
 // evaluates each visible cell at most once per change
 const formulaCache = new Map<string, boolean>();
 let formulaVersion = -1;
+// "Cell value is" thresholds are stored canonically ("1,000", "2.5", "12%", a date) and read the
+// way the engine reads an input; the parse is cached because it runs for every drawn cell
+const thresholdCache = new Map<string, number>();
+function thresholdOf(s: string | undefined): number {
+  // an absent or empty threshold keeps its old meaning (NaN / 0)
+  if (s === undefined || s.trim() === '') return Number(s);
+  let n = thresholdCache.get(s);
+  if (n === undefined) {
+    n = book.parseNumber(s);
+    if (thresholdCache.size > 1000) thresholdCache.clear();
+    thresholdCache.set(s, n);
+  }
+  return n;
+}
 
 function numberOf(v: CellValue): number | null {
   return v && 'n' in v ? v.n : null;
@@ -125,8 +139,8 @@ export function condStyle(meta: TableMeta, cellMap: Map<number, CellView> | unde
     switch (rule.kind) {
       case 'cell_is': {
         const n = numberOf(v);
-        const a = Number(rule.values[0]);
-        const b = Number(rule.values[1]);
+        const a = thresholdOf(rule.values[0]);
+        const b = thresholdOf(rule.values[1]);
         if (n !== null && Number.isFinite(a)) matched = cmpNumber(n, rule.op ?? 'gt', a, Number.isFinite(b) ? b : a);
         else if (v && 's' in v && (rule.op === 'eq' || rule.op === 'ne')) matched = (v.s.toLowerCase() === String(rule.values[0] ?? '').toLowerCase()) === (rule.op === 'eq');
         break;

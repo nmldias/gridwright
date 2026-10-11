@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api, RECORD_KINDS, type Companion, type ContextRecord, type IntakeProfile, type IntakeSet, type Investigation, type SourceDef, type RecordKind, type Suggestion, type Understanding, type Watch, type WatchDef } from '../api/client';
+import * as book from '../engine/book';
 import { readOnly, setStatus, useStore } from '../state/store';
 import { acceptSuggestion, addWatch, applyExclusion, approveWatch, changeWatch, checkNow, clearReflection, confirmReading, confirmRecord, correctRecord, dismissSuggestion, investigate, loadCompanion, markExpectation, markSeen, remember, removeRecord, removeWatch, resolveRecord, restoreSuggestion, retireRecord, statementOf, stopInvestigation, useCompanion } from './companion';
 import { applyIntake, refreshSource, skipIntake, useIntake } from './intake';
@@ -990,10 +991,13 @@ function WatchingView({ watches, fileId, investigations, canInvestigate, stack }
                   <button
                     className="small"
                     onClick={() => {
-                      const v = prompt(`New threshold for “${w.def.purpose}” (currently ${w.def.op} ${w.def.value}). This is recorded as your decision.`, String(w.def.value ?? 0));
-                      if (v === null || v.trim() === '' || !Number.isFinite(Number(v))) return;
+                      // typed like a cell: "1,5" is one and a half in a decimal-comma workbook
+                      const now = book.editText(String(w.def.value ?? 0));
+                      const v = prompt(`New threshold for “${w.def.purpose}” (currently ${w.def.op} ${now}). This is recorded as your decision.`, now);
+                      const x = v === null || v.trim() === '' ? NaN : Number(book.normalizeTyped(v.trim()));
+                      if (!Number.isFinite(x)) return;
                       const reason = prompt('Why? (kept with the decision)', '') ?? '';
-                      void changeWatch(w, { value: Number(v) }, reason);
+                      void changeWatch(w, { value: x }, reason);
                     }}
                   >
                     Move threshold…

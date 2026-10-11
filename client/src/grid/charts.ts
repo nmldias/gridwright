@@ -103,8 +103,10 @@ export function fmtNum(v: number, compact = true): string {
   return trim(v, 2);
 }
 function trim(v: number, d: number): string {
-  const s = v.toFixed(d);
-  return d > 0 ? s.replace(/\.?0+$/, '') : s;
+  const f = v.toFixed(d);
+  const s = d > 0 ? f.replace(/\.?0+$/, '') : f;
+  // a chart is part of the workbook: its labels follow the workbook's decimal comma (1,5k)
+  return getState().decimalComma ? s.replace('.', ',') : s;
 }
 function niceTicks(lo: number, hi: number, n = 4): number[] {
   if (hi <= lo) hi = lo + 1;

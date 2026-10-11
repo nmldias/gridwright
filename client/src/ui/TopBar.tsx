@@ -66,6 +66,7 @@ export function TopBar() {
     const sel = s.selection;
     return !!sel && !!s.tables.get(sel.table)?.merges?.some((m) => m.r0 <= sel.r1 && sel.r0 <= m.r1 && m.c0 <= sel.c1 && sel.c0 <= m.c1);
   });
+  const decimalComma = useStore((s) => s.decimalComma);
   const [renaming, setRenaming] = useState(false);
   const [nameDraft, setNameDraft] = useState(fileName);
   const [recent, setRecent] = useState<FileInfo[]>([]);
@@ -93,6 +94,15 @@ export function TopBar() {
 
   const docItems: MenuEntry[] = [
     { label: 'Rename', title: 'Rename this document', onClick: () => (setNameDraft(fileName), setRenaming(true)), disabled: readOnly && !!fileId },
+    {
+      label: 'Decimal comma (1.234,56)',
+      title: decimalComma
+        ? 'On: numbers are typed and shown as 1.234,56. Click to use 1,234.56 (formulas keep the comma between arguments either way)'
+        : 'Off: numbers are typed and shown as 1,234.56. Click to type and show them as 1.234,56, as in Portuguese',
+      onClick: () => book.apply({ type: 'set_decimal_comma', on: !decimalComma }),
+      active: decimalComma,
+      disabled: readOnly,
+    },
     { label: 'New document', title: 'Start an empty document (the current one stays on the server if it was saved)', onClick: () => void newFile() },
     { label: 'Add a file (CSV, Excel, XML, JSON)…', title: 'Profiled first — columns, period, how it relates to what is here — then placed as you decide in Ask; a Gridwright JSON file replaces the document', onClick: () => pickAndImport() },
     { label: 'Guided import…', title: 'Step by step with the assistant: clean, structure, check and analyse a large export; every step recorded, saved as a recipe for the next file', onClick: () => openStudio() },
