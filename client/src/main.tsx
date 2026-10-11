@@ -6,7 +6,7 @@ import './styles.css';
 import { applyThemeCss } from './theme';
 import { statusOf } from './workers/runs';
 import { getState } from './state/store';
-import { getRenderer } from './grid/actions';
+import { getRenderer, selectCell } from './grid/actions';
 import { displayOf } from './grid/format';
 import { numberOverflows } from './grid/renderer';
 import * as book from './engine/book';
@@ -22,6 +22,7 @@ applyThemeCss();
 // Introspection hooks for tests and debugging (window.__gw)
 (window as any).__gw = {
   getState,
+  selectCell,
   book,
   review,
   charts,

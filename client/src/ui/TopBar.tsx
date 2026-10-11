@@ -9,6 +9,7 @@ import { NUMBER_FORMATS } from '../grid/format';
 import { useStore, type Panel } from '../state/store';
 import { downloadJson, newFile, openFile, saveCurrentFile } from './files';
 import { pickAndImport } from './import';
+import { openStudio } from './studio/nav';
 import { Menu, type MenuEntry } from './Menu';
 import { openPrintView } from './print';
 import { insertChart } from './review';
@@ -94,6 +95,7 @@ export function TopBar() {
     { label: 'Rename', title: 'Rename this document', onClick: () => (setNameDraft(fileName), setRenaming(true)), disabled: readOnly && !!fileId },
     { label: 'New document', title: 'Start an empty document (the current one stays on the server if it was saved)', onClick: () => void newFile() },
     { label: 'Add a file (CSV, Excel, XML, JSON)…', title: 'Profiled first — columns, period, how it relates to what is here — then placed as you decide in Ask; a Gridwright JSON file replaces the document', onClick: () => pickAndImport() },
+    { label: 'Guided import…', title: 'Step by step with the assistant: clean, structure, check and analyse a large export; every step recorded, saved as a recipe for the next file', onClick: () => openStudio() },
     { label: 'Import a workbook with its formulas…', title: 'Every sheet becomes a table as it is, formulas kept; nothing profiled', onClick: () => pickAndImport({ formulas: true }) },
     { label: 'Finance templates…', title: 'Reference workbooks and templates', onClick: () => useStore.setState({ panel: 'files', filesView: 'templates' }) },
     'sep',
@@ -110,6 +112,7 @@ export function TopBar() {
     { label: 'Chart from selection', title: 'Insert a chart built from the selection (exhibit style)', onClick: () => void insertChart(), disabled: !selection },
     'sep',
     { label: 'Add a file…', title: 'CSV, Excel, XML or JSON — profiled, then placed as you decide in Ask', onClick: () => pickAndImport() },
+    { label: 'Guided import…', title: 'Clean, structure and analyse a file step by step, with an audit trail and reusable recipes', onClick: () => openStudio() },
   ];
   // code cells: Python is one click (the common case); JavaScript, SQL and the panel sit under its caret
   const codeItems: MenuEntry[] = [

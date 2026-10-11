@@ -44,7 +44,21 @@ export function registerDocumentRoutes(app: Express, ctx: { defaultSharing: 'edi
     const p = docPermission(req, res, 'view');
     if (!p) return;
     const f = readFile(req.params.id)!;
-    res.json({ ...f, seq: currentSeq(req.params.id), permission: p.permission, folder: p.access.folder });
+    const seq = currentSeq(req.params.id);
+    // the saved file can lag the log (edits made on the server — imports, placements, accepted proposals — when no
+    // editor saved afterwards): serve the newest checkpoint plus every op since, so the seq sent matches the content
+    let json = f.json;
+    const bundle = replayBundle(req.params.id, seq);
+    if (bundle && bundle.ops.length) {
+      try {
+        const d = openDocument(req.params.id);
+        d.book.free();
+        json = d.json;
+      } catch (e) {
+        console.error('replay on open failed:', errorMessage(e));
+      }
+    }
+    res.json({ ...f, json, seq, permission: p.permission, folder: p.access.folder });
   });
   app.post('/api/files', requireRole('editor'), (req, res) => {
     try {
