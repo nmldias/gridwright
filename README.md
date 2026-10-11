@@ -249,7 +249,7 @@ python3 e2e/smoke.py http://localhost:8787 --python     # editing, handles, code
 node e2e/mock-llm.mjs &                                 # mock model for the assistant (also plays a tool round)
 python3 e2e/features.py http://localhost:8787 --pg host:port:db:user:pass --mock-llm http://127.0.0.1:8899/v1
                                                         # arrays, refs, filters, rules, pivots, SQL cells, history,
-                                                        # AI diff, convergence, touch (40 checks)
+                                                        # AI diff, convergence, touch (41 checks)
 python3 e2e/features2.py http://localhost:8787 --pg … --mock-llm … --acl http://127.0.0.1:8795
                                                         # charts, sign-offs, CHECK/FX/RECONCILE/AGEING, trace, merges,
                                                         # undo as ops, OT, audit CSV, AI tools, templates (the AGEING spill surviving
