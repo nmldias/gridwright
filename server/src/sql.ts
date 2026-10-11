@@ -148,13 +148,18 @@ export function limitsOf(c: StoredConnection, requested?: number): { maxRows: nu
   return { maxRows, timeoutMs };
 }
 
-export async function runQuery(c: StoredConnection, sql: string, limit: number, params: Param[] = []): Promise<QueryResult> {
+/**
+ * Run a statement. On a read-only connection — or with `forceReadOnly` (the assistant, MCP) — the
+ * database enforces it too, whatever the text says: a read-only transaction on Postgres and MySQL, and on
+ * SQL Server (which has none) a transaction that is always rolled back.
+ */
+export async function runQuery(c: StoredConnection, sql: string, limit: number, params: Param[] = [], opts: { forceReadOnly?: boolean } = {}): Promise<QueryResult> {
   const password = c.passwordEnc ? decrypt(c.passwordEnc) : '';
   const t0 = Date.now();
   const { maxRows: max, timeoutMs } = limitsOf(c, limit);
-  const readOnly = c.readOnly !== false;
+  const readOnly = opts.forceReadOnly === true || c.readOnly !== false;
   if (c.kind === 'postgres') return runPostgres(c, password, sql, max, timeoutMs, readOnly, params, t0);
-  if (c.kind === 'mssql') return runMssql(c, password, sql, max, timeoutMs, params, t0);
+  if (c.kind === 'mssql') return runMssql(c, password, sql, max, timeoutMs, readOnly, params, t0);
   return runMysql(c, password, sql, max, timeoutMs, readOnly, params, t0);
 }
 
@@ -174,8 +179,12 @@ async function runPostgres(c: StoredConnection, password: string, sql: string, m
   });
   await client.connect();
   try {
-    // a read-only transaction is enforced by the database itself, whatever the text says
-    if (readOnly) await client.query('BEGIN READ ONLY');
+    // a read-only transaction is enforced by the database itself, whatever the text says; strings are
+    // read the standard way (backslash is a character, not an escape), as the read-only policy reads them
+    if (readOnly) {
+      await client.query('SET standard_conforming_strings = on');
+      await client.query('BEGIN READ ONLY');
+    }
     const cursor = client.query(new Cursor(text, params, { rowMode: 'array' } as never));
     const { rows, fields } = await new Promise<{ rows: unknown[][]; fields: { name: string; dataTypeID?: number }[] }>((resolve, reject) => {
       cursor.read(max + 1, (err: Error | undefined, rows: unknown[][], result?: { fields?: { name: string; dataTypeID?: number }[] }) => {
@@ -193,7 +202,7 @@ async function runPostgres(c: StoredConnection, password: string, sql: string, m
   }
 }
 
-async function runMssql(c: StoredConnection, password: string, sql: string, max: number, timeoutMs: number, params: Param[], t0: number): Promise<QueryResult> {
+async function runMssql(c: StoredConnection, password: string, sql: string, max: number, timeoutMs: number, readOnly: boolean, params: Param[], t0: number): Promise<QueryResult> {
   const mssql = (await import('mssql')).default;
   const pool = new mssql.ConnectionPool({
     server: c.host,
@@ -208,9 +217,17 @@ async function runMssql(c: StoredConnection, password: string, sql: string, max:
     pool: { max: 2, min: 0, idleTimeoutMillis: 5000 },
   });
   await pool.connect();
+  // SQL Server has no read-only transaction: a read-only query runs inside one that is always rolled
+  // back, so a write that got past the policy is undone, and BACKUP, RESTORE, KILL and the like refuse
+  // to run at all inside a transaction. Closing the connection rolls back whatever is left.
+  let tx: InstanceType<typeof mssql.Transaction> | null = null;
   try {
+    if (readOnly) {
+      tx = new mssql.Transaction(pool);
+      await tx.begin(mssql.ISOLATION_LEVEL.READ_COMMITTED);
+    }
     const { text } = rewritePlaceholders(sql, (i) => `@p${i}`);
-    const request = pool.request();
+    const request = tx ? new mssql.Request(tx) : pool.request();
     request.stream = true;
     params.forEach((p, i) => request.input(`p${i}`, p));
     let columns: string[] = [];
@@ -231,15 +248,37 @@ async function runMssql(c: StoredConnection, password: string, sql: string, max:
           request.cancel(); // stop the server from sending the rest
         }
       });
+      // an error does not end the request: SQL Server may send more (BACKUP inside a transaction sends
+      // two) and then 'done'. Settle on 'done' — rolling back while the request is still running never
+      // completes — keeping the first error; if 'done' never comes (the connection died), after 2 s.
+      let failure: Error | null = null;
+      let giveUp: NodeJS.Timeout | null = null;
       request.on('error', (err: Error & { code?: string }) => {
         if (truncated && (err.code === 'ECANCEL' || /cancel/i.test(err.message))) return;
-        reject(err);
+        failure ??= err;
+        giveUp ??= setTimeout(() => reject(failure), 2000);
       });
-      request.on('done', () => resolve());
+      request.on('done', () => {
+        if (giveUp) clearTimeout(giveUp);
+        if (failure) reject(failure);
+        else resolve();
+      });
       request.query(text);
     });
+    if (tx) {
+      const open = tx;
+      tx = null;
+      try {
+        await open.rollback();
+      } catch (e) {
+        // the statement ended the transaction itself (COMMIT/ROLLBACK inside the batch): report it, never pass it off as read-only
+        throw new Error(`the statement ended the read-only transaction (${errorText(e)}); the result is not returned`);
+      }
+    }
     return { columns, kinds, rows: rows.map((row) => row.map((v, i) => plain(v, kinds[i]))), rowCount: rows.length + (truncated ? 1 : 0), truncated, ms: Date.now() - t0 };
   } finally {
+    // bounded: closing the connection rolls back whatever a stuck rollback left open
+    if (tx) await Promise.race([tx.rollback().catch(() => undefined), new Promise((r) => setTimeout(r, 5000))]);
     await pool.close().catch(() => undefined);
   }
 }
@@ -269,6 +308,20 @@ async function runMysql(c: StoredConnection, password: string, sql: string, max:
     // read-only does not run the query at all
     if (readOnly) {
       try {
+        // the read-only policy reads a backslash in quotes as an escape and "…" as a string, as MySQL
+        // does by default: a server or session configured otherwise (NO_BACKSLASH_ESCAPES, ANSI_QUOTES,
+        // or a combination mode that implies one) is set back for this session, or the query is refused
+        const lexing = /^(NO_BACKSLASH_ESCAPES|ANSI_QUOTES|ANSI|ORACLE|MSSQL|DB2|POSTGRESQL|MAXDB)$/i;
+        const modeOf = async () => {
+          const [rows] = await conn.query('SELECT @@SESSION.sql_mode');
+          return String((rows as unknown[][])[0]?.[0] ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+        };
+        const mode = await modeOf();
+        if (mode.some((m) => lexing.test(m))) {
+          await conn.query('SET SESSION sql_mode = ?', [mode.filter((m) => !lexing.test(m)).join(',')]);
+          const now = await modeOf();
+          if (now.some((m) => /^(NO_BACKSLASH_ESCAPES|ANSI_QUOTES)$/i.test(m))) throw new Error(`sql_mode still has ${now.join(',')}`);
+        }
         // the session (every transaction, autocommit included) and the transaction we run in
         await conn.query('SET SESSION TRANSACTION READ ONLY');
         await conn.query('START TRANSACTION READ ONLY');

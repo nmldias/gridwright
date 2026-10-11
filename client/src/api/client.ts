@@ -728,13 +728,17 @@ export const api = {
       return j(await fetch(`/api/files/${encodeURIComponent(id)}/checkpoint`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ client }) }));
     },
     async save(id: string, name: string, json: string, client?: string, seq?: number): Promise<FileInfo & { seq: number }> {
-      return j(
-        await fetch(`/api/files/${encodeURIComponent(id)}`, {
-          method: 'PUT',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ name, json, client, seq }),
-        }),
-      );
+      const res = await fetch(`/api/files/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name, json, client, seq }),
+      });
+      if (res.status === 409) {
+        // the log has changes this copy has not applied: the caller catches up to `seq` and saves again
+        const b = (await res.json().catch(() => ({}))) as { error?: string; seq?: number };
+        throw Object.assign(new Error(b.error || 'the document changed since this copy'), { stale: true, seq: b.seq });
+      }
+      return j(res);
     },
     async remove(id: string): Promise<void> {
       await j(await fetch(`/api/files/${encodeURIComponent(id)}`, { method: 'DELETE' }));

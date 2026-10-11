@@ -40,8 +40,8 @@ export function TrustBanner() {
           <strong>
             {n} code cell{n === 1 ? '' : 's'} did not run.
           </strong>{' '}
-          {n === 1 ? 'It was' : 'They were'} written by someone else (or before you opened this document here), and code runs with <em>your</em> access to data and
-          connections.
+          {n === 1 ? 'It was' : 'They were'} not typed by you here — written by someone else, by the assistant or an agent, or before you opened this document — and code
+          runs with <em>your</em> access to data and connections.
         </span>
         <span className="trust-actions">
           <button onClick={() => setOpen(true)} data-testid="trust-review">

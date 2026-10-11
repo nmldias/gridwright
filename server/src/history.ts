@@ -1,12 +1,16 @@
 // Per-document operation log (audit trail) and checkpoints.
 //
-//   data/history/<fileId>.ops.jsonl     one JSON entry per line, strictly increasing `seq`
+//   data/history/log.sqlite             every document's entries; (file, seq) is unique, so a number is
+//                                       never handed out twice — not after a restart, not for a large entry
 //   data/history/<fileId>/<seq>.json    document snapshots ("checkpoints") taken at saves / undo-redo
 //
 // The server is the single sequencer: every op accepted over the WebSocket gets the next seq,
 // is appended here, and only then broadcast — so every client applies the same order.
+// Logs written by earlier versions (<fileId>.ops.jsonl, one JSON entry per line) are imported on
+// first use and kept aside as <fileId>.ops.jsonl.migrated.
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import { join } from 'node:path';
 import { DATA_DIR } from './storage.js';
 
@@ -90,11 +94,6 @@ export function sanitiseRun(raw: unknown): RunRecord | null {
 const HISTORY_DIR = () => join(DATA_DIR, 'history');
 const safeId = (id: string) => /^[a-zA-Z0-9_-]{1,64}$/.test(id);
 
-const seqCache = new Map<string, number>();
-
-function logPath(fileId: string) {
-  return join(HISTORY_DIR(), `${fileId}.ops.jsonl`);
-}
 function cpDir(fileId: string) {
   return join(HISTORY_DIR(), fileId);
 }
@@ -103,35 +102,135 @@ export function ensureHistoryDir() {
   mkdirSync(HISTORY_DIR(), { recursive: true });
 }
 
+// --- the log: one SQLite database ----------------------------------------------------------------
+// An entry is stored as its JSON without seq and ts (those are columns); has_op and checkpoint are
+// kept apart so replays and "what changed since" are index lookups, not scans of the whole log.
+const SCHEMA_VERSION = 1;
+let conn: DatabaseSync | null = null;
+let q: Record<'head' | 'insert' | 'since' | 'recent' | 'all' | 'ops' | 'changes' | 'del' | 'has', StatementSync> | null = null;
+
+function db(): typeof q & object {
+  if (q) return q;
+  ensureHistoryDir();
+  const d = new DatabaseSync(join(HISTORY_DIR(), 'log.sqlite'));
+  // an audit log: every commit reaches the disk (FULL), readers never block the writer (WAL)
+  d.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 10000; PRAGMA foreign_keys = ON;');
+  d.exec(`CREATE TABLE IF NOT EXISTS entries (
+    id INTEGER PRIMARY KEY,
+    file TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    ts TEXT NOT NULL,
+    has_op INTEGER NOT NULL,
+    checkpoint INTEGER NOT NULL,
+    entry TEXT NOT NULL,
+    UNIQUE (file, seq)
+  )`);
+  const v = Number((d.prepare('PRAGMA user_version').get() as { user_version: number }).user_version);
+  if (v > SCHEMA_VERSION) throw new Error(`the history log (${join(HISTORY_DIR(), 'log.sqlite')}) is from a newer Gridwright (schema ${v}; this one knows ${SCHEMA_VERSION})`);
+  if (v < SCHEMA_VERSION) d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+  conn = d;
+  q = {
+    head: d.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM entries WHERE file = ?'),
+    // the number is taken inside the insert, under SQLite's write lock: two writers cannot get the same one
+    insert: d.prepare('INSERT INTO entries (file, seq, ts, has_op, checkpoint, entry) VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM entries WHERE file = ?), ?, ?, ?, ?) RETURNING seq'),
+    since: d.prepare('SELECT seq, ts, entry FROM entries WHERE file = ? AND seq > ? ORDER BY seq LIMIT ?'),
+    recent: d.prepare('SELECT seq, ts, entry FROM entries WHERE file = ? AND seq < ? ORDER BY seq DESC LIMIT ?'),
+    all: d.prepare('SELECT seq, ts, entry FROM entries WHERE file = ? ORDER BY seq'),
+    ops: d.prepare('SELECT seq, ts, entry FROM entries WHERE file = ? AND seq > ? AND seq <= ? AND has_op = 1 ORDER BY seq'),
+    changes: d.prepare('SELECT COUNT(*) AS n FROM entries WHERE file = ? AND seq > ? AND (has_op = 1 OR checkpoint = 1)'),
+    del: d.prepare('DELETE FROM entries WHERE file = ?'),
+    has: d.prepare('SELECT 1 AS x FROM entries WHERE file = ? LIMIT 1'),
+  };
+  importLegacyLogs(d);
+  return q;
+}
+
+type Row = { seq: number | bigint; ts: string; entry: string };
+function toEntry(r: Row): LogEntry {
+  return { seq: Number(r.seq), ts: r.ts, ...(JSON.parse(r.entry) as Omit<LogEntry, 'seq' | 'ts'>) };
+}
+function stored(e: Omit<LogEntry, 'seq' | 'ts'> & { seq?: unknown; ts?: unknown }): string {
+  const { seq: _s, ts: _t, ...rest } = e;
+  return JSON.stringify(rest);
+}
+
+/**
+ * Import the logs of earlier versions (<id>.ops.jsonl): every readable line, in file order. A number
+ * that is not above the previous one — the restart bug handed numbers out again — gets the next free
+ * number and a note saying what it was. Checkpoint files keep their names. The old file is renamed
+ * <id>.ops.jsonl.migrated (kept, not deleted). One transaction per document: all of it or none.
+ */
+function importLegacyLogs(d: DatabaseSync) {
+  let names: string[] = [];
+  try {
+    names = readdirSync(HISTORY_DIR()).filter((n) => n.endsWith('.ops.jsonl'));
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const fileId = name.slice(0, -'.ops.jsonl'.length);
+    const path = join(HISTORY_DIR(), name);
+    if (!safeId(fileId)) continue;
+    let renumbered = 0;
+    let imported = 0;
+    let skipped = 0;
+    d.exec('BEGIN IMMEDIATE');
+    try {
+      // a previous start that imported but could not rename: the rows are there, only the rename is left
+      if (!q!.has.get(fileId)) {
+        const put = d.prepare('INSERT INTO entries (file, seq, ts, has_op, checkpoint, entry) VALUES (?, ?, ?, ?, ?, ?)');
+        let last = 0;
+        for (const line of readFileSync(path, 'utf8').split('\n')) {
+          if (!line.trim()) continue;
+          let e: LogEntry;
+          try {
+            e = JSON.parse(line);
+          } catch {
+            skipped++; // a torn or damaged line
+            continue;
+          }
+          if (!e || typeof e !== 'object') {
+            skipped++;
+            continue;
+          }
+          let seq = Number(e.seq);
+          if (!Number.isInteger(seq) || seq <= last) {
+            const was = Number.isFinite(seq) ? String(seq) : 'none';
+            seq = last + 1;
+            e.note = `${e.note ? `${e.note} ` : ''}(renumbered from ${was} when the log moved to SQLite)`.slice(0, 400);
+            renumbered++;
+          }
+          last = seq;
+          put.run(fileId, seq, typeof e.ts === 'string' ? e.ts : new Date(0).toISOString(), e.op ? 1 : 0, e.checkpoint ? 1 : 0, stored(e));
+          imported++;
+        }
+      }
+      d.exec('COMMIT');
+    } catch (err) {
+      d.exec('ROLLBACK');
+      console.error(`history: could not import ${name}: ${(err as Error).message} — left as it is`);
+      continue;
+    }
+    try {
+      renameSync(path, `${path}.migrated`);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') console.error(`history: imported ${name} but could not rename it: ${(err as Error).message}`);
+    }
+    if (imported || renumbered || skipped) console.log(`history: imported ${imported} entr${imported === 1 ? 'y' : 'ies'} of ${fileId}${renumbered ? `, ${renumbered} renumbered (numbers used twice by an earlier version)` : ''}${skipped ? `, ${skipped} unreadable line${skipped === 1 ? '' : 's'} skipped` : ''}`);
+  }
+}
+
+/** Close the log (tests; a clean shutdown). */
+export function closeHistory() {
+  conn?.close();
+  conn = null;
+  q = null;
+}
+
 /** Highest seq in the log (0 when empty). */
 export function currentSeq(fileId: string): number {
   if (!safeId(fileId)) return 0;
-  const cached = seqCache.get(fileId);
-  if (cached !== undefined) return cached;
-  let seq = 0;
-  const p = logPath(fileId);
-  if (existsSync(p)) {
-    // read the tail of the file to find the last line
-    const st = statSync(p);
-    const size = st.size;
-    const chunk = Math.min(size, 65536);
-    const fd = readFileSync(p); // documents' logs are small enough to read; optimise later if needed
-    const tail = fd.subarray(size - chunk).toString('utf8');
-    const lines = tail.trim().split('\n');
-    for (let i = lines.length - 1; i >= 0; i--) {
-      try {
-        const e = JSON.parse(lines[i]);
-        if (typeof e.seq === 'number') {
-          seq = e.seq;
-          break;
-        }
-      } catch {
-        /* partial line */
-      }
-    }
-  }
-  seqCache.set(fileId, seq);
-  return seq;
+  return Number((db().head.get(fileId) as { seq: number | bigint }).seq);
 }
 
 /** Append an entry; returns the assigned seq. */
@@ -144,11 +243,10 @@ export function onAppend(fn: (fileId: string, entry: LogEntry) => void): () => v
 
 export function appendEntry(fileId: string, entry: Omit<LogEntry, 'seq' | 'ts'>): number {
   if (!safeId(fileId)) throw new Error('bad file id');
-  ensureHistoryDir();
-  const seq = currentSeq(fileId) + 1;
-  const full: LogEntry = { seq, ts: new Date().toISOString(), ...entry };
-  appendFileSync(logPath(fileId), JSON.stringify(full) + '\n');
-  seqCache.set(fileId, seq);
+  const ts = new Date().toISOString();
+  const row = db().insert.get(fileId, fileId, ts, entry.op ? 1 : 0, entry.checkpoint ? 1 : 0, stored(entry)) as { seq: number | bigint };
+  const seq = Number(row.seq);
+  const full: LogEntry = { seq, ts, ...entry };
   for (const fn of appendListeners) {
     try {
       fn(fileId, full);
@@ -161,30 +259,25 @@ export function appendEntry(fileId: string, entry: Omit<LogEntry, 'seq' | 'ts'>)
 
 /** Entries with seq > since (ascending), capped. */
 export function entriesSince(fileId: string, since: number, limit = 5000): LogEntry[] {
-  return readAll(fileId).filter((e) => e.seq > since).slice(0, limit);
+  if (!safeId(fileId)) return [];
+  return (db().since.all(fileId, since, limit) as Row[]).map(toEntry);
+}
+
+/** How many entries that change the content (ops, checkpoints) come after `since` — runs and notes do not count. */
+export function contentChangesSince(fileId: string, since: number): number {
+  if (!safeId(fileId)) return 0;
+  return Number((db().changes.get(fileId, since) as { n: number | bigint }).n);
 }
 
 /** Most recent entries (descending), optionally before a seq. */
 export function recentEntries(fileId: string, limit = 200, before?: number): LogEntry[] {
-  const all = readAll(fileId);
-  const filtered = before ? all.filter((e) => e.seq < before) : all;
-  return filtered.slice(-limit).reverse();
+  if (!safeId(fileId)) return [];
+  return (db().recent.all(fileId, before ? before : Number.MAX_SAFE_INTEGER, limit) as Row[]).map(toEntry);
 }
 
 export function readAll(fileId: string): LogEntry[] {
   if (!safeId(fileId)) return [];
-  const p = logPath(fileId);
-  if (!existsSync(p)) return [];
-  const out: LogEntry[] = [];
-  for (const line of readFileSync(p, 'utf8').split('\n')) {
-    if (!line.trim()) continue;
-    try {
-      out.push(JSON.parse(line));
-    } catch {
-      /* skip corrupt line */
-    }
-  }
-  return out;
+  return (db().all.all(fileId) as Row[]).map(toEntry);
 }
 
 /** Write a checkpoint of the document as of `seq` (idempotent per seq). */
@@ -352,7 +445,7 @@ export function replayBundle(fileId: string, seq: number): { checkpointSeq: numb
   const seqs = checkpointSeqs(fileId).filter((s) => s <= seq);
   const cp = seqs.length ? seqs[seqs.length - 1] : 0;
   const json = cp ? readFileSync(join(cpDir(fileId), `${cp}.json`), 'utf8') : null;
-  const ops = readAll(fileId).filter((e) => e.seq > cp && e.seq <= seq && e.op);
+  const ops = safeId(fileId) ? (db().ops.all(fileId, cp, seq) as Row[]).map(toEntry) : [];
   if (!json && cp === 0 && !checkpointSeqs(fileId).length && ops.length === 0) return null;
   return { checkpointSeq: cp, json, ops };
 }
@@ -401,12 +494,7 @@ export function opTouchesCell(op: Record<string, unknown>, table: number, row: n
 
 export function deleteHistory(fileId: string) {
   if (!safeId(fileId)) return;
-  try {
-    unlinkSync(logPath(fileId));
-  } catch {
-    /* none */
-  }
-  seqCache.delete(fileId);
+  db().del.run(fileId);
   const dir = cpDir(fileId);
   if (existsSync(dir)) {
     for (const f of readdirSync(dir)) {

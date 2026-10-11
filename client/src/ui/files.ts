@@ -1,7 +1,7 @@
 // File operations shared by the top bar and the files panel.
 
 import { api } from '../api/client';
-import { getClientId, joinFile } from '../api/ws';
+import { catchUp, getClientId, joinFile } from '../api/ws';
 import * as book from '../engine/book';
 import { getState, setStatus, useStore } from '../state/store';
 import { adoptUnsaved } from './chat';
@@ -18,7 +18,16 @@ export async function saveCurrentFile(): Promise<void> {
       const info = await api.files.checkpoint(st.fileId, getClientId());
       if (info.seq > getState().seq) useStore.setState({ seq: info.seq });
     } else if (st.fileId) {
-      const info = await api.files.save(st.fileId, st.fileName, json, getClientId(), st.seq);
+      let info: { seq: number };
+      try {
+        info = await api.files.save(st.fileId, st.fileName, json, getClientId(), st.seq);
+      } catch (e) {
+        const stale = e as { stale?: boolean; seq?: number };
+        if (!stale.stale || typeof stale.seq !== 'number') throw e;
+        // changes were logged since this copy (another editor, an import, an accepted proposal): catch up, save that
+        await catchUp(stale.seq);
+        info = await api.files.save(st.fileId, st.fileName, book.toJson(), getClientId(), getState().seq);
+      }
       if (info.seq > getState().seq) useStore.setState({ seq: info.seq });
     } else {
       const info = await api.files.create(st.fileName, json, getClientId(), st.fileFolder);

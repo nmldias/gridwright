@@ -126,6 +126,30 @@ export function openDocument(fileId: string): { book: BookApi; name: string; jso
   return { book, name: f.name, json, seq };
 }
 
+/**
+ * Why `json` is not a workbook (null when it is). Cheap by default: a JSON object whose tables are a
+ * list. `full` also loads it in the engine (an explicit save; too slow for every undo).
+ */
+export function workbookProblem(json: string, full = false): string | null {
+  let v: unknown;
+  try {
+    v = JSON.parse(json);
+  } catch (e) {
+    return `not JSON: ${errorMessage(e)}`;
+  }
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return 'not a workbook (an object is expected)';
+  const tables = (v as { tables?: unknown }).tables;
+  if (tables !== undefined && !Array.isArray(tables)) return 'not a workbook (tables must be a list)';
+  if (full && engineAvailable()) {
+    try {
+      engine().Book.from_json(json).free();
+    } catch (e) {
+      return `the engine cannot load it: ${errorMessage(e)}`;
+    }
+  }
+  return null;
+}
+
 export function colLetters(col: number): string {
   let s = '';
   let c = col;

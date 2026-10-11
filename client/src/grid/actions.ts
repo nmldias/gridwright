@@ -243,7 +243,7 @@ export function commitEdit(text: string, move: { dr: number; dc: number } | null
       }
     }
     useStore.setState({ editing: null });
-    book.apply({ type: 'set_cell', table: ed.table, row: ed.r, col: ed.c, input: text });
+    book.apply({ type: 'set_cell', table: ed.table, row: ed.r, col: ed.c, input: text }, { trustCode: true });
   } else {
     useStore.setState({ editing: null });
   }
@@ -310,7 +310,7 @@ export function makeAgentCell() {
     return;
   }
   const keep = cell?.k === 'python' && cell.i.trim() && !cell.i.startsWith('# Python cell');
-  book.apply({ type: 'set_cell', table: sel.table, row: sel.ar, col: sel.ac, input: keep ? cell!.i : AGENT_TEMPLATE, kind: 'python', runtime: 'agent' });
+  book.apply({ type: 'set_cell', table: sel.table, row: sel.ar, col: sel.ac, input: keep ? cell!.i : AGENT_TEMPLATE, kind: 'python', runtime: 'agent' }, { trustCode: !keep });
   openCodeCell(sel.table, sel.ar, sel.ac);
 }
 
@@ -338,7 +338,7 @@ export function makeCodeCell(kind: CellKind, conn?: string) {
     // new Python cells run on the server when the host offers it (faster, real CPython); existing cells keep their choice
     const sp = getState().serverPython;
     const runtime = kind === 'python' && sp && sp.can?.run !== false ? 'server' : undefined;
-    book.apply({ type: 'set_cell', table: sel.table, row: sel.ar, col: sel.ac, input: template, kind, conn: kind === 'sql' ? (conn ?? null) : undefined, runtime });
+    book.apply({ type: 'set_cell', table: sel.table, row: sel.ar, col: sel.ac, input: template, kind, conn: kind === 'sql' ? (conn ?? null) : undefined, runtime }, { trustCode: true });
   }
   openCodeCell(sel.table, sel.ar, sel.ac);
 }

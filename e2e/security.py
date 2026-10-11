@@ -511,7 +511,8 @@ json.dumps(out)"""
 
         with sync_playwright() as p:
             br = p.chromium.launch(args=["--no-sandbox"])
-            # Eve (editor) writes the cells in her browser: they run for her, in the sandbox
+            # Eve (editor) writes the cells in her browser: they run for her, in the sandbox (typed code is
+            # trusted for its author — trustCode, as the code panel and formula bar pass it)
             ec = br.new_context()
             ec.add_cookies(session_of(eve))
             pe = ec.new_page()
@@ -522,8 +523,8 @@ json.dumps(out)"""
               const t = Array.from(window.__gw.getState().tables.keys())[0];
               b.apply({type: 'set_cell', table: t, row: 0, col: 0, input: '2'});
               b.apply({type: 'set_cell', table: t, row: 1, col: 0, input: '40'});
-              b.apply({type: 'set_cell', table: t, row: 0, col: 1, input: js, kind: 'javascript', refresh: 3});
-              b.apply({type: 'set_cell', table: t, row: 1, col: 1, input: py, kind: 'python'}); }""", [EXPLOIT, PYCODE])
+              b.apply({type: 'set_cell', table: t, row: 0, col: 1, input: js, kind: 'javascript', refresh: 3}, {trustCode: true});
+              b.apply({type: 'set_cell', table: t, row: 1, col: 1, input: py, kind: 'python'}, {trustCode: true}); }""", [EXPLOIT, PYCODE])
             v = wait_value(pe, 1, "origin:", 60)
             ok(v and "sum=42" in v, f"a JavaScript cell still computes, in the sandbox ({v})")
             ok(v and "members:blocked" in v and "files:blocked" in v and "origin:null" in v and "document:undefined" in v, "…but cannot call the API, has an opaque origin and no page (H1)")

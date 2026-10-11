@@ -4,7 +4,8 @@ import { App } from './App';
 import { AuthGate } from './ui/AuthGate';
 import './styles.css';
 import { applyThemeCss } from './theme';
-import { statusOf } from './workers/runs';
+import { lastRecord, statusOf } from './workers/runs';
+import { isTrusted } from './workers/trust';
 import { getState } from './state/store';
 import { getRenderer, selectCell } from './grid/actions';
 import { displayOf } from './grid/format';
@@ -30,6 +31,9 @@ applyThemeCss();
   applyTemplate,
   transformOp,
   diffDocuments,
+  /** the last run record of a cell, and whether a code cell would run without review (tests) */
+  lastRecord,
+  isTrusted,
   /** numeric cells of a table whose display text does not fit their column (tests) */
   overflows: (table: number) => {
     const st = getState();

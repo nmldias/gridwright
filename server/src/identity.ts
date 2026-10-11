@@ -38,7 +38,17 @@ const ADMINS = (process.env.GRIDWRIGHT_ADMINS ?? '').split(',').map((s) => s.tri
 const READONLY = (process.env.GRIDWRIGHT_READONLY ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 
 const agentTokens = new Map<string, { identity: Identity; expires: number }>();
-const isLoopback = (addr?: string) => !!addr && (addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1');
+export const isLoopback = (addr?: string) => !!addr && (addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1');
+/** GRIDWRIGHT_TRUST_TAILSCALE: identity headers are believed — from the local proxy only (see headersTrusted). */
+export const trustTailscale = TRUST;
+/**
+ * Tailscale's identity headers are believed only on a connection from this machine's loopback
+ * interface, which is where `tailscale serve` connects from. Anyone who reaches the listener
+ * directly could write the same headers, so a request from anywhere else is not identified by them.
+ */
+export function headersTrusted(req: IncomingMessage): boolean {
+  return TRUST && !onAgentChannel(req) && isLoopback(req.socket?.remoteAddress);
+}
 
 /**
  * The agent channel: a Unix socket the server listens on and binds into a sandbox (an agent cell).
@@ -95,15 +105,20 @@ function resolveIdentity(req: IncomingMessage): Identity {
   };
   if (ACCOUNTS) {
     // a login the proxy vouches for still needs an account here; the role comes from the membership
-    const a = resolveAccount(req, TRUST ? h('tailscale-user-login').trim() : undefined);
+    const a = resolveAccount(req, headersTrusted(req) ? h('tailscale-user-login').trim() : undefined);
     if (!a) return { login: '', name: '', role: 'viewer' };
     return { login: a.login, name: a.name, role: a.role, tenant: a.tenant, tenantName: a.tenantName, tenantSlug: a.tenantSlug, platformAdmin: a.platformAdmin, mustChangePassword: a.mustChangePassword, denied: a.denied };
   }
+  // Tailscale mode, but the request did not come through the local proxy: it is nobody, and may only look
+  if (TRUST && !headersTrusted(req)) return { login: '', name: '', role: 'viewer' };
   let login = '';
   let name = '';
   if (TRUST) {
     login = h('tailscale-user-login').trim();
     name = h('tailscale-user-name').trim() || login.split('@')[0];
+    // through the proxy, but nobody vouched for: tailscale serve sends no identity for tagged devices
+    // (or a local process that skipped the headers) — such a request is nobody, never an administrator
+    if (!login) return { login: '', name: '', role: 'viewer' };
   }
   const l = login.toLowerCase();
   let role: Identity['role'] = 'editor';

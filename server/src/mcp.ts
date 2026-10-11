@@ -15,7 +15,7 @@ import { createProposal, listProposals, type Action } from './proposals.js';
 import { addRecord, addWatch, affectedBy, brief as companionBrief, contextForModel, graphOf, openIssues } from './companion.js';
 import { RecordInputSchema, WatchDefSchema } from './contracts.js';
 import { runQuery } from './sql.js';
-import { authorizeQuery, canSeeConnection, isReadOnlySql } from './sqlpolicy.js';
+import { authorizeQuery, canSeeConnection, dialectOf, isReadOnlySql } from './sqlpolicy.js';
 import { listConnections, listFiles, readFile } from './storage.js';
 import { createRequire } from 'node:module';
 
@@ -314,10 +314,11 @@ export function buildServer(who: Identity): McpServer {
       try {
         const c = listConnections().find((x) => x.id === connection && canSeeConnection(x, who));
         if (!c) return fail('connection not found');
-        const check = isReadOnlySql(sql);
+        // MCP never writes, whatever the connection allows (the policy and the database both enforce it)
+        const check = isReadOnlySql(sql, dialectOf(c));
         if (!check.ok) return fail(check.reason ?? 'not allowed');
         authorizeQuery(c, who, sql);
-        const r = await runQuery(c, sql, MAX_TOOL_ROWS, params ?? []);
+        const r = await runQuery(c, sql, MAX_TOOL_ROWS, params ?? [], { forceReadOnly: true });
         return text({ columns: r.columns, rows: r.rows, rowCount: r.rowCount, truncated: r.truncated, ms: r.ms });
       } catch (e) {
         return fail(errorMessage(e));

@@ -7,6 +7,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { canEdit, canSign, canView, permissionFor, readAccess, SIGN_OPS, type Permission } from './access.js';
 import { appendEntry, currentSeq, entriesSince, sanitiseRun, writeCheckpoint, type Author, type LogEntry } from './history.js';
 import { identityOf, type Identity } from './identity.js';
+import { workbookProblem } from './headless.js';
 import { readFile } from './storage.js';
 import { ACCOUNTS } from './tenancy.js';
 
@@ -119,6 +120,11 @@ export function attachMultiplayer(wss: WebSocketServer) {
         case 'snapshot': {
           // undo/redo (or a bulk change) replaced the whole document: checkpoint + broadcast
           if (!canEdit(perm()) || typeof msg.json !== 'string') return;
+          const problem = workbookProblem(msg.json);
+          if (problem) {
+            send(peer, JSON.stringify({ type: 'rejected', cid: msg.cid, reason: `snapshot refused: ${problem}` }));
+            return;
+          }
           const seq = appendEntry(file, { author: author(), origin: typeof msg.origin === 'string' ? msg.origin.slice(0, 16) : 'user', checkpoint: true, note: typeof msg.note === 'string' ? msg.note.slice(0, 200) : 'snapshot' });
           writeCheckpoint(file, seq, msg.json);
           const relay = JSON.stringify({ type: 'snapshot', seq, client, json: msg.json });
@@ -127,8 +133,16 @@ export function attachMultiplayer(wss: WebSocketServer) {
           break;
         }
         case 'run': {
-          // a code-cell execution record (hashes + runtime) reported by a browser runtime: audit evidence, not an op
-          if (!canView(perm())) return;
+          // a code-cell execution record (hashes + runtime) reported by a browser runtime: audit evidence, not an op.
+          // It goes into the document's log, so it takes what changing the document takes, and a budget per session.
+          if (!canEdit(perm())) {
+            send(peer, JSON.stringify({ type: 'run_rejected', reason: 'read-only access: runs are recorded for editors' }));
+            return;
+          }
+          if (!takeRunBudget(peer)) {
+            send(peer, JSON.stringify({ type: 'run_rejected', reason: `too many run records (at most ${RUN_BURST} at once, ${RUN_PER_MINUTE} a minute)` }));
+            return;
+          }
           const run = sanitiseRun(msg.run);
           if (!run) return;
           run.attested = 'client';
@@ -154,6 +168,24 @@ export function attachMultiplayer(wss: WebSocketServer) {
 }
 
 /** Access to a document changed: downgrade or disconnect the sessions it affects, at once. */
+/** Run records a session may add: a burst, refilled per minute (a cell re-run in a loop must not flood the log). */
+const RUN_BURST = 120;
+const RUN_PER_MINUTE = 60;
+const runBudget = new WeakMap<object, { tokens: number; at: number }>();
+function takeRunBudget(peer: object): boolean {
+  const now = Date.now();
+  const b = runBudget.get(peer) ?? { tokens: RUN_BURST, at: now };
+  b.tokens = Math.min(RUN_BURST, b.tokens + ((now - b.at) / 60_000) * RUN_PER_MINUTE);
+  b.at = now;
+  if (b.tokens < 1) {
+    runBudget.set(peer, b);
+    return false;
+  }
+  b.tokens -= 1;
+  runBudget.set(peer, b);
+  return true;
+}
+
 export function accessChanged(file: string) {
   const room = rooms.get(file);
   if (!room) return;

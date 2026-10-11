@@ -260,7 +260,7 @@ function treasury() {
     book.apply({ type: 'set_header_rows', table: c, header_rows: 0 });
     book.apply({ type: 'set_format', table: c, r0: 0, c0: 0, r1: 0, c1: 0, format: { bold: true } });
     book.apply({ type: 'set_col_width', table: c, col: 0, width: 260 });
-    book.apply({ type: 'set_cell', table: c, row: 4, col: 0, input: checks[4][0], kind: 'sql' }, { silent: true });
+    book.apply({ type: 'set_cell', table: c, row: 4, col: 0, input: checks[4][0], kind: 'sql' }, { silent: true, trustCode: true });
   }
 }
 

@@ -114,8 +114,13 @@ export function toJson(): string {
   return getBook().to_json();
 }
 
-/** Apply an op locally (and notify listeners, e.g. the multiplayer link). */
-export function apply(op: Op, opts: { remote?: boolean; silent?: boolean; origin?: Origin; note?: string } = {}): Changes {
+/**
+ * Apply an op locally (and notify listeners, e.g. the multiplayer link). `trustCode`: the op is code
+ * this person typed here (cell editor, formula bar, code and SQL panels, a code cell they inserted) —
+ * only then does it become theirs and run without review. Pastes, fills, imports and anything the AI
+ * or an agent wrote never grant trust: such code runs only if this exact code is already trusted.
+ */
+export function apply(op: Op, opts: { remote?: boolean; silent?: boolean; origin?: Origin; note?: string; trustCode?: boolean } = {}): Changes {
   const b = getBook();
   if (!opts.remote && readOnly() && op.type !== 'code_result' && !(useStore.getState().permission === 'sign' && SIGN_OPS.has(op.type))) {
     const msg = useStore.getState().permission === 'sign' ? 'You may sign off on this document but not edit it' : 'This document is read-only for you';
@@ -129,7 +134,7 @@ export function apply(op: Op, opts: { remote?: boolean; silent?: boolean; origin
   }
   applyChanges(changes);
   if (!opts.remote) {
-    trustTypedCode(op);
+    if (opts.trustCode && (opts.origin ?? 'user') === 'user') trustTypedCode(op);
     useStore.setState({ dirty: true });
     const meta: ApplyMeta = { origin: opts.origin ?? 'user', note: opts.note };
     opListeners.forEach((l) => l(op, changes, meta));
@@ -137,7 +142,7 @@ export function apply(op: Op, opts: { remote?: boolean; silent?: boolean; origin
   return changes;
 }
 
-/** Code this person just wrote (typed, pasted, inserted) in this browser is theirs: it may run. */
+/** Code this person just typed or inserted in this browser is theirs: it may run. */
 function trustTypedCode(op: Op) {
   const cells: CellView[] = [];
   if (op.type === 'set_cell') {

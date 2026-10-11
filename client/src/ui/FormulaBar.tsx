@@ -29,7 +29,7 @@ export function FormulaBar() {
     if (!selection || !ref.current) return;
     const text = ref.current.value;
     const prev = cell?.i ?? '';
-    if (text !== prev && !cell?.s) book.apply({ type: 'set_cell', table: selection.table, row: selection.ar, col: selection.ac, input: text });
+    if (text !== prev && !cell?.s) book.apply({ type: 'set_cell', table: selection.table, row: selection.ar, col: selection.ac, input: text }, { trustCode: true });
     useStore.setState({ editing: null, editorText: text });
     selectCell(selection.table, selection.ar + 1, selection.ac);
   };

@@ -6,8 +6,8 @@
 import type { Express } from 'express';
 import { canManage, canView, deleteAccess, normalise, permissionFor, readAccess, tenantOf, writeAccess, type FileAccess } from '../access.js';
 import { brief as companionBrief, deleteCompanion, recordRejection } from '../companion.js';
-import { errorMessage, openDocument } from '../headless.js';
-import { appendEntry, checkpointSeqs, compactCheckpoints, currentSeq, deleteHistory, historyCsv, opTouchesCell, readAll, recentEntries, replayBundle, writeCheckpoint } from '../history.js';
+import { errorMessage, openDocument, workbookProblem } from '../headless.js';
+import { appendEntry, checkpointSeqs, compactCheckpoints, contentChangesSince, currentSeq, deleteHistory, historyCsv, opTouchesCell, readAll, recentEntries, replayBundle, writeCheckpoint } from '../history.js';
 import { identityEnabled, identityOf } from '../identity.js';
 import { deleteIntake } from '../intake.js';
 import { accessChanged, broadcastEntries, notifyCompanion, notifyProposal as notifyProposalRoom, notifySaved } from '../multiplayer.js';
@@ -84,18 +84,24 @@ export function registerDocumentRoutes(app: Express, ctx: { defaultSharing: 'edi
       if (!p) return;
       const { name, json, client, seq } = req.body ?? {};
       if (typeof json !== 'string') return res.status(400).json({ error: 'json (string) required' });
-      const meta = writeFile(req.params.id, String(name || 'Untitled').slice(0, 120), json);
-      // checkpoint the saved state at the log position the client had applied (falls back to the current seq)
-      const at = Number.isFinite(Number(seq)) && Number(seq) > 0 ? Number(seq) : currentSeq(req.params.id);
-      if (!checkpointSeqs(req.params.id).includes(at)) {
-        if (at === 0) {
-          const id = identityOf(req);
-          const s = appendEntry(req.params.id, { author: { id: typeof client === 'string' ? client : 'api', name: id.name || 'Guest', login: id.login || undefined }, origin: 'user', checkpoint: true, note: 'saved' });
-          writeCheckpoint(req.params.id, s, json);
-        } else {
-          writeCheckpoint(req.params.id, at, json);
-        }
+      // A save is the state at the head of the log, nowhere else: a checkpoint at an older position would
+      // be replayed as that moment's state. So the copy must hold every change in the log — nothing that
+      // changes content (an op or a checkpoint) may be logged after the position it says it has applied,
+      // and it may not claim a position the log never reached. A copy that is behind is refused; its own
+      // edits are in the log already (every change is logged as it is made).
+      const cur = currentSeq(req.params.id);
+      const given = seq === undefined || seq === null || seq === '' ? cur : Number(seq);
+      const behind = Number.isInteger(given) && given >= 0 && given <= cur ? contentChangesSince(req.params.id, given) : -1;
+      if (behind !== 0) {
+        return res.status(409).json({ error: behind < 0 ? `this copy claims change ${given}, but the document's log is at ${cur}` : `${behind} change${behind === 1 ? ' was' : 's were'} made since this copy (at ${given}; the document is at ${cur}): reload to catch up, then save — your edits are already in the log`, seq: cur, stale: true });
       }
+      const problem = workbookProblem(json, true);
+      if (problem) return res.status(400).json({ error: `not saved: ${problem}` });
+      const meta = writeFile(req.params.id, String(name || 'Untitled').slice(0, 120), json);
+      // the save is a logged, attributed event of its own, with the checkpoint at its position
+      const id = identityOf(req);
+      const s = appendEntry(req.params.id, { author: { id: typeof client === 'string' ? client : 'api', name: id.name || 'Guest', login: id.login || undefined }, origin: 'user', checkpoint: true, note: 'saved' });
+      writeCheckpoint(req.params.id, s, json);
       notifySaved(req.params.id, typeof client === 'string' ? client : undefined);
       res.json({ ...meta, seq: currentSeq(req.params.id) });
     } catch (e) {

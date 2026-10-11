@@ -275,6 +275,42 @@ if [ "$ACCOUNTS" = 1 ]; then
   GW_TOKEN=""
 fi
 
+# --- secrets: a file only root (system service) or you (user service) can read -------------------
+# Any local user can read a unit's Environment= lines (systemctl show / cat), so the shared token and the
+# AI key go in an EnvironmentFile instead. A re-run keeps what is there unless you pass new values.
+if [ -n "$SYSUSER" ]; then SECRETS_FILE="/etc/gridwright/$SVC.env"; else SECRETS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/gridwright/$SVC.env"; fi
+read_secret() { # $1 = name; prints the value stored by an earlier run (empty when none)
+  local line
+  if [ -n "$SYSUSER" ]; then line="$(sudo cat "$SECRETS_FILE" 2>/dev/null | grep -m1 "^$1=" || true)"; else line="$(grep -m1 "^$1=" "$SECRETS_FILE" 2>/dev/null || true)"; fi
+  line="${line#*=}"; line="${line#\"}"; line="${line%\"}"
+  printf '%s' "$line" | sed -e 's/\\"/"/g' -e 's/\\\\/\\/g'
+}
+if [ "$ACCOUNTS" != 1 ] && [ "$TAILSCALE" != 1 ] && [ -z "${GW_TOKEN:-}" ]; then
+  # neither accounts nor Tailscale tell people apart: without a token anyone who reaches the server
+  # (directly, or through Caddy with --https) would be its administrator
+  GW_TOKEN="$(read_secret GRIDWRIGHT_TOKEN)"
+  if [ -z "$GW_TOKEN" ]; then
+    GW_TOKEN="$("$NODE_BIN" -e 'process.stdout.write(require("crypto").randomBytes(24).toString("base64url"))')"
+    say "no sign-in mode chosen (--accounts or --tailscale): generated a shared access token, kept in $SECRETS_FILE"
+  fi
+fi
+[ -n "${AI_API_KEY:-}" ] || AI_API_KEY="$(read_secret AI_API_KEY)"
+secrets_text() {
+  esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+  printf '# Gridwright secrets, written by scripts/install.sh (re-runs keep them). Read by systemd only.\n'
+  printf 'GRIDWRIGHT_TOKEN="%s"\n' "$(esc "${GW_TOKEN:-}")"
+  printf 'AI_API_KEY="%s"\n' "$(esc "${AI_API_KEY:-}")"
+}
+if [ -n "$SYSUSER" ]; then
+  sudo install -d -o root -g root -m 700 "$(dirname "$SECRETS_FILE")"
+  (umask 077; secrets_text | sudo tee "$SECRETS_FILE" >/dev/null)
+  sudo chown root:root "$SECRETS_FILE" && sudo chmod 600 "$SECRETS_FILE"
+else
+  mkdir -p "$(dirname "$SECRETS_FILE")" && chmod 700 "$(dirname "$SECRETS_FILE")"
+  (umask 077; secrets_text > "$SECRETS_FILE")
+  chmod 600 "$SECRETS_FILE"
+fi
+
 # --- Python for server-side cells -----------------------------------------------------------
 if [ "$PYVENV" = 1 ]; then
   command -v python3 >/dev/null 2>&1 || die "--python needs python3 on this host (sudo apt install python3 python3-venv)"
@@ -339,7 +375,6 @@ Environment=PORT=$PORT
 Environment=HOST=$HOST_BIND
 Environment=GRIDWRIGHT_DATA=$DATA
 Environment=CLIENT_DIR=$RUN_ROOT/client/dist
-Environment=GRIDWRIGHT_TOKEN=${GW_TOKEN:-}
 Environment=GRIDWRIGHT_AUTH=$GW_AUTH
 Environment=GRIDWRIGHT_ADMIN_EMAIL=${GW_ADMIN_EMAIL:-}
 Environment=GRIDWRIGHT_TRUST_TAILSCALE=$TRUST
@@ -357,18 +392,19 @@ Environment=GRIDWRIGHT_INBOX=${GW_INBOX:-}
 Environment=GRIDWRIGHT_INTAKE_MAX_MB=${GW_INTAKE_MAX_MB:-}
 Environment=AI_BASE_URL=${AI_BASE_URL:-}
 Environment=AI_MODEL=${AI_MODEL:-}
-Environment=AI_API_KEY=${AI_API_KEY:-}
+EnvironmentFile=$SECRETS_FILE
 EOF
 }
 
 start_nohup() {
   pkill -f "$ROOT/server/dist/index.js" 2>/dev/null || true
-  (cd server && PORT="$PORT" HOST="$HOST_BIND" GRIDWRIGHT_DATA="$DATA" CLIENT_DIR="$ROOT/client/dist" \
+  # exported in the subshell: on the server's environment, not on a command line (other users can read argv)
+  (cd server && umask 077 && export PORT="$PORT" HOST="$HOST_BIND" GRIDWRIGHT_DATA="$DATA" CLIENT_DIR="$ROOT/client/dist" \
     GRIDWRIGHT_TOKEN="${GW_TOKEN:-}" GRIDWRIGHT_AUTH="$GW_AUTH" GRIDWRIGHT_ADMIN_EMAIL="${GW_ADMIN_EMAIL:-}" GRIDWRIGHT_TRUST_TAILSCALE="$TRUST" GRIDWRIGHT_TRUST_PROXY="${TRUST_PROXY:-${GW_TRUST_PROXY:-}}" GRIDWRIGHT_ADMINS="${GW_ADMINS:-}" GRIDWRIGHT_READONLY="${GW_READONLY:-}" GRIDWRIGHT_DEFAULT_SHARING="${GW_DEFAULT_SHARING:-}" \
     GRIDWRIGHT_PYTHON="${GW_PYTHON:-}" GRIDWRIGHT_PYTHON_SANDBOX="${GW_PYTHON_SANDBOX:-}" GRIDWRIGHT_PYTHON_TIMEOUT_MS="${GW_PYTHON_TIMEOUT_MS:-}" GRIDWRIGHT_PYTHON_MEMORY_MB="${GW_PYTHON_MEMORY_MB:-}" GRIDWRIGHT_PYTHON_CONCURRENCY="${GW_PYTHON_CONCURRENCY:-}" GRIDWRIGHT_PYTHON_THREADS="${GW_PYTHON_THREADS:-}" \
-    GRIDWRIGHT_INBOX="${GW_INBOX:-}" GRIDWRIGHT_INTAKE_MAX_MB="${GW_INTAKE_MAX_MB:-}" \
+    GRIDWRIGHT_INBOX="${GW_INBOX:-}" GRIDWRIGHT_INTAKE_MAX_MB="${GW_INTAKE_MAX_MB:-}" NODE_ENV=production \
     AI_BASE_URL="${AI_BASE_URL:-}" AI_MODEL="${AI_MODEL:-}" AI_API_KEY="${AI_API_KEY:-}" \
-    umask 077 && setsid -f nohup "$NODE_BIN" "$ROOT/server/dist/index.js" > "$DATA/server.log" 2>&1 < /dev/null)
+    && setsid -f nohup "$NODE_BIN" "$ROOT/server/dist/index.js" > "$DATA/server.log" 2>&1 < /dev/null)
   say "started with nohup (no systemd user session); log: $DATA/server.log"
 }
 
@@ -434,6 +470,7 @@ elif command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >
     unit_env
     printf 'UMask=0077\nExecStart=%s %s/server/dist/index.js\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n' "$NODE_BIN" "$ROOT"
   } > "$unit_dir/gridwright.service"
+  chmod 600 "$unit_dir/gridwright.service"
   systemctl --user daemon-reload
   systemctl --user enable gridwright.service >/dev/null 2>&1
   systemctl --user restart gridwright.service
@@ -465,10 +502,10 @@ set -euo pipefail
 umask 077
 stamp="\$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BACKUP_DIR"
-tar -czf "$BACKUP_DIR/gridwright-\$stamp.tar.gz" -C "$DATA" --exclude=./pyodide --exclude=./pyenv --exclude=./pycache --exclude=./server.log --exclude=./backup.sh .
+# a consistent snapshot (databases copied with VACUUM INTO), without secret.key — keep the key apart
+"$NODE_BIN" --no-warnings "$RUN_ROOT/server/dist/backup.js" "$DATA" "$BACKUP_DIR/gridwright-\$stamp.tar.gz"
 ls -1t "$BACKUP_DIR"/gridwright-*.tar.gz 2>/dev/null | tail -n +15 | xargs -r rm -f
 ${GW_BACKUP_TARGET:+rsync -a --delete "$BACKUP_DIR/" "$GW_BACKUP_TARGET" || echo "rsync to $GW_BACKUP_TARGET failed" >&2}
-echo "backup written: $BACKUP_DIR/gridwright-\$stamp.tar.gz"
 EOF
   }
   if [ -n "$SYSUSER" ]; then
@@ -481,7 +518,7 @@ EOF
   if [ "$SYSTEM_UNIT" = 1 ]; then
     {
       printf '[Unit]\nDescription=Gridwright nightly backup\n\n[Service]\nType=oneshot\nUser=%s\nGroup=%s\nUMask=0077\nExecStart=%s/backup.sh\n' "$SYSUSER" "$SYSUSER" "$DATA"
-      harden "$BACKUP_DIR"
+      harden "$BACKUP_DIR $DATA"   # $DATA: SQLite's -shm of a live database, opened read-only for the snapshot
     } | sudo tee "/etc/systemd/system/$SVC-backup.service" >/dev/null
     printf '[Unit]\nDescription=Gridwright nightly backup at 02:30\n\n[Timer]\nOnCalendar=*-*-* 02:30:00\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n' | sudo tee "/etc/systemd/system/$SVC-backup.timer" >/dev/null
     sudo systemctl daemon-reload
@@ -523,6 +560,13 @@ for i in $(seq 1 30); do
   [ "$i" -eq 30 ] && { [ -f "$DATA/server.log" ] && tail -n 30 "$DATA/server.log"; if [ "$SYSTEM_UNIT" = 1 ]; then sudo journalctl -u "$SVC" --no-pager -n 30 || true; else journalctl --user -u gridwright --no-pager -n 30 2>/dev/null || true; fi; die "server did not answer on port $PORT"; }
 done
 
+# the server that answers must be the one just configured: a server started without its environment
+# (or another Gridwright on this port) reports a different sign-in mode
+expect="none"; [ "$TRUST" = 1 ] && expect="tailscale"; [ "$ACCOUNTS" = 1 ] && expect="accounts"
+expect="$expect $([ -n "${GW_TOKEN:-}" ] && [ "$ACCOUNTS" != 1 ] && echo true || echo false)"
+got="$(curl -fsS -H "Authorization: Bearer ${GW_TOKEN:-}" "http://127.0.0.1:$PORT/api/health" 2>/dev/null | "$NODE_BIN" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const h=JSON.parse(s);process.stdout.write(h.auth+" "+(!!h.token))}catch{process.stdout.write("unreadable")}})' || true)"
+[ "$got" = "$expect" ] || die "the server on port $PORT does not run with these settings (expected sign-in \"$expect\", it reports \"$got\"): another Gridwright on this port, or it started without its environment"
+say "settings check: sign-in mode ${expect% *}, shared token ${expect#* }"
 # the runtime is probed in the background right after start (a second or two), then the GPU probe
 # imports cuDF when it is installed (can take a while on first use) — wait for both, within reason
 for i in $(seq 1 40); do
@@ -571,7 +615,7 @@ if [ "$HTTPS" = 1 ]; then
     sleep 2
     [ "$i" -eq 60 ] && echo "warning: https://$HTTPS_DOMAIN/ does not answer yet — are ports 80 and 443 open to the internet? sudo journalctl -u caddy -n 50" >&2
   done
-  say "Gridwright is up: https://$HTTPS_DOMAIN/   (HTTPS by Caddy; the server itself listens on 127.0.0.1:$PORT only)"
+  say "Gridwright is up: https://$HTTPS_DOMAIN/${GW_TOKEN:+?token=$GW_TOKEN}   (HTTPS by Caddy; the server itself listens on 127.0.0.1:$PORT only)"
 elif [ "$TAILSCALE" = 1 ]; then
   if tailscale serve --bg --https=443 "http://127.0.0.1:$PORT" >/dev/null 2>&1; then
     fqdn="$(tailscale status --json 2>/dev/null | "$NODE_BIN" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s);process.stdout.write((j.Self.DNSName||"").replace(/\.$/,""))}catch{}})')"
@@ -591,7 +635,8 @@ if [ "$ACCOUNTS" = 1 ]; then
   if as_svc test -f "$DATA/initial-admin.txt"; then say "  its temporary password is in $DATA/initial-admin.txt${SYSUSER:+ (sudo cat it)} — change it at first sign-in, then delete the file"; fi
   say "  existing documents and connections belong to the Default client; create clients in Clients & people → Clients"
 fi
-say "data: $DATA   (documents, history, connections, AI settings, secret.key — back this up)"
+say "data: $DATA   (documents, history, connections, AI settings)"
+say "server key: $DATA/secret.key — NOT in the backups: keep a copy apart (password manager, another machine); without it saved passwords and AI keys in a backup cannot be decrypted"
 if [ "$MIGRATED" = 1 ]; then
   say "the old data folder $MIGRATE_FROM is no longer used; once you have checked the new service, delete it (it still holds a copy of secret.key): rm -rf $MIGRATE_FROM"
 fi
