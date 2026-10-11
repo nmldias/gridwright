@@ -10,6 +10,8 @@
 //
 // The Rust unit tests (core/src/formula/mod.rs) check the same limits natively, plus the
 // work-day functions against a day-by-day count; this file proves them on the shipped engine.
+// The last cases check day counts against Excel's own results (DAYS360, YEARFRAC, two-digit
+// years: Microsoft's examples and reported Excel results).
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -20,6 +22,7 @@ const TIME_LIMIT_MS = 20_000;
 
 const err = (code) => (v) => v.e === code;
 const num = (n) => (v) => v.n === n;
+const near = (n) => (v) => typeof v.n === 'number' && Math.abs(v.n - n) < 5e-9;
 const nest = (k, open, close) => `${open.repeat(k)}1${close.repeat(k)}`;
 
 /** A table big enough for the cell cases; returns its id. */
@@ -175,6 +178,19 @@ const CASES = [
     // re-evaluated, as in Excel, but only a changed result is reported to the grid
     return { ms: Date.now() - t0, reported: (ch.cells?.[t] || []).length };
   }, (v) => v.reported === 1 && v.ms < 2000, ''],
+  // day counts as Excel computes them (review 11 Oct, 2.3)
+  ['DAYS360 from 29 Feb to 31 Mar is 30', '=DAYS360(DATE(2024,2,29),DATE(2024,3,31))', num(30), 'gave 32'],
+  ['DAYS360 on 28 Feb to itself is -2', '=DAYS360(DATE(2006,2,28),DATE(2006,2,28))', num(-2), 'gave 0'],
+  ['DAYS360 from 1 to 28 Feb is 27', '=DAYS360(DATE(2018,2,1),DATE(2018,2,28))', num(27), ''],
+  ['DAYS360 from 30 Jan to 1 Feb is 1', '=DAYS360(DATE(2011,1,30),DATE(2011,2,1))', num(1), ''],
+  ['YEARFRAC basis 0, Microsoft example', '=YEARFRAC(DATE(2012,1,1),DATE(2012,7,30))', near(0.58055556), ''],
+  ['YEARFRAC basis 1, Microsoft example', '=YEARFRAC(DATE(2012,1,1),DATE(2012,7,30),1)', near(0.57650273), ''],
+  ['YEARFRAC basis 1 of a whole non-leap year is 1', '=YEARFRAC(DATE(2023,1,1),DATE(2024,1,1),1)', num(1), 'gave 0.998632'],
+  ['YEARFRAC basis 1 of a whole leap year is 1', '=YEARFRAC(DATE(2024,1,1),DATE(2025,1,1),1)', num(1), 'gave 1.001368'],
+  ['YEARFRAC basis 0 from the last day of February', '=YEARFRAC(DATE(2023,2,28),DATE(2023,3,31))', near(31 / 360), 'gave 33/360'],
+  ['two-digit year 95 is 1995', '=DATEVALUE("15/06/95")', num(34865), 'gave 2095'],
+  ['two-digit year 30 is 1930', '=DATEVALUE("15/06/30")', num(11124), 'gave 2030'],
+  ['two-digit year 29 is 2029', '=DATEVALUE("15/06/29")', num(47284), ''],
 ];
 
 function runCase(engineDir, i) {

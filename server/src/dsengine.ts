@@ -113,7 +113,8 @@ export function toDate(v: unknown, dayFirst = true): string | null {
   if (m) return isoOf(+m[1], +m[2], +m[3]);
   m = /^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2}|\d{4})(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?$/.exec(s);
   if (m) {
-    const y = m[3].length === 2 ? 2000 + Number(m[3]) : Number(m[3]);
+    // two-digit years pivot as in Excel: 00-29 are 2000-2029, 30-99 are 1930-1999
+    const y = m[3].length === 2 ? Number(m[3]) + (Number(m[3]) < 30 ? 2000 : 1900) : Number(m[3]);
     return dayFirst ? isoOf(y, +m[2], +m[1]) : isoOf(y, +m[1], +m[2]);
   }
   if (/^\d{8}$/.test(s)) return isoOf(+s.slice(0, 4), +s.slice(4, 6), +s.slice(6, 8));
