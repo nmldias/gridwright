@@ -80,12 +80,18 @@ function isDatePattern(p: string): boolean {
   return /yy|dd|mmm|hh|h:|d /.test(stripped);
 }
 
-const fmtCache = new Map<string, (n: number) => string>();
+/** The open workbook writes numbers with a decimal comma ("1.234,56"): set when it loads or changes. */
+let decimalCommaDisplay = false;
+export function setDecimalCommaDisplay(on: boolean) {
+  decimalCommaDisplay = on;
+}
 
-function compileNumber(pattern: string): (n: number) => string {
+const fmtCache = new Map<string, (n: number, comma: boolean) => string>();
+
+function compileNumber(pattern: string): (n: number, comma: boolean) => string {
   const cached = fmtCache.get(pattern);
   if (cached) return cached;
-  let fn: (n: number) => string;
+  let fn: (n: number, comma: boolean) => string;
   const p = pattern.trim();
   if (p.startsWith('currency:')) {
     const code = p.slice(9).trim().toUpperCase() || 'USD';
@@ -129,7 +135,11 @@ function compileNumber(pattern: string): (n: number) => string {
     const grouped = decimalComma ? core.includes('.') : core.includes(',');
     const decSep = decimalComma ? ',' : '.';
     const grpSep = decimalComma ? '.' : ',';
-    fn = (n: number) => {
+    // In a decimal-comma workbook every pattern shows "1.234,56"; the pattern still decides
+    // the decimals and the grouping.
+    fn = (n: number, comma: boolean) => {
+      const ds = comma ? ',' : decSep;
+      const gs = comma ? '.' : grpSep;
       const x = pct ? n * 100 : n;
       const body = Math.abs(x).toFixed(decimals);
       const [intPart, frac] = body.split('.');
@@ -137,11 +147,11 @@ function compileNumber(pattern: string): (n: number) => string {
       if (grouped) {
         g = '';
         for (let i = 0; i < intPart.length; i++) {
-          if (i > 0 && (intPart.length - i) % 3 === 0) g += grpSep;
+          if (i > 0 && (intPart.length - i) % 3 === 0) g += gs;
           g += intPart[i];
         }
       }
-      const num = frac !== undefined ? `${g}${decSep}${frac}` : g;
+      const num = frac !== undefined ? `${g}${ds}${frac}` : g;
       const neg = x < 0 && /[1-9]/.test(num);
       return `${neg ? '-' : ''}${prefix}${num}${pct ? '%' : ''}${suffix}`;
     };
@@ -151,31 +161,35 @@ function compileNumber(pattern: string): (n: number) => string {
   return fn;
 }
 
-/** Format a number with a spreadsheet-style pattern. */
-export function formatNumber(n: number, pattern?: string): string {
-  if (!pattern) return formatNumberPlain(n);
-  const p = pattern.trim();
-  if (!p) return formatNumberPlain(n);
+/** Format a number with a spreadsheet-style pattern. `canonical` ignores the workbook's decimal
+ *  comma: for text a program reads back (the assistant's view of the sheet), not for people. */
+export function formatNumber(n: number, pattern?: string, canonical = false): string {
+  const comma = decimalCommaDisplay && !canonical;
+  const p = (pattern ?? '').trim();
+  if (!p) {
+    const s = formatNumberPlain(n);
+    return comma ? s.replace('.', ',') : s;
+  }
   if (isDatePattern(p)) return formatDate(n, p);
-  return compileNumber(p)(n);
+  return compileNumber(p)(n, comma);
 }
 
-export function displayValue(v: CellValue, f?: Format): string {
+export function displayValue(v: CellValue, f?: Format, canonical = false): string {
   if (v === null || v === undefined) return '';
-  if ('n' in v) return formatNumber(v.n, f?.number_format);
+  if ('n' in v) return formatNumber(v.n, f?.number_format, canonical);
   if ('s' in v) return v.s;
   if ('b' in v) return v.b ? 'TRUE' : 'FALSE';
   if ('e' in v) return v.e;
   return '';
 }
 
-export function displayOf(cell: CellView | undefined): string {
+export function displayOf(cell: CellView | undefined, canonical = false): string {
   if (!cell) return '';
   if (cell.v === null && cell.k !== 'value' && cell.i) {
     // pending/failed code cell without output
     return cell.err ? '#ERROR!' : '';
   }
-  return displayValue(cell.v, cell.f);
+  return displayValue(cell.v, cell.f, canonical);
 }
 
 export function alignOf(cell: CellView | undefined): 'left' | 'right' | 'center' {

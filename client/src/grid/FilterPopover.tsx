@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Overlay } from '../ui/overlay';
 import * as book from '../engine/book';
-import { colToLetters, type ColumnFilter } from '../engine/types';
+import { colToLetters, valueToString, type ColumnFilter } from '../engine/types';
 import { displayValue } from './format';
 import { sortTableByColumn } from './actions';
 import { cellKey } from '../engine/types';
@@ -21,6 +21,9 @@ const OPS: [NonNullable<ColumnFilter['op']>, string][] = [
   ['blank', 'is blank'],
   ['not_blank', 'is not blank'],
 ];
+/** Conditions that compare numbers: their value is typed like a cell (a decimal-comma
+ *  workbook reads "1.000" as one thousand) and stored canonically. Text conditions are literal. */
+const COMPARES = new Set<ColumnFilter['op']>(['eq', 'ne', 'gt', 'ge', 'lt', 'le']);
 
 export function FilterPopover() {
   const pop = useStore((s) => s.filterPopover);
@@ -35,19 +38,20 @@ export function FilterPopover() {
   const [op, setOp] = useState<NonNullable<ColumnFilter['op']>>('contains');
   const [val, setVal] = useState('');
 
-  // distinct values of the column (data rows only)
+  // distinct values of the column (data rows only). `key` is the value as the engine compares
+  // it (canonical, no number format) and is what a filter stores; `text` is how it looks here.
   const distinct = useMemo(() => {
-    if (!meta || !pop) return [] as { text: string; count: number }[];
+    if (!meta || !pop) return [] as { key: string; text: string; count: number }[];
     const map = cells.get(meta.id);
-    const counts = new Map<string, number>();
+    const byKey = new Map<string, { key: string; text: string; count: number }>();
     for (let r = meta.header_rows; r < meta.rows; r++) {
       const c = map?.get(cellKey(r, pop.col));
-      const text = c ? displayValue(c.v, c.f) : '';
-      counts.set(text, (counts.get(text) ?? 0) + 1);
+      const key = c ? valueToString(c.v) : '';
+      const seen = byKey.get(key);
+      if (seen) seen.count++;
+      else byKey.set(key, { key, text: c ? displayValue(c.v, c.f) : '', count: 1 });
     }
-    return Array.from(counts.entries())
-      .map(([text, count]) => ({ text, count }))
-      .sort((a, b) => a.text.localeCompare(b.text, undefined, { numeric: true }));
+    return Array.from(byKey.values()).sort((a, b) => a.text.localeCompare(b.text, undefined, { numeric: true }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [meta, pop, cellsVersion]);
 
@@ -60,7 +64,7 @@ export function FilterPopover() {
     } else if (existing?.op) {
       setMode('condition');
       setOp(existing.op);
-      setVal(existing.value ?? '');
+      setVal(existing.value ? (COMPARES.has(existing.op) ? book.editText(existing.value) : existing.value) : '');
       setChecked(null);
     } else {
       setMode('values');
@@ -81,7 +85,7 @@ export function FilterPopover() {
   };
   const others = meta.filters.filter((f) => f.col !== pop.col);
   const shown = distinct.filter((d) => !search || d.text.toLowerCase().includes(search.toLowerCase()));
-  const sel = checked ?? new Set(distinct.map((d) => d.text));
+  const sel = checked ?? new Set(distinct.map((d) => d.key));
   const left = Math.min(pop.x, window.innerWidth - 290);
   const top = Math.min(pop.y, window.innerHeight - 420);
   const stop = (e: React.KeyboardEvent) => e.stopPropagation();
@@ -116,7 +120,7 @@ export function FilterPopover() {
         <>
           <input value={search} onKeyDown={stop} placeholder="Search values…" onChange={(e) => setSearch(e.target.value)} />
           <div className="row small-row">
-            <button className="link small" onClick={() => setChecked(new Set(distinct.map((d) => d.text)))}>
+            <button className="link small" onClick={() => setChecked(new Set(distinct.map((d) => d.key)))}>
               all
             </button>
             <button className="link small" onClick={() => setChecked(new Set())}>
@@ -126,14 +130,14 @@ export function FilterPopover() {
           </div>
           <div className="filter-values">
             {shown.map((d) => (
-              <label key={d.text} className="field check">
+              <label key={d.key} className="field check">
                 <input
                   type="checkbox"
-                  checked={sel.has(d.text)}
+                  checked={sel.has(d.key)}
                   onChange={(e) => {
                     const next = new Set(sel);
-                    if (e.target.checked) next.add(d.text);
-                    else next.delete(d.text);
+                    if (e.target.checked) next.add(d.key);
+                    else next.delete(d.key);
                     setChecked(next);
                   }}
                 />
@@ -160,7 +164,7 @@ export function FilterPopover() {
           </select>
           {op !== 'blank' && op !== 'not_blank' && <input value={val} onKeyDown={stop} placeholder="value" onChange={(e) => setVal(e.target.value)} />}
           <div className="row">
-            <button className="primary" onClick={() => apply([...others, { col: pop.col, op, value: val }])}>
+            <button className="primary" onClick={() => apply([...others, { col: pop.col, op, value: COMPARES.has(op) ? book.normalizeTyped(val) : val }])}>
               Apply
             </button>
             <button onClick={() => apply(others)}>Clear</button>

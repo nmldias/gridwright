@@ -35,6 +35,12 @@ thread_local! {
     static WORK_EXHAUSTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Evaluations in progress on this thread: only the outermost one starts a fresh budget.
     static EVAL_NESTING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The evaluated workbook writes numbers with a decimal comma ("1.234,56").
+    static DECIMAL_COMMA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Text that a formula turns into a number, read as the workbook writes numbers.
+pub fn text_number(s: &str) -> Option<f64> {
+    crate::model::parse_number_literal_in(s, DECIMAL_COMMA.with(|d| d.get()))
 }
 /// Charge `units` to the current evaluation. False once the budget is spent, and from then on,
 /// so loops stop at once and everything left in the formula is cheap.
@@ -363,7 +369,7 @@ pub fn to_number(v: &Value) -> Result<f64, ErrorKind> {
         Value::Empty => Ok(0.0),
         Value::Number(n) => Ok(*n),
         Value::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
-        Value::Text(s) => crate::model::parse_number_literal(s)
+        Value::Text(s) => text_number(s)
             .or_else(|| parse_date_time_text(s).map(|(d, _)| d))
             .ok_or(ErrorKind::Value),
         Value::Error(e) => Err(e.clone()),
@@ -838,6 +844,7 @@ pub fn eval(e: &Expr, ctx: &Ctx) -> Arg {
     if nesting >= 4 {
         return Arg::err(ErrorKind::Cycle);
     }
+    let comma_before = DECIMAL_COMMA.with(|d| d.replace(ctx.wb.decimal_comma));
     if nesting == 0 {
         WORK_LEFT.with(|w| w.set(MAX_EVAL_WORK));
         WORK_EXHAUSTED.with(|x| x.set(false));
@@ -845,6 +852,7 @@ pub fn eval(e: &Expr, ctx: &Ctx) -> Arg {
     EVAL_NESTING.with(|n| n.set(nesting + 1));
     let out = eval_depth(e, ctx, 0);
     EVAL_NESTING.with(|n| n.set(nesting));
+    DECIMAL_COMMA.with(|d| d.set(comma_before));
     if nesting == 0 && WORK_EXHAUSTED.with(|x| x.get()) {
         return Arg::err(ErrorKind::Num);
     }
@@ -1738,7 +1746,7 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
             }
             t(if s.is_empty() { String::new() } else { s.repeat(times as usize) })
         }
-        "VALUE" => match crate::model::parse_number_literal(&try_text!(a(0))).or_else(|| parse_date_time_text(&a(0).to_display()).map(|x| x.0)) {
+        "VALUE" => match text_number(&try_text!(a(0))).or_else(|| parse_date_time_text(&a(0).to_display()).map(|x| x.0)) {
             Some(x) => n(x),
             None => Arg::err(ErrorKind::Value),
         },
@@ -4116,7 +4124,7 @@ pub fn fx_rate(wb: &Workbook, from: &str, to: &str, date: f64) -> Option<f64> {
         let q = t.value_at(CellKey::new(r, c_to)).to_display().trim().to_ascii_uppercase();
         let rate = match t.value_at(CellKey::new(r, c_rate)) {
             Value::Number(x) if x > 0.0 => x,
-            Value::Text(s) => match crate::model::parse_number_literal(&s) {
+            Value::Text(s) => match text_number(&s) {
                 Some(x) if x > 0.0 => x,
                 _ => continue,
             },

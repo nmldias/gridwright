@@ -95,6 +95,8 @@ interface State {
   selectedTable: TableId | null;
   editing: Editing | null;
   editorText: string;
+  /** the open workbook types and shows numbers with a decimal comma ("1.234,56") */
+  decimalComma: boolean;
   panel: Panel;
   codeCell: CellRef | null;
   canUndo: boolean;
@@ -168,6 +170,7 @@ export const useStore = create<State>((set) => ({
   selectedTable: null,
   editing: null,
   editorText: '',
+  decimalComma: false,
   panel: 'none',
   codeCell: null,
   canUndo: false,

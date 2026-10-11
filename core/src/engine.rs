@@ -218,6 +218,10 @@ pub enum Op {
     RestoreCharts {
         charts: Vec<Chart>,
     },
+    /// Type and show numbers with a decimal comma ("1.234,56") in this workbook.
+    SetDecimalComma {
+        on: bool,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -403,6 +407,9 @@ pub struct Changes {
     /// Chart created by this op (AddChart).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_chart: Option<u32>,
+    /// The workbook's decimal-comma setting, when it changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decimal_comma: Option<bool>,
     /// Undo/redo: the restore ops that reproduce this change on another client.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ops: Vec<Op>,
@@ -440,6 +447,8 @@ enum Inverse {
     Names(Vec<NamedRange>),
     /// Restore the chart list.
     Charts(Vec<Chart>),
+    /// Restore the decimal-comma setting.
+    DecimalComma(bool),
 }
 
 pub struct Engine {
@@ -1378,6 +1387,16 @@ impl Engine {
                 self.recalc_all_into(ch);
                 Ok(Some(Inverse::Names(prev)))
             }
+            Op::SetDecimalComma { on } => {
+                let prev = self.wb.decimal_comma;
+                self.wb.decimal_comma = on;
+                ch.decimal_comma = Some(on);
+                // text that formulas turn into numbers ("1.000" + 0, VALUE) now reads differently
+                if prev != on {
+                    self.recalc_all_into(ch);
+                }
+                Ok(Some(Inverse::DecimalComma(prev)))
+            }
             Op::AddSignoff {
                 table,
                 r0,
@@ -1789,6 +1808,16 @@ impl Engine {
             Inverse::Tables(tables) => self.restore_tables(tables, &mut ch),
             Inverse::Names(names) => self.restore_names(names, &mut ch),
             Inverse::Charts(charts) => self.restore_charts(charts, &mut ch),
+            Inverse::DecimalComma(on) => {
+                let counter = Inverse::DecimalComma(self.wb.decimal_comma);
+                let changed = self.wb.decimal_comma != on;
+                self.wb.decimal_comma = on;
+                ch.decimal_comma = Some(on);
+                if changed {
+                    self.recalc_all_into(&mut ch);
+                }
+                (counter, Op::SetDecimalComma { on })
+            }
         };
         ch.ops.push(op);
         (counter, ch)
@@ -3336,6 +3365,35 @@ mod tests {
     /// Review of 11 Oct, 2.2: a loaded workbook showed TODAY() as 30 Dec 1899, set_now changed
     /// nothing, and INDIRECT/OFFSET on a computed address went stale. Volatile formulas now follow
     /// the clock and every recalculation, and only a changed result is reported or re-runs code.
+    #[test]
+    fn decimal_comma_setting_reads_text_numbers_and_undoes() {
+        let mut e = engine();
+        set(&mut e, 1, 0, 0, "'1.000");
+        set(&mut e, 1, 0, 1, "=A1+0");
+        set(&mut e, 1, 0, 2, "=VALUE(\"1.234,5\")");
+        set(&mut e, 1, 0, 3, "1.5");
+        assert_eq!(val(&e, 1, 0, 1), Value::Number(1.0));
+        assert_eq!(val(&e, 1, 0, 2), Value::Number(1234.5));
+        let ch = e.apply(Op::SetDecimalComma { on: true });
+        assert_eq!(ch.decimal_comma, Some(true));
+        assert!(e.wb.decimal_comma);
+        assert_eq!(val(&e, 1, 0, 1), Value::Number(1000.0), "text read as the workbook writes numbers");
+        assert_eq!(val(&e, 1, 0, 2), Value::Number(1234.5));
+        assert_eq!(val(&e, 1, 0, 3), Value::Number(1.5), "stored inputs are never re-read");
+        let json = serde_json::to_string(&e.wb).unwrap();
+        assert!(json.contains("\"decimal_comma\":true"));
+        let back: Workbook = serde_json::from_str(&json).unwrap();
+        assert!(back.decimal_comma);
+        let ch = e.undo();
+        assert_eq!(ch.decimal_comma, Some(false));
+        assert_eq!(val(&e, 1, 0, 1), Value::Number(1.0));
+        assert!(matches!(ch.ops.last(), Some(Op::SetDecimalComma { on: false })));
+        e.redo();
+        assert_eq!(val(&e, 1, 0, 1), Value::Number(1000.0));
+        e.apply(Op::SetDecimalComma { on: false });
+        assert!(!serde_json::to_string(&e.wb).unwrap().contains("decimal_comma"), "default not written");
+    }
+
     #[test]
     fn volatile_formulas_follow_the_clock_and_every_recalculation() {
         let day = crate::formula::eval::serial_from_ymd(2026, 10, 11);

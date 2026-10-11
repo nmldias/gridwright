@@ -79,6 +79,8 @@ jobs:
         run: node e2e/engine_limits.mjs server/engine
       - name: Dates read by the guided import
         run: node e2e/import_dates.mjs server/dist
+      - name: Numbers with a decimal comma (1.234,56) on the shipped WebAssembly build
+        run: node e2e/decimal_comma.mjs server/engine
 
       - name: Seed the test database
         run: |
@@ -166,6 +168,8 @@ jobs:
           GRIDWRIGHT_PYTHON=/tmp/gw-py/bin/python node e2e/python_sandbox.mjs server/dist --sandbox bwrap
           python3 e2e/code_trust.py --port 8803 --data /tmp/gw-trust
           bash e2e/installer_nohup.sh 8805
+      - name: Numbers with a decimal comma in the browser (typed, edited, pasted, shown, switched, saved)
+        run: python3 e2e/decimal_comma_ui.py --port 8807
       - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4

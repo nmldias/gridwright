@@ -37,7 +37,7 @@ export function selectCell(table: TableId, r: number, c: number, extend = false)
   } else {
     sel = { table, r0: r, c0: c, r1: r, c1: c, ar: r, ac: c };
   }
-  useStore.setState({ selection: sel, editorText: cellAt(table, sel.ar, sel.ac)?.i ?? '' });
+  useStore.setState({ selection: sel, editorText: book.editText(cellAt(table, sel.ar, sel.ac)?.i ?? '') });
   scrollTo(table, extend ? r : sel.ar, extend ? c : sel.ac);
   renderer?.markDirty();
 }
@@ -54,7 +54,7 @@ export function selectRange(table: TableId, r0: number, c0: number, r1: number, 
     ar: Math.max(0, Math.min(r0, r1)),
     ac: Math.max(0, Math.min(c0, c1)),
   };
-  useStore.setState({ selection: sel, editorText: cellAt(table, sel.ar, sel.ac)?.i ?? '' });
+  useStore.setState({ selection: sel, editorText: book.editText(cellAt(table, sel.ar, sel.ac)?.i ?? '') });
   renderer?.markDirty();
 }
 
@@ -219,16 +219,17 @@ export function startEdit(initial?: string, replace = false) {
     setStatus('This table is a pivot — its cells are computed from the source table.');
     return;
   }
-  const text = initial !== undefined ? initial : (cell?.i ?? '');
+  const text = initial !== undefined ? initial : book.editText(cell?.i ?? '');
   useStore.setState({ editing: { table: sel.table, r: sel.ar, c: sel.ac, initial: text, replace, source: 'cell' }, editorText: text, selectedTable: null });
   renderer?.markDirty();
 }
 
 /** Returns false when a strict validation rule refused the value (the editor stays open). */
-export function commitEdit(text: string, move: { dr: number; dc: number } | null): boolean {
+export function commitEdit(typed: string, move: { dr: number; dc: number } | null): boolean {
   const st = getState();
   const ed = st.editing;
   if (!ed) return true;
+  const text = book.normalizeTyped(typed);
   const prev = cellAt(ed.table, ed.r, ed.c)?.i ?? '';
   if (text !== prev) {
     const meta = st.tables.get(ed.table);
@@ -255,7 +256,7 @@ export function commitEdit(text: string, move: { dr: number; dc: number } | null
 export function cancelEdit() {
   const ed = getState().editing;
   if (!ed) return;
-  useStore.setState({ editing: null, editorText: cellAt(ed.table, ed.r, ed.c)?.i ?? '' });
+  useStore.setState({ editing: null, editorText: book.editText(cellAt(ed.table, ed.r, ed.c)?.i ?? '') });
   renderer?.markDirty();
 }
 
@@ -438,7 +439,8 @@ export async function pasteFromClipboard(explicitText?: string) {
     return;
   }
   if (!text) return;
-  const values = parseTsv(text);
+  // from outside the workbook: read numbers as this workbook writes them ("1.234,56")
+  const values = parseTsv(text).map((row) => row.map((v) => book.normalizeTyped(v)));
   if (!values.length) return;
   book.apply({ type: 'set_cells', table: sel.table, row: sel.r0, col: sel.c0, values });
   selectRange(sel.table, sel.r0, sel.c0, sel.r0 + values.length - 1, sel.c0 + (values[0]?.length ?? 1) - 1);

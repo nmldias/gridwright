@@ -98,7 +98,15 @@ export function FormatPanel() {
       c1: sel.c1,
       kind: cf.kind,
       op: cf.kind === 'cell_is' ? cf.op : cf.kind === 'text' ? (TEXT_OPS.some(([k]) => k === cf.op) ? cf.op : 'contains') : undefined,
-      values: cf.kind === 'cell_is' ? [cf.v1, cf.v2] : cf.kind === 'text' || cf.kind === 'top' || cf.kind === 'bottom' || cf.kind === 'formula' ? [cf.v1] : [],
+      // thresholds are typed like a cell and stored canonically; text and formulas are kept as written
+      values:
+        cf.kind === 'cell_is'
+          ? [book.normalizeTyped(cf.v1), book.normalizeTyped(cf.v2)]
+          : cf.kind === 'top' || cf.kind === 'bottom'
+            ? [book.normalizeTyped(cf.v1)]
+            : cf.kind === 'text' || cf.kind === 'formula'
+              ? [cf.v1]
+              : [],
       fill: cf.kind === 'color_scale' ? undefined : cf.fill || undefined,
       color: cf.color || undefined,
       bold: cf.bold ? true : undefined,
@@ -118,7 +126,7 @@ export function FormatPanel() {
         setStatus('Enter the allowed values (comma separated) or a range such as Lists::A2:A20');
         return;
       }
-    } else values = [vd.v1, vd.v2];
+    } else values = [book.normalizeTyped(vd.v1), book.normalizeTyped(vd.v2)];
     const rule: Validation = {
       r0: sel.r0,
       c0: sel.c0,
@@ -145,13 +153,14 @@ export function FormatPanel() {
   const describeCf = (r: CondFormat) => {
     const k = CF_KINDS.find((x) => x.value === r.kind)?.label ?? r.kind;
     const op = r.op ? ([...NUM_OPS, ...TEXT_OPS].find(([x]) => x === r.op)?.[1] ?? r.op) : '';
-    const vals = r.values.filter(Boolean).join(' and ');
+    const numeric = r.kind === 'cell_is' || r.kind === 'top' || r.kind === 'bottom';
+    const vals = r.values.filter(Boolean).map((v) => (numeric ? book.editText(v) : v)).join(' and ');
     return `${rangeLabel(r)}: ${k.replace('…', '')} ${op} ${vals}`.trim();
   };
   const describeVd = (r: Validation) => {
     const k = V_KINDS.find((x) => x.value === r.kind)?.label ?? r.kind;
     const op = r.op ? NUM_OPS.find(([x]) => x === r.op)?.[1] ?? r.op : '';
-    const vals = r.kind === 'list' ? r.values.join(', ') : r.values.filter(Boolean).join(' and ');
+    const vals = r.kind === 'list' ? r.values.join(', ') : r.values.filter(Boolean).map((v) => book.editText(v)).join(' and ');
     return `${rangeLabel(r)}: ${k} ${op} ${vals}${r.strict ? ' (strict)' : ''}`;
   };
 

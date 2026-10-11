@@ -183,9 +183,68 @@ impl Value {
     }
 }
 
-/// Numbers typed by users: plain, thousands separators, percentages, currency symbols.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Exchange "." and "," — the whole difference between "1,234.56" and "1.234,56".
+pub fn swap_separators(s: &str) -> String {
+    s.chars().map(|c| match c { '.' => ',', ',' => '.', c => c }).collect()
+}
+
+/// A number as written in a workbook with a decimal comma ("1.234,56", "1,5", "(1.000)").
+pub fn parse_number_literal_in(t: &str, decimal_comma: bool) -> Option<f64> {
+    if decimal_comma {
+        parse_number_literal(&swap_separators(t))
+    } else {
+        parse_number_literal(t)
+    }
+}
+
+/// What a person typed, as the input to store: in a decimal-comma workbook a number is
+/// rewritten English-style ("1.234,56" → "1,234.56", "1,5" → "1.5"); anything else is kept.
+pub fn normalize_typed(t: &str, decimal_comma: bool) -> String {
+    let s = t.trim_start();
+    if !decimal_comma || s.starts_with('=') || s.starts_with('\'') || !(t.contains('.') || t.contains(',')) {
+        return t.to_string();
+    }
+    let swapped = swap_separators(t);
+    if parse_number_literal(&swapped).is_some() {
+        swapped
+    } else {
+        t.to_string()
+    }
+}
+
+/// The text to show when editing a stored input: the inverse of `normalize_typed`.
+pub fn edit_text(input: &str, decimal_comma: bool) -> String {
+    let s = input.trim_start();
+    if !decimal_comma || s.starts_with('=') || s.starts_with('\'') || parse_number_literal(input).is_none() {
+        return input.to_string();
+    }
+    swap_separators(input)
+}
+
+/// "1,234,567" grouping: 1-3 digits, then groups of exactly three.
+fn grouped(int_part: &str, sep: char) -> bool {
+    let digits = int_part.trim_start_matches(['-', '+']);
+    let mut groups = digits.split(sep);
+    let first = groups.next().unwrap_or("");
+    (1..=3).contains(&first.len())
+        && first.chars().all(|c| c.is_ascii_digit())
+        && groups.all(|g| g.len() == 3 && g.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Numbers typed by users: plain, thousands separators, percentages, currency symbols, and
+/// accounting negatives in parentheses.
 pub fn parse_number_literal(t: &str) -> Option<f64> {
     let mut s = t.replace(['\u{a0}', ' '], "");
+    // "(1,234.00)" is -1234, as in accounting formats and Excel
+    let mut neg = false;
+    if s.len() > 2 && s.starts_with('(') && s.ends_with(')') {
+        s = s[1..s.len() - 1].to_string();
+        neg = true;
+    }
     let mut pct = false;
     if let Some(stripped) = s.strip_suffix('%') {
         s = stripped.to_string();
@@ -198,12 +257,14 @@ pub fn parse_number_literal(t: &str) -> Option<f64> {
             s = stripped.to_string();
         }
     }
-    if s.is_empty() {
+    if s.is_empty() || (neg && s.starts_with(['-', '+', '('])) {
         return None;
     }
     // Separators: "1,234.5" (en) vs "1.234,5" (pt/eu). Decide by whichever
     // separator appears last; a lone comma followed by exactly three digits is
     // read as a thousands separator ("1,500"), otherwise as a decimal comma ("1,5").
+    // A separator that repeats is a thousands separator, but only in a real grouping:
+    // "1.000.000" is a million, "08.10.2026" is not a number (it is a date).
     let has_dot = s.contains('.');
     let has_comma = s.contains(',');
     let candidate = if has_dot && has_comma {
@@ -220,9 +281,16 @@ pub fn parse_number_literal(t: &str) -> Option<f64> {
             } else {
                 s.replace(',', ".")
             }
-        } else {
+        } else if grouped(&s, ',') {
             s.replace(',', "")
+        } else {
+            return None;
         }
+    } else if s.matches('.').count() > 1 {
+        if !grouped(&s, '.') {
+            return None;
+        }
+        s.replace('.', "")
     } else {
         s.clone()
     };
@@ -230,7 +298,8 @@ pub fn parse_number_literal(t: &str) -> Option<f64> {
     if !n.is_finite() {
         return None;
     }
-    Some(if pct { n / 100.0 } else { n })
+    let n = if pct { n / 100.0 } else { n };
+    Some(if neg { -n } else { n })
 }
 
 pub fn format_number(n: f64) -> String {
@@ -917,6 +986,11 @@ pub struct Workbook {
     /// Serial date-time (days since 1899-12-30) injected by the host for NOW()/TODAY().
     #[serde(skip)]
     pub now_serial: f64,
+    /// Numbers are typed and shown with a decimal comma ("1.234,56", pt-AO and most of Europe).
+    /// Inputs stay English-style ("1234.56"): the client converts at the edge, so every replica
+    /// parses an op the same way. Formulas keep "." decimals and "," between arguments.
+    #[serde(skip_serializing_if = "is_false")]
+    pub decimal_comma: bool,
 }
 
 impl Workbook {
@@ -930,6 +1004,7 @@ impl Workbook {
             charts: vec![],
             next_chart_id: 1,
             now_serial: 45000.0,
+            decimal_comma: false,
         }
     }
 
@@ -1058,6 +1133,53 @@ mod tests {
         assert_eq!(Value::parse_literal("TRUE"), Value::Bool(true));
         assert_eq!(Value::parse_literal("hello"), Value::Text("hello".into()));
         assert_eq!(Value::parse_literal(""), Value::Empty);
+    }
+
+    #[test]
+    fn numbers_in_both_conventions() {
+        use super::{edit_text, normalize_typed, parse_number_literal as auto, parse_number_literal_in as as_in};
+        // every workbook: accounting negatives, repeated separators only in a real grouping
+        assert_eq!(auto("(1,234.00)"), Some(-1234.0));
+        assert_eq!(auto("(500)"), Some(-500.0));
+        assert_eq!(auto("(12%)"), Some(-0.12));
+        assert_eq!(auto("(-5)"), None);
+        assert_eq!(auto("1.000.000"), Some(1_000_000.0));
+        assert_eq!(auto("1,000,000"), Some(1_000_000.0));
+        assert_eq!(auto("-1,000,000"), Some(-1_000_000.0));
+        assert_eq!(auto("1,2,3"), None);
+        assert_eq!(auto("1.2.3"), None);
+        assert_eq!(auto("08.10.2026"), None);
+        assert_eq!(Value::parse_literal("08.10.2026"), Value::Number(46303.0));
+        assert_eq!(Value::parse_literal("(1.234,00)"), Value::Number(-1234.0));
+        // a decimal-comma workbook (pt-AO): the review's cases
+        assert_eq!(as_in("1.000", true), Some(1000.0));
+        assert_eq!(as_in("1,500", true), Some(1.5));
+        assert_eq!(as_in("1.000.000", true), Some(1_000_000.0));
+        assert_eq!(as_in("(1.234,00)", true), Some(-1234.0));
+        assert_eq!(as_in("1.234,56", true), Some(1234.56));
+        assert_eq!(as_in("1,234.56", true), Some(1234.56));
+        assert_eq!(as_in("1,5 Kz", true), Some(1.5));
+        assert_eq!(as_in("12,5%", true), Some(0.125));
+        assert_eq!(as_in("08.10.2026", true), None);
+        // ...and nothing changes for the other workbooks
+        assert_eq!(as_in("1.000", false), Some(1.0));
+        assert_eq!(as_in("1,500", false), Some(1500.0));
+        // typed text becomes an English-style input; editing shows it back as typed
+        assert_eq!(normalize_typed("1.234,56", true), "1,234.56");
+        assert_eq!(normalize_typed("1,5", true), "1.5");
+        assert_eq!(normalize_typed("1.000", true), "1,000");
+        for keep in ["08.10.2026", "=ROUND(1.5,2)", "'1,5", "hello, world.", "12/10", "8 Oct, 2026"] {
+            assert_eq!(normalize_typed(keep, true), keep);
+        }
+        assert_eq!(normalize_typed("1,5", false), "1,5");
+        for typed in ["1.000", "1,500", "1.000.000", "(1.234,00)", "1.234,56", "€ 1.000,00", "1,5 Kz", "12,5%", "-0,75", "1,234.56", "42", "08.10.2026"] {
+            let stored = normalize_typed(typed, true);
+            let expect = as_in(typed, true).map(Value::Number).unwrap_or_else(|| Value::parse_literal(typed));
+            assert_eq!(Value::parse_literal(&stored), expect, "{typed} -> {stored}");
+            assert_eq!(edit_text(&stored, true), typed, "round trip of {typed}");
+            assert_eq!(edit_text(&stored, false), stored);
+        }
+        assert_eq!(Value::auto_format(&normalize_typed("€ 1.000,00", true)), Some("€#,##0.00".into()));
     }
 
     #[test]

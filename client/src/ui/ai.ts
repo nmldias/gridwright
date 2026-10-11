@@ -40,7 +40,8 @@ function summariseWorkbook(maxRows = 15, maxCols = 12): string {
       let any = false;
       for (let c = 0; c < cols; c++) {
         const cell = cellAt(t.id, r, c);
-        let text = cell ? (cell.k === 'formula' ? `${displayOf(cell)} {${cell.i}}` : cell.k === 'value' ? displayOf(cell) : `[${cell.k} cell → ${displayOf(cell)}]`) : '';
+        // canonical numbers ("1234.5"): what the assistant reads, it may write back as an input
+        let text = cell ? (cell.k === 'formula' ? `${displayOf(cell, true)} {${cell.i}}` : cell.k === 'value' ? displayOf(cell, true) : `[${cell.k} cell → ${displayOf(cell, true)}]`) : '';
         if (text.length > 40) text = text.slice(0, 37) + '…';
         if (text) any = true;
         cells.push(text);

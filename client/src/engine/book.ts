@@ -6,6 +6,7 @@ import wasmUrl from './pkg/gridwright_core_bg.wasm?url';
 import type { CellRef, CellValue, CellView, Changes, Chart, CheckView, NamedRange, Op, SignoffStatus, TableId, TableMeta, Trace } from './types';
 import { cellKey, isCodeKind } from './types';
 import { cellAt, readOnly, useStore } from '../state/store';
+import { setDecimalCommaDisplay } from '../grid/format';
 import { clearRecords } from '../workers/runs';
 import { trust } from '../workers/trust';
 
@@ -64,7 +65,9 @@ export async function loadBook(json: string | null, name = 'Untitled', fileId: s
   if (book) book.free();
   if (!opts.keepView) clearRecords();
   book = json ? Book.from_json(json) : new Book(name);
+  if (!json) book.start_with_decimal_comma(localeUsesDecimalComma());
   book.set_now(nowSerial());
+  setDecimalCommaDisplay(book.decimal_comma());
   const metas: TableMeta[] = JSON.parse(book.tables());
   const tables = new Map<TableId, TableMeta>();
   const cells = new Map<TableId, Map<number, CellView>>();
@@ -80,6 +83,7 @@ export async function loadBook(json: string | null, name = 'Untitled', fileId: s
     cells,
     names: JSON.parse(book.names()) as NamedRange[],
     charts: JSON.parse(book.charts()) as Chart[],
+    decimalComma: book.decimal_comma(),
     selectedChart: null,
     trace: null,
     fileName: json ? book.name() : name,
@@ -193,6 +197,7 @@ export function announceSnapshot(note: string, origin: Origin = 'system') {
 }
 
 export function applyChanges(changes: Changes) {
+  if (changes.decimal_comma !== undefined) setDecimalCommaDisplay(changes.decimal_comma);
   const b = getBook();
   const st = useStore.getState();
   const tables = new Map(st.tables);
@@ -255,6 +260,7 @@ export function applyChanges(changes: Changes) {
     canRedo: b.can_redo(),
     cellsVersion: st.cellsVersion + 1,
     ...(changes.names ? { names: changes.names } : {}),
+    ...(changes.decimal_comma !== undefined ? { decimalComma: changes.decimal_comma } : {}),
     ...(changes.charts ? { charts: changes.charts } : {}),
     ...(changes.created_chart ? { selectedChart: changes.created_chart } : {}),
   });
@@ -300,8 +306,30 @@ export function listEntries(table: TableId, row: number, col: number): string[] 
   return JSON.parse(getBook().list_entries(table, row, col));
 }
 
+/** The browser's language writes "1,5" for one and a half (pt, most of Europe). */
+export function localeUsesDecimalComma(lang = typeof navigator !== 'undefined' ? navigator.language : 'en'): boolean {
+  try {
+    return new Intl.NumberFormat(lang).formatToParts(1.5).find((p) => p.type === 'decimal')?.value === ',';
+  } catch {
+    return false;
+  }
+}
+/** What a person typed or pasted from outside, as the input to store ("1.234,56" → "1,234.56" in
+ *  a decimal-comma workbook). Copies inside the workbook keep stored inputs as they are. */
+export function normalizeTyped(text: string): string {
+  return getBook().normalize_typed(text);
+}
+/** A stored input as the person editing it expects to see it (inverse of normalizeTyped). */
+export function editText(input: string): string {
+  return getBook().edit_text(input);
+}
 export function formatWithEngine(n: number, pattern: string): string {
   return Book.format_number(n, pattern);
+}
+/** A stored (canonical) literal as a number, read as the engine reads input ("1,000", "12%",
+ *  a date); NaN when it is not a number. */
+export function parseNumber(text: string): number {
+  return Book.parse_number(text);
 }
 
 export function trace(table: TableId, row: number, col: number): Trace {

@@ -93,6 +93,23 @@ impl Book {
     pub fn can_undo(&self) -> bool {
         self.engine.can_undo()
     }
+    /// The workbook types and shows numbers with a decimal comma ("1.234,56").
+    pub fn decimal_comma(&self) -> bool {
+        self.engine.wb.decimal_comma
+    }
+    /// A brand-new workbook starts with the creator's convention: not an edit, nothing to undo.
+    pub fn start_with_decimal_comma(&mut self, on: bool) {
+        self.engine.wb.decimal_comma = on;
+    }
+    /// What a person typed (or pasted from outside), as the input to store: numbers are
+    /// rewritten English-style in a decimal-comma workbook; everything else is kept as typed.
+    pub fn normalize_typed(&self, text: &str) -> String {
+        model::normalize_typed(text, self.engine.wb.decimal_comma)
+    }
+    /// A stored input as the person editing it expects to see it (inverse of normalize_typed).
+    pub fn edit_text(&self, input: &str) -> String {
+        model::edit_text(input, self.engine.wb.decimal_comma)
+    }
 
     pub fn can_redo(&self) -> bool {
         self.engine.can_redo()
@@ -199,6 +216,15 @@ impl Book {
     /// Format a number with a spreadsheet pattern (same rules as TEXT()).
     pub fn format_number(n: f64, pattern: &str) -> String {
         formula::eval::format_text(&Value::Number(n), pattern)
+    }
+
+    /// A stored (canonical) literal read as a number the way the engine reads an input:
+    /// "1,000", "2.5", "12%", "2026-01-01"; NaN when it is not a number.
+    pub fn parse_number(text: &str) -> f64 {
+        match Value::parse_literal(text) {
+            Value::Number(n) => n,
+            _ => f64::NAN,
+        }
     }
 
     /// Evaluate a formula body for a specific cell position (conditional-format formulas); JSON value.

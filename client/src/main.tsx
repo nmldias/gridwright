@@ -10,6 +10,7 @@ import { getState } from './state/store';
 import { getRenderer, selectCell } from './grid/actions';
 import { displayOf } from './grid/format';
 import { numberOverflows } from './grid/renderer';
+import { condStyle } from './grid/condfmt';
 import * as book from './engine/book';
 import * as review from './ui/review';
 import * as charts from './grid/charts';
@@ -48,6 +49,18 @@ applyThemeCss();
       if (numberOverflows(text, bold, meta.col_widths[cell.c] ?? 0)) out.push(`${cell.r},${cell.c}:${text}`);
     }
     return out;
+  },
+  /** the text a cell shows on the grid (tests) */
+  display: (table: number, r: number, c: number) => {
+    const cell = getState().cells.get(table)?.get(r * 65536 + c);
+    return cell ? displayOf(cell) : '';
+  },
+  /** the conditional-format style a cell is drawn with (tests) */
+  condStyle: (table: number, r: number, c: number) => {
+    const st = getState();
+    const meta = st.tables.get(table);
+    const map = st.cells.get(table);
+    return meta ? condStyle(meta, map, r, c, map?.get(r * 65536 + c), st.cellsVersion) ?? null : null;
   },
   /** execution-evidence status of a code cell (tests) */
   runStatus: (ref: { table: number; row: number; col: number }) => {
