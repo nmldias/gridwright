@@ -234,6 +234,11 @@ export function profileSheet(db: DatabaseSync, sheet: SheetMeta, schema = 'main'
       if (!related || b.distinct < a.distinct * 0.5 || b.distinct > a.distinct * 3) continue;
       const A = `c${a.index}`;
       const B = `c${b.index}`;
+      // a code/name pair means the code determines the name, apart from spelling variants. Two columns that vary
+      // independently (a ledger: every account under every cost centre) are not one: count the rows whose name,
+      // normalised, is not the most common one for its code; over a quarter of the rows, skip the pair.
+      const fit = db.prepare(`SELECT sum(n) total, sum(n) - sum(top) other FROM (SELECT ${A}, sum(n) n, max(n) top FROM (SELECT ${A}, gw_namekey(${B}) k, count(*) n ${W} AND ${A} IS NOT NULL AND ${B} IS NOT NULL GROUP BY ${A}, k) GROUP BY ${A})`).get() as { total: number | null; other: number | null };
+      if (!fit.total || (fit.other ?? 0) > fit.total * 0.25) continue;
       const many = db.prepare(`SELECT ${A} code, json_group_array(name) names, json_group_array(n) counts FROM (SELECT ${A}, ${B} name, count(*) n ${W} AND ${A} IS NOT NULL AND ${B} IS NOT NULL GROUP BY ${A}, ${B} ORDER BY n DESC) GROUP BY ${A} HAVING count(*) > 1 ORDER BY sum(n) DESC`).all() as { code: string; names: string; counts: string }[];
       const groups = db.prepare(`SELECT k, json_group_array(DISTINCT code) codes, min(name) name FROM (SELECT gw_namekey(${B}) k, ${A} code, ${B} name ${W} AND ${A} IS NOT NULL AND ${B} IS NOT NULL GROUP BY ${A}, ${B}) GROUP BY k HAVING count(DISTINCT code) > 1 ORDER BY count(DISTINCT code) DESC`).all() as { k: string; codes: string; name: string }[];
       if (!many.length && !groups.length) continue;

@@ -24,7 +24,8 @@ const DUE_DATE = /venc|due|prazo|maturity/i;
 const AMOUNT = /valor|total|amount|montante|pre[cç]o|price|custo|cost|saldo|balance|l[ií]quido|net|bruto|gross/i;
 const DOC_TYPE = /tipo|type|esp[eé]cie|kind/i;
 const STATUS = /status|estado|situa[cç][aã]o|state/i;
-const CUSTOMER = /cliente|customer|client|seguradora|payer|pagador|entidade|account name|nome/i;
+// the counterparty of each document: a customer, or a supplier in a purchases register
+const CUSTOMER = /cliente|customer|client|seguradora|payer|pagador|entidade|account name|nome|fornecedor|supplier|vendor|credor|devedor|counterparty|contraparte/i;
 /** a label naming a code rather than a name: “Código Cliente”, “Customer ID”, “Nº Cliente”, “Ref. Cliente”, “NIF” */
 const CODE_LABEL = /(^|[\s_.-])(c[oó]d(igo)?|code|id|n[ºo°.]|num(ero|ber)?|n[uú]mero|ref(er[eê]ncia)?|nif|nuit|conta|account)([\s_.-]|$)/i;
 const PK_LABEL = /interno|internal|^id$|record|registo|linha|line id/i;
@@ -86,7 +87,10 @@ export function propose(p: SheetProfile): Proposal {
   const cats = used.filter((c) => c.inferred === 'category');
   const docType = cats.find((c) => DOC_TYPE.test(c.label) && c.top.some((t) => CREDIT.test(String(t.value)))) ?? cats.find((c) => c.top.some((t) => CREDIT.test(String(t.value))) && c.distinct <= 12);
   const status = cats.find((c) => c !== docType && STATUS.test(c.label)) ?? cats.find((c) => c !== docType && c.top.some((t) => OPEN.test(String(t.value).trim())));
-  const pair = p.pairs.find((x) => CUSTOMER.test(p.columns.find((c) => c.key === x.name)?.label ?? '')) ?? p.pairs[0];
+  // a code/name pair is the customer only when one of its columns says so: any other pair (an account and its
+  // description, a cost centre) is not a customer, and its names are not spellings of one customer
+  const labelOf = (key: string) => p.columns.find((c) => c.key === key)?.label ?? '';
+  const pair = p.pairs.find((x) => CUSTOMER.test(labelOf(x.name))) ?? p.pairs.find((x) => CUSTOMER.test(labelOf(x.code)));
   // without a code/name pair (a clean file has none to report): the customer is the name column, not “Código Cliente”
   const textual = (c: (typeof used)[number]) => c.inferred === 'text' || c.inferred === 'category';
   const customerName = pair
