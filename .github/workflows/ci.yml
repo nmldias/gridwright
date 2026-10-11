@@ -154,6 +154,14 @@ jobs:
         run: python3 e2e/sqlserver.py http://127.0.0.1:8787 --mssql '127.0.0.1:14333:master:sa:Gridwright!2026'
       - name: MySQL driver and read-only policy (MariaDB)
         run: python3 e2e/mysql.py http://127.0.0.1:8787 --mysql 127.0.0.1:33069:demo:gw:gw
+      - name: Review of 11 Oct 2026 (start-up rules, identity, token, origin, bodies, saves, backup, run records; history log; read-only SQL in the database; Python sandbox; code trust; the installer without systemd)
+        run: |
+          python3 e2e/server_gates.py --port 8806
+          node e2e/history_log.mjs server/dist
+          node e2e/sql_readonly.mjs server/dist --pg 127.0.0.1:54329:demo:gw:gw --mysql 127.0.0.1:33069:demo:gw:gw --mysql-root root --mssql '127.0.0.1:14333:master:sa:Gridwright!2026'
+          GRIDWRIGHT_PYTHON=/tmp/gw-py/bin/python node e2e/python_sandbox.mjs server/dist --sandbox bwrap
+          python3 e2e/code_trust.py --port 8803 --data /tmp/gw-trust
+          bash e2e/installer_nohup.sh 8805
       - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4
@@ -230,29 +238,37 @@ jobs:
       - name: Test the deployable image, not the checkout (declared capabilities and isolation as it ships)
         run: |
           set -e
-          probe() { # $1 = container name
+          # the image listens on 0.0.0.0, so with no sign-in configured the server makes up an access token
+          # (/data/access-token) and the API needs it: $T is the token of the container being probed
+          probe() { # $1 = container name, $2 = port
             for i in $(seq 1 60); do curl -fsS "http://127.0.0.1:$2/api/health" >/dev/null 2>&1 && break; sleep 1; done
             curl -fsS "http://127.0.0.1:$2/api/health" | tee /dev/stderr | grep -q "\"version\":\"$(node -p "require('./server/package.json').version")\""
-            curl -fsS "http://127.0.0.1:$2/api/investigation" | tee /dev/stderr | grep -q '"available":true'
-            for i in $(seq 1 60); do curl -fsS "http://127.0.0.1:$2/api/python" 2>/dev/null | grep -qv '"not probed yet"' && break; sleep 1; done
-            curl -fsS "http://127.0.0.1:$2/api/python" | tee /dev/stderr
-            curl -fsS -X POST "http://127.0.0.1:$2/mcp" -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | grep -q '"propose_edit"'
+            curl -fsS -H "Authorization: Bearer $T" "http://127.0.0.1:$2/api/investigation" | tee /dev/stderr | grep -q '"available":true'
+            for i in $(seq 1 60); do curl -fsS -H "Authorization: Bearer $T" "http://127.0.0.1:$2/api/python" 2>/dev/null | grep -qv '"not probed yet"' && break; sleep 1; done
+            curl -fsS -H "Authorization: Bearer $T" "http://127.0.0.1:$2/api/python" | tee /dev/stderr
+            curl -fsS -X POST "http://127.0.0.1:$2/mcp" -H "Authorization: Bearer $T" -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | grep -q '"propose_edit"'
           }
-          level() { curl -fsS "http://127.0.0.1:$1/api/python" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const p=JSON.parse(s);console.log(p.available?"on:"+p.sandbox:"off:"+p.reason)})'; }
+          level() { curl -fsS -H "Authorization: Bearer $T" "http://127.0.0.1:$1/api/python" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const p=JSON.parse(s);console.log(p.available?"on:"+p.sandbox:"off:"+p.reason)})'; }
           # as it ships: the stack is there; server-side Python is either bubblewrap-sandboxed or off — never a plain process by default
           docker run -d --name gw-default -p 8790:8787 gridwright:test
+          for i in $(seq 1 60); do curl -fsS "http://127.0.0.1:8790/api/health" >/dev/null 2>&1 && break; sleep 1; done
+          # no token given: the API refuses, and the token the server generated opens it
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8790/api/python); [ "$code" = 401 ] || { echo "a default container answered the API without a token ($code)"; exit 1; }
+          T=$(docker exec gw-default cat /data/access-token); [ ${#T} -ge 32 ] || { echo "no generated access token"; exit 1; }
+          [ "$(docker exec gw-default stat -c %a /data/access-token)" = 600 ] || { echo "access-token is not 0600"; exit 1; }
           probe gw-default 8790
           L=$(level 8790); echo "default run: $L"; case "$L" in on:bwrap|off:*) ;; *) echo "unexpected sandbox level by default: $L"; exit 1 ;; esac
           docker logs gw-default | tail -5; docker rm -f gw-default
           # with the container allowed to create user namespaces (host permitting): bubblewrap, the data directory hidden from cells — reported, not required
-          docker run -d --name gw-userns -p 8791:8787 --security-opt seccomp=unconfined --security-opt apparmor=unconfined gridwright:test
+          T=ci-image-token-0123456789abcdef0123456789
+          docker run -d --name gw-userns -e GRIDWRIGHT_TOKEN=$T -p 8791:8787 --security-opt seccomp=unconfined --security-opt apparmor=unconfined gridwright:test
           probe gw-userns 8791
           echo "userns run: $(level 8791)"
           docker rm -f gw-userns
           # accepting the container as the only boundary, by name
-          docker run -d --name gw-none -p 8792:8787 -e GRIDWRIGHT_PYTHON_SANDBOX=none gridwright:test
+          docker run -d --name gw-none -p 8792:8787 -e GRIDWRIGHT_TOKEN=$T -e GRIDWRIGHT_PYTHON_SANDBOX=none gridwright:test
           probe gw-none 8792
-          curl -fsS http://127.0.0.1:8792/api/python | grep -q '"sandbox":"none"'
+          curl -fsS -H "Authorization: Bearer $T" http://127.0.0.1:8792/api/python | grep -q '"sandbox":"none"'
           docker rm -f gw-none
       - name: Build and push (linux/amd64, linux/arm64) from the prebuilt tree
         uses: docker/build-push-action@v6

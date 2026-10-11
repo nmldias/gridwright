@@ -7,7 +7,7 @@ import { addRecord, addWatch, contextForModel, openIssues, RECORD_KINDS, type Re
 import { canRunPython } from './execpolicy.js';
 import { runCodeForDocument } from './investigate.js';
 import { runQuery, type QueryResult } from './sql.js';
-import { authorizeQuery, canSeeConnection, isReadOnlySql } from './sqlpolicy.js';
+import { authorizeQuery, canSeeConnection, dialectOf, isReadOnlySql } from './sqlpolicy.js';
 import { listConnections } from './storage.js';
 
 export const MAX_TOOL_ROWS = 200;
@@ -196,11 +196,12 @@ export async function runTool(name: string, args: Record<string, unknown>, ctx: 
     }
     case 'run_sql': {
       const sql = String(args.sql ?? '');
-      // the assistant never writes, whatever the connection allows
-      const check = isReadOnlySql(sql);
-      if (!check.ok) throw new Error(check.reason);
       const c = conn(args.connection, sql);
-      const r = await runQuery(c, sql, MAX_TOOL_ROWS);
+      // the assistant never writes, whatever the connection allows: the policy reads the statement the
+      // way this database does, and the database runs it read-only
+      const check = isReadOnlySql(sql, dialectOf(c));
+      if (!check.ok) throw new Error(check.reason);
+      const r = await runQuery(c, sql, MAX_TOOL_ROWS, [], { forceReadOnly: true });
       return { result: resultForModel(r), summary: `${r.rowCount} row(s)${r.rowCount > MAX_TOOL_ROWS ? ` (first ${MAX_TOOL_ROWS} shown)` : ''} in ${r.ms} ms` };
     }
     case 'read_context': {

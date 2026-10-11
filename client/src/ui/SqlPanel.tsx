@@ -231,7 +231,7 @@ export function SqlPanel() {
           onClick={() => {
             const sel = getState().selection;
             if (!sel || !view.current) return;
-            book.apply({ type: 'set_cell', table: sel.table, row: sel.ar, col: sel.ac, input: view.current.state.doc.toString(), kind: 'sql', conn: current, refresh: 0 });
+            book.apply({ type: 'set_cell', table: sel.table, row: sel.ar, col: sel.ac, input: view.current.state.doc.toString(), kind: 'sql', conn: current, refresh: 0 }, { trustCode: true });
             useStore.setState({ panel: 'code', codeCell: { table: sel.table, row: sel.ar, col: sel.ac } });
           }}
         >

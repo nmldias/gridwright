@@ -22,6 +22,8 @@ import time
 import traceback
 
 MARKER = "\n__GRIDWRIGHT_RESULT__\n"
+# what one run may send back (tables up to maxCells, images): beyond this the run fails instead of the host
+MAX_RESULT_BYTES = 64 << 20
 
 
 def set_limits(limits, gpu):
@@ -41,6 +43,14 @@ def set_limits(limits, gpu):
             resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
         except Exception:
             pass
+        # processes and threads: a fork bomb stops here. Only sent when the run has its own user
+        # namespace — the count is per user, and outside a namespace it would include the server's own
+        procs = int(limits.get("maxProcs") or 0)
+        if procs > 0:
+            try:
+                resource.setrlimit(resource.RLIMIT_NPROC, (procs, procs))
+            except Exception:
+                pass
         # Memory: cap the data segment (heap + private anonymous mappings), not the whole address
         # space — shared libraries, thread stacks and the per-core BLAS buffers numpy reserves at
         # import would otherwise eat the budget on machines with many cores. CUDA reserves huge
@@ -327,6 +337,92 @@ def runtime_info(gpu_state):
     return {"name": "python-server", "version": sys.version.split()[0], "packages": packages}
 
 
+class _Capped(io.TextIOBase):
+    """stdout/stderr of a cell: keeps the first `cap` characters, notes that the rest was cut."""
+
+    def __init__(self, cap):
+        super().__init__()
+        self.cap = cap
+        self.parts = []
+        self.size = 0
+        self.cut = False
+
+    def writable(self):
+        return True
+
+    def write(self, s):
+        s = str(s)
+        room = self.cap - self.size
+        if room > 0:
+            piece = s[:room]
+            self.parts.append(piece)
+            self.size += len(piece)
+        if len(s) > max(room, 0):
+            self.cut = True
+        return len(s)
+
+    def getvalue(self):
+        text = "".join(self.parts)
+        if self.cut:
+            text += "\n… output cut at %d characters" % self.cap
+        return text
+
+
+def _become_subreaper():
+    """Processes a run leaves behind become this process's children when their parent ends, however
+    they detached (double fork, setsid), so they can be found and stopped."""
+    try:
+        import ctypes
+
+        ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPER
+    except Exception:
+        pass
+
+
+def _children():
+    me = str(os.getpid())
+    kids = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % name) as f:
+                stat = f.read()
+            if stat[stat.rindex(")") + 2 :].split()[1] == me:
+                kids.append(int(name))
+        except Exception:
+            pass
+    return kids
+
+
+def _stop_leftovers():
+    """Nothing of a run may outlive it: kill and reap every child until none is left (each round
+    kills the processes whose parents the previous round killed)."""
+    for _ in range(200):
+        kids = _children()
+        for pid in kids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+        while True:
+            try:
+                pid, _ = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                break
+            except Exception:
+                break
+            if pid == 0:
+                break
+        if not kids:
+            return
+        time.sleep(0.01)
+
+
+def _crash_result(e):
+    return {"ok": False, "error": "the runner failed: %s: %s" % (type(e).__name__, e), "std_out": "", "deps": [], "runtime": {}}
+
+
 def run_cell(req):
     """Execute one request in this process and return the result dict."""
     code = req.get("code") or ""
@@ -372,8 +468,9 @@ def run_cell(req):
         except Exception as e:  # the cell still runs; `companion` says why it is not there
             agent_error = "%s: %s" % (type(e).__name__, e)
     real_stdout = sys.stdout
-    out = io.StringIO()
-    err = io.StringIO()
+    cap = int(limits.get("maxOutputChars") or 1000000)
+    out = _Capped(cap)
+    err = _Capped(min(cap, 200000))
     sys.stdout = out
     sys.stderr = err
     os.environ.setdefault("MPLBACKEND", "Agg")
@@ -430,11 +527,16 @@ def run_cell(req):
 
 def main_once():
     """Single run: request on stdin, result after the marker on stdout (used for probes and GPU runs)."""
+    _become_subreaper()
     req = json.loads(sys.stdin.read() or "{}")
-    result = run_cell(req)
+    try:
+        result = run_cell(req)
+    except BaseException as e:
+        result = _crash_result(e)
     sys.stdout.write(MARKER)
     sys.stdout.write(json.dumps(result, default=str))
     sys.stdout.flush()
+    _stop_leftovers()
 
 
 def serve():
@@ -446,6 +548,7 @@ def serve():
     """
     import select
 
+    _become_subreaper()
     for name in ("numpy", "pandas"):
         try:
             __import__(name)
@@ -480,7 +583,10 @@ def serve():
                 devnull = os.open(os.devnull, os.O_RDWR)
                 os.dup2(devnull, 0)
                 os.dup2(devnull, 1)
-                result = run_cell(req)
+                try:
+                    result = run_cell(req)
+                except BaseException as e:
+                    result = _crash_result(e)
                 data = json.dumps(result, default=str).encode("utf-8")
                 view = memoryview(data)
                 while len(view):
@@ -490,37 +596,59 @@ def serve():
                 os._exit(0)
         os.close(w)
         chunks = []
+        size = 0
         deadline = time.monotonic() + timeout
         timed_out = False
+        too_big = False
+        status_code = None
+        # read until the cell's process has ended and its output is drained — not until end-of-file: a
+        # process the cell left behind may hold the pipe open
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
                 break
-            ready, _, _ = select.select([r], [], [], remaining)
+            if status_code is None:
+                try:
+                    done, code = os.waitpid(pid, os.WNOHANG)
+                    if done:
+                        status_code = code
+                except ChildProcessError:
+                    status_code = 0
+            ready, _, _ = select.select([r], [], [], 0 if status_code is not None else min(remaining, 0.05))
             if not ready:
+                if status_code is not None:
+                    break
                 continue
             chunk = os.read(r, 1 << 16)
             if not chunk:
                 break
             chunks.append(chunk)
-        if timed_out:
+            size += len(chunk)
+            if size > MAX_RESULT_BYTES:
+                too_big = True
+                break
+        if timed_out or too_big:
             try:
                 os.killpg(pid, signal.SIGKILL)
             except Exception:
                 pass
         os.close(r)
-        try:
-            _, status_code = os.waitpid(pid, 0)
-        except Exception:
-            status_code = 0
-        # nothing of a run may outlive it: stop anything it left running in its process group
+        if status_code is None:
+            try:
+                _, status_code = os.waitpid(pid, 0)
+            except Exception:
+                status_code = 0
+        # nothing of a run may outlive it: its process group, then whatever detached from it
         try:
             os.killpg(pid, signal.SIGKILL)
         except Exception:
             pass
+        _stop_leftovers()
         result = None
-        if chunks and not timed_out:
+        if too_big:
+            result = {"ok": False, "error": "the result is larger than %d MB" % (MAX_RESULT_BYTES // (1 << 20)), "std_out": "", "deps": [], "runtime": runtime_info("off")}
+        elif chunks and not timed_out:
             try:
                 result = json.loads(b"".join(chunks).decode("utf-8"))
             except Exception:

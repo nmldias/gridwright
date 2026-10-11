@@ -11,7 +11,10 @@ services:
       # Encrypts stored DB passwords / AI keys. Leave empty to have a random key generated into
       # /data/secret.key (keep the data volume with your backups), or set a long random string.
       GRIDWRIGHT_SECRET: ${GRIDWRIGHT_SECRET:-}
-      # Optional shared access token: open http://host:8787/?token=... once per browser.
+      # Shared access token: open http://host:8787/?token=... once per browser (scripts send
+      # `Authorization: Bearer ...`). Left empty, the server makes one up and keeps it in the data volume:
+      #   docker compose exec gridwright cat /data/access-token
+      # (or set GRIDWRIGHT_AUTH=accounts for sign-in, or GRIDWRIGHT_ALLOW_OPEN=1 to run open on a network you trust)
       GRIDWRIGHT_TOKEN: ${GRIDWRIGHT_TOKEN:-}
       # Trust `tailscale serve` identity headers (bind the port to 127.0.0.1 when enabling this).
       GRIDWRIGHT_TRUST_TAILSCALE: ${GRIDWRIGHT_TRUST_TAILSCALE:-0}

@@ -75,7 +75,12 @@ function toCellValue(p: Plain): CellValue {
   return { s: String(p) };
 }
 
-function handleResult(e: MessageEvent) {
+/**
+ * A run's result. `fromServer`: it came back from the server's Python endpoint, which logged the run
+ * itself — only then is a record it carries kept as "attested: server". A worker message (JavaScript,
+ * browser Python) is the cell code's own output and may say anything: its record is computed here.
+ */
+function handleResult(e: MessageEvent, fromServer = false) {
   const d = e.data;
   if (d.type === 'ready') {
     useStore.setState({ pythonStatus: 'ready' });
@@ -101,12 +106,14 @@ function handleResult(e: MessageEvent) {
   if (!cell || !isCodeKind(cell.k)) return; // cell changed meanwhile
   if (fnv(cell.i) !== fnv(d.code ?? cell.i)) return; // the code changed while this ran: its result is not the current code's
   const deps: Rect[] = (d.deps ?? []).map((x: Rect) => ({ table: x.table, r0: x.r0, c0: x.c0, r1: x.r1, c1: x.c1 }));
-  const runtime: RunRuntime = d.runtime ?? { name: cell.k, version: '', packages: {} };
+  // only the server path may say a run happened on the server (and under which sandbox)
+  const claimsServer = !fromServer && /^python-(server|agent)$/.test(String(d.runtime?.name ?? ''));
+  const runtime: RunRuntime = claimsServer || !d.runtime ? { name: cell.k === 'python' && claimsServer ? 'pyodide' : cell.k, version: '', packages: {} } : d.runtime;
   // the record binds the code that ran, the inputs it was given (from its snapshot) and the output it produced
   const inHash = snapshot ? inputsHashFromSnapshot(snapshot, deps) : d.inputsHash ?? fnv('');
   const finishRecord = (ok: boolean, output: CellValue[][] | null, error?: string) =>
     recordRun(
-      d.record
+      fromServer && d.record
         ? { ...(d.record as RunRecord), deps, runtime, attested: 'server' }
         : {
             table: ref.table,
@@ -205,7 +212,7 @@ async function runSqlCell(ref: CellRef, id: number, code: string, conn: string |
 // Same snapshot the browser worker gets, same `q` API, same output shape; the run record says
 // "python-server" with the sandbox level and the packages the host used.
 async function runServerPython(ref: CellRef, id: number, code: string, gpu: boolean, snapshot: Snapshot, startedAt: number, agent = false) {
-  const finish = (d: any) => handleResult({ data: { id, code, ...d } } as MessageEvent);
+  const finish = (d: any) => handleResult({ data: { id, code, ...d } } as MessageEvent, true);
   try {
     // the server computes and logs the record itself (attested: server) when it knows which cell this is
     const st = getState();
@@ -227,7 +234,7 @@ async function runServerPython(ref: CellRef, id: number, code: string, gpu: bool
 function getJsWorker(): CodeWorker {
   if (!jsWorker) {
     jsWorker = codeWorker('js');
-    jsWorker.onmessage = handleResult;
+    jsWorker.onmessage = (e) => handleResult(e); // a worker's message is never a server record
     jsWorker.onerror = (e) => useStore.setState({ status: `JavaScript worker error: ${e.message}` });
   }
   return jsWorker;
@@ -236,7 +243,7 @@ function getJsWorker(): CodeWorker {
 export function getPyWorker(): CodeWorker {
   if (!pyWorker) {
     pyWorker = codeWorker('py');
-    pyWorker.onmessage = handleResult;
+    pyWorker.onmessage = (e) => handleResult(e);
     pyWorker.onerror = (e) => useStore.setState({ status: `Python worker error: ${e.message}`, pythonStatus: 'error' });
     useStore.setState({ pythonStatus: 'loading' });
     pyWorker.postMessage({ type: 'init', indexURL: pyodideIndexURL() });

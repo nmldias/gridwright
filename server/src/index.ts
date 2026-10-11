@@ -2,7 +2,7 @@
 // connections, AI proxy, identity, backups and the multiplayer sequencer.
 
 import express, { type NextFunction, type Request, type Response } from 'express';
-import { spawn } from 'node:child_process';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { chmodSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -25,20 +25,46 @@ import { registerSourceRoutes } from './routes/sources.js';
 import { registerAccountRoutes } from './routes/accounts.js';
 import { registerAiQuotaRoutes } from './aiquota.js';
 import { requirePlatformAdmin } from './routes/common.js';
-import { agentTokenValid, authMode, identityEnabled, identityOf, markAgentChannel, onAgentChannel } from './identity.js';
+import { agentTokenValid, authMode, identityEnabled, identityOf, isLoopback, markAgentChannel, onAgentChannel, trustTailscale } from './identity.js';
 import { ACCOUNTS, initTenancy } from './tenancy.js';
 import { attachMultiplayer, notifyCompanion, notifyJob, notifyProposal as notifyProposalRoom } from './multiplayer.js';
 import { handleMcp, setProposalNotifier } from './mcp.js';
 import { engineAvailable, errorMessage } from './headless.js';
 import { probePython, pythonStatus } from './pyrun.js';
 import { canRunPython, canUseGpu } from './execpolicy.js';
-import { DATA_DIR, ensureDirs, pyodideDir } from './storage.js';
+import { DATA_DIR, ensureDirs, getSecret, pyodideDir } from './storage.js';
 import { mountSandbox } from './sandboxpage.js';
+import { generatedToken, needsGeneratedToken, startupProblem, loopbackHost } from './startup.js';
+import { snapshotDataDir, stagingDir, tarGz, type SnapshotReport } from './backup.js';
 
 const VERSION = '0.12.0';
 const PORT = Number(process.env.PORT ?? 8787);
-const HOST = process.env.HOST ?? '0.0.0.0';
-const TOKEN = process.env.GRIDWRIGHT_TOKEN ?? '';
+// loopback unless told otherwise: a server reachable from the network needs a way to tell people apart
+const HOST = process.env.HOST || '127.0.0.1';
+const truthy = (v: string | undefined) => ['1', 'true', 'yes'].includes((v ?? '').trim().toLowerCase());
+const STARTUP = { host: HOST, token: process.env.GRIDWRIGHT_TOKEN ?? '', accounts: ACCOUNTS, trust: trustTailscale, allowOpen: truthy(process.env.GRIDWRIGHT_ALLOW_OPEN) };
+{
+  const problem = startupProblem(STARTUP);
+  if (problem) {
+    console.error(`gridwright: ${problem}`);
+    process.exit(78); // EX_CONFIG: systemd does not restart a configuration error in a loop
+  }
+}
+/** The shared access token: GRIDWRIGHT_TOKEN, or one the server made up because it is reachable with no sign-in. */
+const TOKEN = (() => {
+  if (!needsGeneratedToken(STARTUP)) return STARTUP.token;
+  const g = generatedToken(DATA_DIR);
+  console.log(`gridwright: listening on ${HOST} with no sign-in configured, so access needs a token — ${g.created ? 'generated one' : 'using the one generated before'} in ${g.path}; open http://<this host>:${PORT}/?token=<that value> once per browser (or set GRIDWRIGHT_TOKEN, GRIDWRIGHT_AUTH=accounts, or GRIDWRIGHT_ALLOW_OPEN=1 on a network you trust)`);
+  return g.token;
+})();
+if (!TOKEN && !ACCOUNTS && !trustTailscale && STARTUP.allowOpen && !loopbackHost(HOST)) console.warn(`gridwright: GRIDWRIGHT_ALLOW_OPEN=1 — anyone who reaches ${HOST}:${PORT} is an administrator`);
+/** Constant-time comparison with the shared token (hashes first: equal lengths, nothing learnt from timing). */
+const tokenMatches = (given: unknown) => {
+  if (!TOKEN || typeof given !== 'string' || !given) return false;
+  const a = createHash('sha256').update(given).digest();
+  const b = createHash('sha256').update(TOKEN).digest();
+  return timingSafeEqual(a, b);
+};
 const here = fileURLToPath(new URL('.', import.meta.url));
 /**
  * Sharing level of a new document: GRIDWRIGHT_DEFAULT_SHARING=edit|view|none (private when identity
@@ -58,6 +84,13 @@ process.on('unhandledRejection', (e) => console.error('unhandled rejection:', e)
 process.on('uncaughtException', (e) => console.error('uncaught exception:', e));
 
 ensureDirs();
+// the server key, now: a damaged secret.key or a too-short GRIDWRIGHT_SECRET stops the start, before anything is encrypted with another key
+try {
+  getSecret();
+} catch (e) {
+  console.error(`gridwright: ${(e as Error).message}`);
+  process.exit(78);
+}
 // accounts (multi-tenant): the clients, people and sessions are open before the first request
 await initTenancy();
 if (ACCOUNTS && TOKEN) console.log('accounts: GRIDWRIGHT_TOKEN is not used with GRIDWRIGHT_AUTH=accounts — people sign in, scripts and MCP clients use API tokens');
@@ -69,17 +102,6 @@ app.disable('x-powered-by');
 const TRUST_PROXY_RAW = (process.env.GRIDWRIGHT_TRUST_PROXY ?? '').trim();
 if (TRUST_PROXY_RAW && !['0', 'false', 'no'].includes(TRUST_PROXY_RAW.toLowerCase())) app.set('trust proxy', ['1', 'true', 'yes'].includes(TRUST_PROXY_RAW.toLowerCase()) ? 'loopback' : TRUST_PROXY_RAW);
 const proxyTrusted = (addr: string | undefined) => !!addr && !!app.get('trust proxy') && (app.get('trust proxy fn') as (a: string, i: number) => boolean)(addr, 0);
-// request bodies: documents, snapshots for code and uploads may be large; nothing else needs to be
-// (a 64 MB JSON body is parsed on the server's thread — only where it is worth it)
-const bigJson = express.json({ limit: '64mb' });
-const aiJson = express.json({ limit: '16mb' });
-const smallJson = express.json({ limit: '2mb' });
-app.use((req: Request, res: Response, next: NextFunction) => {
-  const p = req.path;
-  if (p.startsWith('/api/files') || p.startsWith('/api/python/') || p.startsWith('/api/investigat') || p === '/mcp') return bigJson(req, res, next);
-  if (p.startsWith('/api/ai/')) return aiJson(req, res, next);
-  return smallJson(req, res, next);
-});
 
 // The frame browser code cells run in (opaque origin, no network for JavaScript): a static page that
 // carries nothing private, so it is served ahead of every gate.
@@ -134,31 +156,8 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-// Optional shared-token gate: GRIDWRIGHT_TOKEN=... then open /?token=... once.
-const COOKIE = 'gridwright_token';
-app.use((req: Request, res: Response, next: NextFunction) => {
-  if (!TOKEN || ACCOUNTS || onAgentChannel(req)) return next();
-  if (req.path === '/api/health') return next(); // liveness probe stays reachable (it reveals nothing private)
-  // the self-hosted Pyodide distribution is public software, fetched without cookies from the code sandbox
-  if (pyodideDir() && req.path.startsWith('/pyodide/') && (req.method === 'GET' || req.method === 'HEAD')) return next();
-  const q = typeof req.query.token === 'string' ? req.query.token : '';
-  if (q === TOKEN) {
-    res.setHeader('set-cookie', `${COOKIE}=${encodeURIComponent(TOKEN)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000`);
-    return next();
-  }
-  const cookie = (req.headers.cookie ?? '').split(';').map((s) => s.trim()).find((s) => s.startsWith(COOKIE + '='));
-  if (cookie && decodeURIComponent(cookie.slice(COOKIE.length + 1)) === TOKEN) return next();
-  if (req.headers.authorization === `Bearer ${TOKEN}`) return next();
-  if (req.path.startsWith('/api/') || req.path === '/ws') {
-    res.status(401).json({ error: 'unauthorised — open the app with ?token=<GRIDWRIGHT_TOKEN> once' });
-    return;
-  }
-  res.status(401).type('html').send('<h3>Gridwright</h3><p>This server requires a token: open <code>/?token=…</code> with the value of <code>GRIDWRIGHT_TOKEN</code>.</p>');
-});
-
-// Accounts gate (GRIDWRIGHT_AUTH=accounts): the API needs a signed-in person (session cookie or an
-// API token), a changed temporary password, and a client they are a member of. The static client
-// stays reachable — it shows the sign-in. Writes from another site are refused outright.
+// Writes from another site are refused in every mode: a page elsewhere must not be able to use the
+// browser's cookie (shared token or session) or a Tailscale identity to change anything here.
 const ALLOWED_ORIGINS = (process.env.GRIDWRIGHT_ALLOWED_ORIGINS ?? '')
   .split(',')
   .map((s) => s.trim().replace(/\/+$/, ''))
@@ -169,22 +168,69 @@ const originAllowed = (req: { headers: Record<string, string | string[] | undefi
   if (ALLOWED_ORIGINS.includes(origin.replace(/\/+$/, ''))) return true;
   try {
     const host = new URL(origin).host;
-    // the forwarded host counts only from a trusted proxy (GRIDWRIGHT_TRUST_PROXY)
-    const fwd = proxyTrusted(req.socket?.remoteAddress) ? String(req.headers['x-forwarded-host'] ?? '').split(',')[0].trim() : '';
+    // the forwarded host counts only from a trusted proxy (GRIDWRIGHT_TRUST_PROXY, or tailscale serve on loopback)
+    const addr = req.socket?.remoteAddress;
+    const fwd = proxyTrusted(addr) || (trustTailscale && isLoopback(addr)) ? String(req.headers['x-forwarded-host'] ?? '').split(',')[0].trim() : '';
     return host === String(req.headers.host ?? '') || (!!fwd && host === fwd);
   } catch {
     return false;
   }
 };
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (onAgentChannel(req)) return next();
+  const p = req.path;
+  if (!(p.startsWith('/api/') || p === '/mcp')) return next();
+  if (req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS' && !originAllowed(req)) {
+    res.status(403).json({ error: 'cross-site request refused' });
+    return;
+  }
+  next();
+});
+
+// Optional shared-token gate: GRIDWRIGHT_TOKEN=... then open /?token=... once (the page sets a cookie
+// and drops the token from the address). The API takes the cookie or `Authorization: Bearer`, never a
+// token in the URL, where it would end up in logs, history and Referer headers.
+const COOKIE = 'gridwright_token';
+const cookieToken = (header: string | undefined) => {
+  const c = (header ?? '').split(';').map((s) => s.trim()).find((s) => s.startsWith(COOKIE + '='));
+  if (!c) return '';
+  try {
+    return decodeURIComponent(c.slice(COOKIE.length + 1));
+  } catch {
+    return '';
+  }
+};
+const bearer = (header: string | undefined) => (header && /^Bearer\s+/i.test(header) ? header.replace(/^Bearer\s+/i, '').trim() : '');
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (!TOKEN || ACCOUNTS || onAgentChannel(req)) return next();
+  if (req.path === '/api/health') return next(); // liveness probe stays reachable (it reveals nothing private)
+  // the self-hosted Pyodide distribution is public software, fetched without cookies from the code sandbox
+  if (pyodideDir() && req.path.startsWith('/pyodide/') && (req.method === 'GET' || req.method === 'HEAD')) return next();
+  const api = req.path.startsWith('/api/') || req.path === '/ws' || req.path === '/mcp';
+  const q = typeof req.query.token === 'string' ? req.query.token : '';
+  if (q && !api && req.method === 'GET' && tokenMatches(q)) {
+    res.setHeader('set-cookie', `${COOKIE}=${encodeURIComponent(TOKEN)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000${req.secure ? '; Secure' : ''}`);
+    const url = new URL(req.originalUrl, 'http://x');
+    url.searchParams.delete('token');
+    res.redirect(302, url.pathname + (url.search || ''));
+    return;
+  }
+  if (tokenMatches(cookieToken(req.headers.cookie)) || tokenMatches(bearer(req.headers.authorization))) return next();
+  if (api) {
+    res.status(401).json({ error: q ? 'a token in the URL is not accepted by the API — send `Authorization: Bearer <GRIDWRIGHT_TOKEN>`' : 'unauthorised — open the app with ?token=<GRIDWRIGHT_TOKEN> once, or send `Authorization: Bearer <GRIDWRIGHT_TOKEN>`' });
+    return;
+  }
+  res.status(401).type('html').send('<h3>Gridwright</h3><p>This server requires a token: open <code>/?token=…</code> with the value of <code>GRIDWRIGHT_TOKEN</code>.</p>');
+});
+
+// Accounts gate (GRIDWRIGHT_AUTH=accounts): the API needs a signed-in person (session cookie or an
+// API token), a changed temporary password, and a client they are a member of. The static client
+// stays reachable — it shows the sign-in. (Writes from another site were refused above.)
 const OPEN_PATHS = new Set(['/api/health', '/api/me', '/api/auth/login', '/api/auth/logout', '/api/auth/invitation', '/api/auth/invitation/accept']);
 app.use((req: Request, res: Response, next: NextFunction) => {
   if (!ACCOUNTS || onAgentChannel(req)) return next();
   const p = req.path;
   if (!(p.startsWith('/api/') || p === '/mcp')) return next();
-  if (req.method !== 'GET' && req.method !== 'HEAD' && !originAllowed(req)) {
-    res.status(403).json({ error: 'cross-site request refused' });
-    return;
-  }
   if (OPEN_PATHS.has(p)) return next();
   const id = identityOf(req);
   if (!id.login) {
@@ -206,6 +252,19 @@ app.use((req: Request, res: Response, next: NextFunction) => {
     return;
   }
   next();
+});
+
+// Request bodies are parsed only now, after the gates: nobody who could not use the API gets the server
+// to parse a large body. Documents, code snapshots and uploads may be big; nothing else needs to be
+// (a 64 MB JSON body is parsed on the server's thread — only where it is worth it).
+const bigJson = express.json({ limit: '64mb' });
+const aiJson = express.json({ limit: '16mb' });
+const smallJson = express.json({ limit: '2mb' });
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const p = req.path;
+  if (p.startsWith('/api/files') || p.startsWith('/api/python/') || p.startsWith('/api/investigat') || p === '/mcp') return bigJson(req, res, next);
+  if (p.startsWith('/api/ai/')) return aiJson(req, res, next);
+  return smallJson(req, res, next);
 });
 
 // roles: viewers cannot write; only admins manage connections, AI settings and backups
@@ -251,18 +310,41 @@ void probeStack().then((st) => console.log(st.available ? `investigation stack: 
 app.all('/mcp', (req, res) => void handleMcp(req, res));
 
 // --- backup (tar.gz of the data directory — every client's: the platform's administrators only) ---
+// A consistent snapshot (databases copied with VACUUM INTO), without secret.key: whoever holds the
+// archive must not also hold the key to the secrets inside it. RESTORE.txt in the archive says how.
 app.get('/api/backup', requirePlatformAdmin, (req, res) => {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  let staging = '';
+  const cleanup = () => {
+    if (staging) rmSync(staging, { recursive: true, force: true });
+    staging = '';
+  };
+  let report: SnapshotReport;
+  try {
+    staging = stagingDir(DATA_DIR);
+    report = snapshotDataDir(DATA_DIR, join(staging, 'data'));
+  } catch (e) {
+    cleanup();
+    res.status(500).json({ error: `backup failed: ${(e as Error).message}` });
+    return;
+  }
+  for (const c of report.copiedAsIs) console.warn(`backup: copied as is (not snapshotted): ${c}`);
   res.setHeader('content-type', 'application/gzip');
   res.setHeader('content-disposition', `attachment; filename="gridwright-backup-${stamp}.tar.gz"`);
-  const tar = spawn('tar', ['-czf', '-', '-C', DATA_DIR, '--exclude=./pyodide', '.']);
+  res.setHeader('x-gridwright-backup', `databases=${report.databases}; files=${report.files}; secret-key=not-included`);
+  const tar = tarGz(join(staging, 'data'));
   tar.stdout.pipe(res);
   tar.stderr.on('data', (d) => console.warn('backup:', d.toString().trim()));
   tar.on('error', (e) => {
+    cleanup();
     if (!res.headersSent) res.status(500).json({ error: e.message });
     else res.end();
   });
-  req.on('close', () => tar.kill());
+  tar.on('exit', cleanup);
+  req.on('close', () => {
+    tar.kill();
+    cleanup();
+  });
 });
 
 // --- self-hosted Pyodide (optional) -----------------------------------------------------
@@ -300,7 +382,9 @@ app.get(/^(?!\/api\/).*/, (_req, res) => {
 });
 
 const server = createServer(app);
-const wss = new WebSocketServer({ noServer: true });
+// the largest message is a document snapshot, which the REST API caps at 64 MB as well (ws would take 100 MiB)
+const WS_MAX_BYTES = Math.max(1, Number(process.env.GRIDWRIGHT_WS_MAX_MB) || 64) * 1024 * 1024;
+const wss = new WebSocketServer({ noServer: true, maxPayload: WS_MAX_BYTES });
 attachMultiplayer(wss);
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
@@ -308,18 +392,23 @@ server.on('upgrade', (req, socket, head) => {
     socket.destroy();
     return;
   }
+  // a page on another site must not open a session with this browser's cookie or Tailscale identity
+  if (!originAllowed(req)) {
+    socket.write('HTTP/1.1 403 Forbidden\r\nconnection: close\r\n\r\n');
+    socket.destroy();
+    return;
+  }
   if (ACCOUNTS) {
     // the same rules as the API: a signed-in member of the client the tab names (?tenant=), from this site
     const id = identityOf(req);
-    if (!originAllowed(req) || !id.login || !id.tenant || id.mustChangePassword) {
+    if (!id.login || !id.tenant || id.mustChangePassword) {
       socket.write('HTTP/1.1 401 Unauthorized\r\nconnection: close\r\n\r\n');
       socket.destroy();
       return;
     }
   } else if (TOKEN) {
-    const cookie = (req.headers.cookie ?? '').split(';').map((s) => s.trim()).find((s) => s.startsWith(COOKIE + '='));
-    const ok = (cookie && decodeURIComponent(cookie.slice(COOKIE.length + 1)) === TOKEN) || url.searchParams.get('token') === TOKEN;
-    if (!ok) {
+    if (!tokenMatches(cookieToken(req.headers.cookie)) && !tokenMatches(bearer(req.headers.authorization))) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\nconnection: close\r\n\r\n');
       socket.destroy();
       return;
     }

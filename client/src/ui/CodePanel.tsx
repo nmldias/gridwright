@@ -11,7 +11,7 @@ import * as book from '../engine/book';
 import { a1, isCodeKind, type CellKind } from '../engine/types';
 import { cellAt, useStore } from '../state/store';
 import { runCell } from '../workers/runner';
-import { clearBlocked, trust } from '../workers/trust';
+import { clearBlocked, isTrusted, trust } from '../workers/trust';
 import { clearDraft, draftKey, getDraft, hasDraft, setDraft as keepDraft } from './drafts';
 import { PanelHeader } from './PanelHeader';
 
@@ -59,7 +59,7 @@ export function CodePanel() {
     const text = viewRef.current.state.doc.toString();
     clearDraft(dkey);
     if (text !== cell?.i) {
-      book.apply({ type: 'set_cell', table: codeCell.table, row: codeCell.row, col: codeCell.col, input: text, kind: lang, conn: cell?.conn ?? null, refresh: cell?.refresh ?? 0, runtime: cell?.runtime ?? null, gpu: cell?.gpu ?? null });
+      book.apply({ type: 'set_cell', table: codeCell.table, row: codeCell.row, col: codeCell.col, input: text, kind: lang, conn: cell?.conn ?? null, refresh: cell?.refresh ?? 0, runtime: cell?.runtime ?? null, gpu: cell?.gpu ?? null }, { trustCode: true });
     } else if (run) {
       // the person is looking at this code and pressed Run: that is their approval of it
       if (cell && isCodeKind(cell.k)) {
@@ -84,7 +84,7 @@ export function CodePanel() {
       refresh: patch.refresh !== undefined ? patch.refresh : (cell.refresh ?? 0),
       runtime: patch.runtime !== undefined ? patch.runtime : (cell.runtime ?? null),
       gpu: patch.gpu !== undefined ? patch.gpu : (cell.gpu ?? null),
-    });
+    }, { trustCode: isTrusted(cell) }); // a new connection or runtime keeps the code's trust, never adds it
   };
   const onServer = lang === 'python' && cell?.runtime === 'server';
   const onAgent = lang === 'python' && cell?.runtime === 'agent';

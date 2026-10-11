@@ -24,20 +24,28 @@ export function ensureDirs() {
 
 // --- secret & encryption ---------------------------------------------------
 let secret: Buffer | null = null;
+/**
+ * The server key: GRIDWRIGHT_SECRET (any text of 16+ characters, hashed), or `<data>/secret.key`
+ * (64 hex characters, made on first use). A key that is there but unusable is an error, never
+ * silently replaced or shortened: everything saved encrypted depends on it staying the same.
+ */
 export function getSecret(): Buffer {
   if (secret) return secret;
   const env = process.env.GRIDWRIGHT_SECRET;
-  if (env && env.length >= 16) {
+  if (env !== undefined && env !== '') {
+    if (env.length < 16) throw new Error('GRIDWRIGHT_SECRET is set but shorter than 16 characters — use a long random value (it encrypts saved passwords and AI keys)');
     secret = createHash('sha256').update(env).digest();
     return secret;
   }
   const p = join(DATA_DIR, 'secret.key');
   if (existsSync(p)) {
-    secret = Buffer.from(readFileSync(p, 'utf8').trim(), 'hex');
+    const hex = readFileSync(p, 'utf8').trim();
+    if (!/^[0-9a-f]{64}$/i.test(hex)) throw new Error(`${p} is not a server key (64 hex characters expected, found ${hex.length} characters${/[^0-9a-f]/i.test(hex) ? ' that are not all hex' : ''}) — restore the key you kept apart; a new one would not open what is saved encrypted`);
+    secret = Buffer.from(hex, 'hex');
   } else {
     ensureDirs();
     secret = randomBytes(32);
-    writeFileSync(p, secret.toString('hex'), { mode: 0o600 });
+    writeFileSync(p, secret.toString('hex'), { mode: 0o600, flag: 'wx' });
   }
   return secret;
 }

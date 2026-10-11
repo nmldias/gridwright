@@ -6,7 +6,7 @@
 // run record so an auditor can see what protected the host.
 
 import { spawn, execFile, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readlinkSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { cpus, freemem, homedir, tmpdir, totalmem } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,6 +22,8 @@ export interface PythonLimits {
   concurrency: number;
   /** BLAS/OpenMP threads per run (keeps numpy's per-core buffers and the pool's CPU use in check) */
   threads: number;
+  /** processes and threads a sandbox may hold at once (RLIMIT_NPROC inside its user namespace) */
+  maxProcs: number;
 }
 
 export interface PythonStatus {
@@ -98,7 +100,11 @@ export const LIMITS: PythonLimits = {
   maxCells: num(process.env.GRIDWRIGHT_PYTHON_MAX_CELLS, 200_000, 5_000_000),
   concurrency: num(process.env.GRIDWRIGHT_PYTHON_CONCURRENCY, 2, 32),
   threads: num(process.env.GRIDWRIGHT_PYTHON_THREADS, Math.max(1, Math.min(4, cpus().length)), 256),
+  maxProcs: 0,
 };
+LIMITS.maxProcs = num(process.env.GRIDWRIGHT_PYTHON_MAX_PROCS, Math.max(128, LIMITS.threads * 8 + 64), 32_768);
+/** The process limit is counted per user: only a run in its own user namespace gets it (bwrap, unshare). */
+const procLimit = (sandbox: Sandbox | null) => (sandbox === 'bwrap' || sandbox === 'unshare' ? { maxProcs: LIMITS.maxProcs } : {});
 
 /** Environment every run gets: thread caps for BLAS/OpenMP (per-core buffers!) and a lean allocator. */
 function runtimeEnv(): Record<string, string> {
@@ -157,26 +163,105 @@ function nvidiaDevices(): string[] {
   }
 }
 
+// What of the host's /etc a Python process needs: the dynamic linker's configuration, certificates,
+// time zones, name-service and font configuration. Nothing else of /etc is in the sandbox.
+const ETC_KEEP = ['ld.so.cache', 'ld.so.conf', 'ld.so.conf.d', 'ssl', 'ca-certificates', 'ca-certificates.conf', 'pki', 'crypto-policies', 'localtime', 'timezone', 'zoneinfo', 'alternatives', 'fonts', 'mime.types', 'nsswitch.conf', 'host.conf', 'gai.conf', 'protocols', 'services', 'matplotlibrc'];
+
+/** passwd, group and hosts for the sandbox: one user (the server's), localhost — not the host's accounts. */
+function sandboxEtc(): string {
+  const dir = join(DATA_DIR, 'sandbox-etc');
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 1000;
+  const gid = typeof process.getgid === 'function' ? process.getgid() : 1000;
+  const files: Record<string, string> = {
+    passwd: `root:x:0:0:root:/nonexistent:/usr/sbin/nologin\nsandbox:x:${uid}:${gid}:Gridwright sandbox:/tmp:/usr/sbin/nologin\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n`,
+    group: `root:x:0:\nsandbox:x:${gid}:\nnogroup:x:65534:\n`,
+    hosts: '127.0.0.1 localhost\n::1 localhost\n',
+  };
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o755 });
+    for (const [name, text] of Object.entries(files)) writeFileSync(join(dir, name), text, { mode: 0o644 });
+  } catch {
+    /* reported when a run fails */
+  }
+  return dir;
+}
+
+/**
+ * The file system of a bubblewrap sandbox, built up from nothing: the system's programs and libraries
+ * (/usr, read-only), the few /etc entries above, private /proc, /dev and /tmp, and the directories
+ * `expose` names (the interpreter, the runner), read-only. The host's data, homes, /opt, /srv, /var,
+ * the rest of /etc and every socket directory are simply not there — wherever an administrator put
+ * them (an accounts database or inbox outside the data directory included).
+ */
+function sandboxRoot(expose: Iterable<string>, gpu: boolean): string[] {
+  const args = ['--ro-bind', '/usr', '/usr'];
+  // merged-/usr systems: /bin -> usr/bin and so on; older ones have real directories
+  for (const d of ['/bin', '/sbin', '/lib', '/lib32', '/lib64', '/libx32']) {
+    try {
+      const st = lstatSync(d);
+      if (st.isSymbolicLink()) args.push('--symlink', readlinkSync(d), d);
+      else if (st.isDirectory()) args.push('--ro-bind', d, d);
+    } catch {
+      /* not on this system */
+    }
+  }
+  for (const name of ETC_KEEP) if (existsSync(join('/etc', name))) args.push('--ro-bind', join('/etc', name), join('/etc', name));
+  const etc = sandboxEtc();
+  for (const name of ['passwd', 'group', 'hosts']) if (existsSync(join(etc, name))) args.push('--ro-bind', join(etc, name), join('/etc', name));
+  args.push('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp');
+  // CPU topology for the BLAS/OpenMP thread pools; a GPU run needs the device tree
+  if (gpu) args.push('--ro-bind-try', '/sys', '/sys');
+  else args.push('--ro-bind-try', '/sys/devices/system/cpu', '/sys/devices/system/cpu');
+  // configuration of locally built software is not something a cell needs
+  if (existsSync('/usr/local/etc')) args.push('--tmpfs', '/usr/local/etc');
+  const shown: string[] = [];
+  for (const dir of expose) {
+    if (!dir || !existsSync(dir) || dir === '/usr' || dir.startsWith('/usr/')) continue;
+    args.push('--ro-bind', dir, dir);
+    shown.push(dir);
+  }
+  // an exposed directory that holds the data directory or a home (an interpreter installed above
+  // them) must not bring them along
+  for (const hidden of hiddenDirs()) if (shown.some((d) => hidden.startsWith(`${d}/`))) args.push('--tmpfs', hidden);
+  return args;
+}
+
+/** Directories the interpreter needs: its prefix (a venv) and the real installation behind it. */
+function interpreterDirs(py: string): string[] {
+  const dirs = [resolve(dirname(dirname(py)))];
+  try {
+    dirs.push(dirname(dirname(realpathSync(py))));
+  } catch {
+    /* not resolvable: the prefix alone */
+  }
+  return dirs;
+}
+
+/** Library directories named in the environment (CUDA, vendor BLAS) — read-only in the sandbox. */
+function libraryDirs(gpu: boolean): string[] {
+  const dirs = (process.env.LD_LIBRARY_PATH ?? '').split(':').filter((d) => d.startsWith('/'));
+  if (gpu && process.env.CUDA_HOME?.startsWith('/')) dirs.push(process.env.CUDA_HOME);
+  return dirs;
+}
+
 /** argv that runs the runner script under the given sandbox (`serve` = warm host mode). */
 export function wrap(sandbox: Sandbox, py: string, gpu: boolean, serve = false, tenant = 'default'): string[] {
   const script = RUNNER;
   const tail = serve ? [py, script, '--serve'] : [py, script];
   if (sandbox === 'bwrap') {
-    const args = ['--ro-bind', '/', '/', '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--unshare-all', '--die-with-parent', '--new-session', '--clearenv'];
-    for (const dir of hiddenDirs()) args.push('--tmpfs', dir);
-    // re-expose what the interpreter and the runner need, read-only, even when they live under a hidden directory
-    const expose = new Set<string>([dirname(script), resolve(dirname(dirname(py)))]);
-    for (const dir of expose) if (existsSync(dir)) args.push('--ro-bind', dir, dir);
+    const args = [...sandboxRoot(new Set([dirname(script), ...interpreterDirs(py), ...libraryDirs(gpu)]), gpu), '--unshare-all', '--die-with-parent', '--new-session', '--clearenv'];
     if (gpu) for (const dev of nvidiaDevices()) args.push('--dev-bind', dev, dev);
     // one writable directory for library caches (fonts, JIT kernels) — the client's own — bound after the hiding mounts
     args.push('--bind', cacheDirFor(tenant), CACHE_IN_SANDBOX);
     args.push('--setenv', 'PATH', '/usr/local/bin:/usr/bin:/bin', '--setenv', 'HOME', '/tmp');
     for (const [k, v] of Object.entries({ ...runtimeEnv(), ...cacheEnv(CACHE_IN_SANDBOX) })) args.push('--setenv', k, v);
     for (const k of ['LD_LIBRARY_PATH', 'CUDA_HOME', 'CUDA_VISIBLE_DEVICES', 'VIRTUAL_ENV']) if (process.env[k]) args.push('--setenv', k, process.env[k] as string);
-    args.push('--chdir', '/tmp');
+    // every mount is in place: the root (and the directories bwrap made for the binds) becomes read-only — only /tmp and the binds above stay writable
+    args.push('--remount-ro', '/', '--chdir', '/tmp');
     return ['bwrap', ...args, ...tail];
   }
-  if (sandbox === 'unshare') return ['unshare', '-rn', '--kill-child', '--', ...tail];
+  // its own PID namespace: whatever a run leaves behind ends with it
+  if (sandbox === 'unshare') return ['unshare', '-rn', '--pid', '--fork', '--mount-proc', '--kill-child', '--', ...tail];
   return tail;
 }
 
@@ -364,21 +449,20 @@ export function wrapAgent(sandbox: Sandbox, opts: AgentRunOptions): { argv: stri
   const tail = [opts.python, RUNNER];
   const pyPath: Record<string, string> = opts.pythonPath.length ? { PYTHONPATH: opts.pythonPath.join(':') } : {};
   if (sandbox === 'bwrap') {
-    const args = ['--ro-bind', '/', '/', '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--unshare-all', '--die-with-parent', '--new-session', '--clearenv'];
-    for (const dir of hiddenDirs()) args.push('--tmpfs', dir);
-    const expose = new Set<string>([dirname(RUNNER), resolve(dirname(dirname(opts.python))), ...opts.expose]);
-    for (const dir of expose) if (existsSync(dir)) args.push('--ro-bind', dir, dir);
+    const expose = new Set<string>([dirname(RUNNER), ...interpreterDirs(opts.python), ...libraryDirs(false), ...opts.expose]);
+    const args = [...sandboxRoot(expose, false), '--unshare-all', '--die-with-parent', '--new-session', '--clearenv'];
     args.push('--bind', cacheDirFor(opts.tenant ?? 'default'), CACHE_IN_SANDBOX);
     args.push('--bind', opts.workDir, AGENT_IN.work, '--bind', opts.socket, AGENT_IN.socket);
     const env: Record<string, string> = { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: '/tmp', ...runtimeEnv(), ...cacheEnv(CACHE_IN_SANDBOX), ...opts.env, ...pyPath, GRIDWRIGHT_SOCKET: AGENT_IN.socket, GRIDWRIGHT_WORK: AGENT_IN.work, GRIDWRIGHT_THREADS_DB: `${AGENT_IN.work}/threads.sqlite` };
     for (const [k, v] of Object.entries(env)) args.push('--setenv', k, v);
     for (const k of ['LD_LIBRARY_PATH', 'VIRTUAL_ENV']) if (process.env[k]) args.push('--setenv', k, process.env[k] as string);
-    args.push('--chdir', '/tmp');
+    // every mount is in place: the root (and the directories bwrap made for the binds) becomes read-only — only /tmp and the binds above stay writable
+    args.push('--remount-ro', '/', '--chdir', '/tmp');
     return { argv: ['bwrap', ...args, ...tail], env: {} };
   }
   // weaker levels are the administrator's explicit choice for every cell; the socket is still the only channel offered
   const env = { ...opts.env, ...pyPath, GRIDWRIGHT_SOCKET: opts.socket, GRIDWRIGHT_WORK: opts.workDir, GRIDWRIGHT_THREADS_DB: join(opts.workDir, 'threads.sqlite') };
-  if (sandbox === 'unshare') return { argv: ['unshare', '-rn', '--kill-child', '--', ...tail], env };
+  if (sandbox === 'unshare') return { argv: ['unshare', '-rn', '--pid', '--fork', '--mount-proc', '--kill-child', '--', ...tail], env };
   return { argv: tail, env };
 }
 
@@ -398,7 +482,7 @@ export async function runAsAgentCell(code: string, snapshot: Snapshot, opts: Age
   if (agentActive >= AGENT_CONCURRENCY) return { ...base, ok: false, busy: true, error: `${agentActive} agent cell${agentActive === 1 ? ' is' : 's are'} running; try again when ${agentActive === 1 ? 'it finishes' : 'one finishes'} (GRIDWRIGHT_AGENT_CELL_CONCURRENCY)` };
   agentActive++;
   // the document's thread store grows with every checkpoint: a larger per-file cap than a cell's 64 MB
-  const limits = { cpuSeconds: Math.ceil(timeoutMs / 1000), memoryMb: Math.max(LIMITS.memoryMb, 4096), maxCells: LIMITS.maxCells, fileMb: 1024 };
+  const limits = { cpuSeconds: Math.ceil(timeoutMs / 1000), memoryMb: Math.max(LIMITS.memoryMb, 4096), maxCells: LIMITS.maxCells, fileMb: 1024, ...procLimit(st.sandbox) };
   try {
     const { argv, env } = wrapAgent(st.sandbox, opts);
     const r = await execute(argv, { code, snapshot, gpu: false, limits, agent: true }, timeoutMs + 2000, env);
@@ -477,6 +561,12 @@ function startHost(sandbox: Sandbox, py: string, tenant: string): Host {
   proc.stdout!.setEncoding('utf8');
   proc.stdout!.on('data', (chunk: string) => {
     host.buf += chunk;
+    // the runner caps a result at 64 MB; a host that sends more without a line end is broken
+    if (host.buf.length > 96 * 1024 * 1024) {
+      host.buf = '';
+      proc.kill('SIGKILL');
+      return;
+    }
     let nl: number;
     while ((nl = host.buf.indexOf('\n')) >= 0) {
       const line = host.buf.slice(0, nl);
@@ -685,7 +775,7 @@ export async function runPython(code: string, snapshot: Snapshot, gpu: boolean, 
   const st = status.available ? status : await probePython();
   const base = { std_out: '', deps: [] as RunResult['deps'], runtime: { name: 'python-server', version: st.version, packages: { sandbox: st.sandbox ?? 'none' } }, ms: 0 };
   if (!st.available || !st.sandbox) return { ...base, ok: false, error: `server-side Python is not available: ${st.reason ?? 'unknown'}` };
-  const limits = { cpuSeconds: Math.ceil(LIMITS.timeoutMs / 1000), memoryMb: LIMITS.memoryMb, maxCells: LIMITS.maxCells, fileMb: 64 };
+  const limits = { cpuSeconds: Math.ceil(LIMITS.timeoutMs / 1000), memoryMb: LIMITS.memoryMb, maxCells: LIMITS.maxCells, fileMb: 64, ...procLimit(st.sandbox) };
   try {
     await admit(tenant);
   } catch (e) {

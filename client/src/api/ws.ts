@@ -21,6 +21,7 @@ let unsubSel: (() => void) | null = null;
 let unsubRun: (() => void) | null = null;
 let retry = 0;
 let nextCid = 1;
+let lastRunNotice = 0;
 let resyncing = false;
 
 interface Pending {
@@ -113,6 +114,15 @@ function connect() {
         if (idx >= 0) pending.splice(idx, 1);
         setStatus(`Change rejected by the server: ${msg.reason ?? 'not allowed'}`, 6000);
         void resync('rejected');
+        break;
+      }
+      case 'run_rejected': {
+        // a run record the server would not log (view-only access, or too many): nothing to undo, say so once in a while
+        const now = Date.now();
+        if (now - lastRunNotice > 30_000) {
+          lastRunNotice = now;
+          setStatus(`Run not recorded in the document's history: ${msg.reason ?? 'not allowed'}`, 6000);
+        }
         break;
       }
       case 'ack':
@@ -208,6 +218,8 @@ function connect() {
     unsubRun = onRecord((r) => {
       if (!fileId) return;
       if (r.attested === 'server') return; // the server wrote this record itself
+      const perm = getState().permission;
+      if (perm !== 'edit' && perm !== 'own') return; // the server records runs for editors only
       send({ type: 'run', client: clientId, run: r });
     });
   }
@@ -369,7 +381,11 @@ function opRect(op: Op): { table: number; r0: number; c0: number; r1: number; c1
 }
 
 /** Rebuild the document from the server's log (checkpoint + ops) once nothing is in flight. */
-async function resync(reason: string) {
+/** Catch up with the log up to `seq` (the head the server reported), e.g. before saving again. */
+export async function catchUp(seq: number): Promise<void> {
+  await resync('catch-up', seq);
+}
+async function resync(reason: string, target?: number) {
   if (!fileId || resyncing) return;
   resyncing = true;
   try {
@@ -377,14 +393,14 @@ async function resync(reason: string) {
     for (let i = 0; i < 40 && pending.length > 0; i++) await new Promise((r) => setTimeout(r, 50));
     pending.length = 0;
     const fid = fileId;
-    const seq = getState().seq;
+    const seq = Math.max(getState().seq, target ?? 0);
     const bundle = await api.files.replay(fid, seq);
     if (!bundle || fileId !== fid) return;
     const st = getState();
     const json = await book.replayDocument(bundle.json, bundle.ops.map((e) => e.op as Op), st.fileName);
     await book.loadBook(json, st.fileName, st.fileId, { keepView: true });
     useStore.setState({ seq: Math.max(getState().seq, seq), dirty: true });
-    if (reason !== 'reconnect') setStatus('Synchronised with the other editors', 2000);
+    if (reason !== 'reconnect' && reason !== 'catch-up') setStatus('Synchronised with the other editors', 2000);
   } catch (e) {
     setStatus(`Could not resynchronise: ${(e as Error).message}`, 6000);
   } finally {
