@@ -7,7 +7,7 @@ before and passes after, and is merged through CI (see [`AGENTS.md`](../AGENTS.m
 Status: `todo` · `partial` · `done` (merged; PR noted). Line numbers are from `a1f0a62`: locate the code again
 before editing.
 
-**Next item: 2.6.** Then the rest of Phase 2 in order, then Phase 3.
+**Next item: 2.7.** Then the rest of Phase 2 in order, then Phase 3.
 
 ## Done
 
@@ -18,10 +18,12 @@ before editing.
 | 2.2 | Volatile functions (TODAY, NOW, RAND, INDIRECT, OFFSET, FX/AGEING without a date) recalculated after load, on `set_now` and on every change | #9 |
 | 2.3 | DAYS360, YEARFRAC (bases 0/1), EDATE month-end, DATE and parsed two-digit years as Excel (pivot 1930) | #10 |
 | 2.4 | Decimal comma (`1.234,56`) as a document setting: typed/pasted input, display, filters, highlight rules, validation; strict grouping, `(1.234,00)` negative, `08.10.2026` stays a date | #11 |
+| 2.5 | Comparison at 15 significant digits: operators, criteria, lookups, CHECK, filters, validation, highlight rules | #13 |
+| 2.6 | Rounding and number text on the 15-digit decimal value: ROUND family, MROUND, CEILING/FLOOR, TEXT with sections, FIXED, DOLLAR; General format for number → text; the browser formatter checked against the engine | #PR |
 
 Regression suites for these: `e2e/server_gates.py`, `history_log.mjs`, `sql_readonly.mjs`, `python_sandbox.mjs`,
 `code_trust.py`, `installer_nohup.sh`, `security.py`, `engine_limits.mjs`, `import_dates.mjs`,
-`decimal_comma.mjs`, `decimal_comma_ui.py`.
+`decimal_comma.mjs`, `decimal_comma_ui.py`, `numeric_equality.mjs`, `numeric_equality_ui.py`, `numerics.mjs`.
 
 ## Phase 2 — Engine correctness (Rust core)
 
@@ -43,7 +45,7 @@ Baselines below were reproduced on the shipped engine at `main` `8da8d82`, e.g. 
 
 * **Implemented:** shared 15-digit decimal comparison and numeric hash keys, consistent ordering, criteria and validation bounds; filters and CHECK inherit the comparator. UNIQUE follows the same equality; pivots/COUNTUNIQUE keep display-text grouping (README limitation). Regression coverage: Rust comparison/formula/filter/validation/key tests and `e2e/numeric_equality.mjs` (4 checks). Microsoft precision and function semantics are cited by tests; exact decimal examples have not been independently executed in Excel. Highlight rules evaluated in the browser (`client/src/grid/condfmt.ts`: value comparisons, duplicates, top/bottom N) use the engine's comparison through `Book.compare_numbers` (`e2e/numeric_equality_ui.py`, 14 checks). A numeric pre-check proves most pairs unequal without formatting (sorting 20,000 amounts: 368 ms → 18 ms; `main` 14 ms); UNIQUE/XLOOKUP indexes still build a 15-digit text key per value (≈2× `main`), left for 2.8.
 
-### 2.6 Rounding and display — one Excel-numerics module — `todo`
+### 2.6 Rounding and display — one Excel-numerics module — `done` (#PR)
 * **Baseline:** `=ROUND(1.005,2)` → `1` (Excel `1.01`); every ROUND result truncated to 12 decimals; TEXT rounds
   differently from ROUND; text coercion prints binary noise (the review's example `888888888.3000000715`); TEXT
   ignores `;` sections (positive;negative;zero;text), so accounting formats break.
@@ -52,6 +54,16 @@ Baselines below were reproduced on the shipped engine at `main` `8da8d82`, e.g. 
   Excel's General format (concatenation, `VALUE`, `to_display`), TEXT with sections. Keep `client/src/grid/format.ts`
   in step, or route client formatting through `Book.format_number`.
 * **Acceptance:** table-driven Excel-verified cases (they seed 2.9); the decimal-comma suites still pass.
+
+* **Implemented:** `core/src/formula/numerics.rs` holds the 15-digit decimal value of a number (ties away from
+  zero, as Excel and JavaScript), decimal rounding (`round_decimal`, `fixed_abs`) and Excel's General text
+  (`general_text`, used by `to_display`, so concatenation, pivot keys and re-written formula literals). ROUND,
+  ROUNDUP, ROUNDDOWN, TRUNC, PERCENTRANK, MROUND, CEILING, FLOOR, CEILING.MATH, FLOOR.MATH, TEXT, FIXED and the new
+  DOLLAR use it. TEXT/grid formats gained sections, `_x`, `\x`, `?`, `[Red]`, `*` fill and thousands scaling.
+  `client/src/engine/types.ts` + `grid/format.ts` port the same code (WASM per cell is ~15× slower);
+  `e2e/numerics.mjs` checks the shipped engine against `core/src/formula/excel_cases.tsv` (76 cases, 31 failed on
+  `main`) and the browser formatter against the engine (9,840 number × pattern pairs; `main` already differed on
+  General for long decimals). Not done: General fitted to column width, TEXT conditions/scientific/fractions.
 
 ### 2.7 IRR / XIRR / RATE convergence — `todo`
 * **Problem:** absolute tolerance, so small-scale cash flows return the guess; the bisection fallback returns its

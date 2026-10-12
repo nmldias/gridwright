@@ -4,7 +4,7 @@
 //! lifted over arrays element-wise (so `=ROUND(A1:A5, 1)` yields an array that
 //! spills), aggregates consume whole arrays, and a few functions are lazy.
 
-use super::numerics::{compare_numbers, number_key};
+use super::numerics::{self, compare_numbers, number_key};
 use super::parser::{BinOp, Expr, RefExpr, RefKind};
 use crate::model::{CellKey, ErrorKind, Rect, TableId, Value, Workbook};
 
@@ -1061,42 +1061,6 @@ fn arg_at(args: &[Arg], i: usize) -> Value {
     args.get(i).cloned().map(|a| a.scalar()).unwrap_or(Value::Empty)
 }
 
-fn round_to(x: f64, digits: f64, mode: i8) -> f64 {
-    let f = 10f64.powi(digits as i32);
-    let y = x * f;
-    let r = match mode {
-        0 => {
-            // round half away from zero
-            if y >= 0.0 {
-                (y + 0.5).floor()
-            } else {
-                (y - 0.5).ceil()
-            }
-        }
-        1 => {
-            if y >= 0.0 {
-                y.ceil()
-            } else {
-                y.floor()
-            }
-        }
-        _ => {
-            if y >= 0.0 {
-                y.floor()
-            } else {
-                y.ceil()
-            }
-        }
-    };
-    // avoid -0 and float noise
-    let out = r / f;
-    if out == 0.0 {
-        0.0
-    } else {
-        (out * 1e12).round() / 1e12
-    }
-}
-
 /// Scalar functions that are applied element-wise when given arrays.
 const LIFTED: &[&str] = &[
     "ABS", "SQRT", "EXP", "LN", "LOG", "LOG10", "POWER", "MOD", "INT", "TRUNC", "ROUND", "ROUNDUP", "ROUNDDOWN", "CEILING", "FLOOR", "SIGN", "NOT",
@@ -1104,7 +1068,7 @@ const LIFTED: &[&str] = &[
     "FIND", "SEARCH", "SUBSTITUTE", "REPT", "VALUE", "TEXT", "EXACT", "N", "T", "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "WEEKDAY", "EDATE",
     "EOMONTH", "DAYS", "DATE", "DATEVALUE", "TIME", "YEARFRAC", "DATEDIF", "EFFECT", "NOMINAL", "PMT", "PV", "FV", "NPER", "RATE", "IPMT", "PPMT",
     "SLN", "SWITCH", "AGE_BUCKET", "QUOTIENT", "GCD", "LCM", "FACT", "COMBIN", "PERMUT", "MROUND", "EVEN", "ODD", "SQRTPI", "RADIANS", "DEGREES", "SIN", "COS", "TAN",
-    "ASIN", "ACOS", "ATAN", "ATAN2", "SINH", "COSH", "TANH", "CEILING.MATH", "FLOOR.MATH", "BASE", "DECIMAL", "CHAR", "CODE", "UNICHAR", "UNICODE", "CLEAN", "FIXED",
+    "ASIN", "ACOS", "ATAN", "ATAN2", "SINH", "COSH", "TANH", "CEILING.MATH", "FLOOR.MATH", "BASE", "DECIMAL", "CHAR", "CODE", "UNICHAR", "UNICODE", "CLEAN", "FIXED", "DOLLAR",
     "NUMBERVALUE", "REPLACE", "TEXTBEFORE", "TEXTAFTER", "REGEXMATCH", "REGEXEXTRACT", "REGEXREPLACE", "DAYS360", "WEEKNUM", "ISOWEEKNUM", "TIMEVALUE", "ISERR",
     "ISNONTEXT", "TYPE", "ERROR.TYPE", "SYD", "DB", "DDB", "RRI", "PDURATION", "ISPMT", "NORM.DIST", "NORMDIST", "NORM.S.DIST", "NORMSDIST", "NORM.INV", "NORMINV",
     "NORM.S.INV", "NORMSINV", "STANDARDIZE", "ADDRESS",
@@ -1434,18 +1398,18 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
         "INT" => n(try_num!(a(0)).floor()),
         "TRUNC" => {
             let digits = if args.len() > 1 { try_num!(a(1)) } else { 0.0 };
-            n(round_to(try_num!(a(0)), digits, -1))
+            n(numerics::round_decimal(try_num!(a(0)), digits, numerics::Rounding::Down))
         }
-        "ROUND" => n(round_to(try_num!(a(0)), if args.len() > 1 { try_num!(a(1)) } else { 0.0 }, 0)),
-        "ROUNDUP" => n(round_to(try_num!(a(0)), if args.len() > 1 { try_num!(a(1)) } else { 0.0 }, 1)),
-        "ROUNDDOWN" => n(round_to(try_num!(a(0)), if args.len() > 1 { try_num!(a(1)) } else { 0.0 }, -1)),
+        "ROUND" => n(numerics::round_decimal(try_num!(a(0)), if args.len() > 1 { try_num!(a(1)) } else { 0.0 }, numerics::Rounding::HalfAway)),
+        "ROUNDUP" => n(numerics::round_decimal(try_num!(a(0)), if args.len() > 1 { try_num!(a(1)) } else { 0.0 }, numerics::Rounding::Up)),
+        "ROUNDDOWN" => n(numerics::round_decimal(try_num!(a(0)), if args.len() > 1 { try_num!(a(1)) } else { 0.0 }, numerics::Rounding::Down)),
         "CEILING" => {
             let x = try_num!(a(0));
             let s = if args.len() > 1 { try_num!(a(1)) } else { 1.0 };
             if s == 0.0 {
                 n(0.0)
             } else {
-                n((x / s).ceil() * s)
+                n(numerics::normalize15(numerics::normalize15(x / s).ceil() * s))
             }
         }
         "FLOOR" => {
@@ -1454,7 +1418,7 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
             if s == 0.0 {
                 n(0.0)
             } else {
-                n((x / s).floor() * s)
+                n(numerics::normalize15(numerics::normalize15(x / s).floor() * s))
             }
         }
         "PI" => n(std::f64::consts::PI),
@@ -2540,7 +2504,8 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
             if (x < 0.0) != (m < 0.0) {
                 return Arg::err(ErrorKind::Num);
             }
-            n((x / m).round() * m)
+            // on the decimal quotient: MROUND(1.3, 0.2) is 1.4 although 1.3/0.2 is 6.4999…
+            n(numerics::normalize15(numerics::round_decimal(x / m, 0.0, numerics::Rounding::HalfAway) * m))
         }
         "EVEN" | "ODD" => {
             let x = try_num!(a(0));
@@ -2595,8 +2560,8 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
             if sig == 0.0 {
                 return n(0.0);
             }
-            let q = x / sig;
-            n(if name == "CEILING.MATH" { q.ceil() } else { q.floor() } * sig)
+            let q = numerics::normalize15(x / sig);
+            n(numerics::normalize15(if name == "CEILING.MATH" { q.ceil() } else { q.floor() } * sig))
         }
         "BASE" => {
             let x = try_num!(a(0)).floor();
@@ -2733,7 +2698,7 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
                 (below - 1.0 + (x - lo) / (hi - lo)) / nn
             };
             let digits = args.get(2).map(|d| to_number(&d.clone().scalar()).unwrap_or(3.0)).unwrap_or(3.0);
-            n(round_to(r, digits, 2))
+            n(numerics::round_decimal(r, digits, numerics::Rounding::Down))
         }
         "RANK.AVG" => {
             let x = try_num!(a(0));
@@ -2892,7 +2857,20 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
             }
             let no_commas = args.len() > 2 && try_bool!(a(2));
             let pattern = if no_commas { format!("0{}", if d > 0.0 { format!(".{}", "0".repeat(d as usize)) } else { String::new() }) } else { format!("#,##0{}", if d > 0.0 { format!(".{}", "0".repeat(d as usize)) } else { String::new() }) };
-            t(format_text(&Value::Number(round_to(x, d, 0)), &pattern))
+            t(format_text(&Value::Number(numerics::round_decimal(x, d, numerics::Rounding::HalfAway)), &pattern))
+        }
+        "DOLLAR" => {
+            // FIXED with the currency format: DOLLAR(-1234.567, -2) is "($1,200)"
+            let x = try_num!(a(0));
+            let d = match args.get(1).map(|v| v.clone().scalar()) {
+                None | Some(Value::Empty) => 2.0,
+                Some(v) => try_num!(v),
+            };
+            if !(d <= 127.0) {
+                return Arg::err(ErrorKind::Value);
+            }
+            let dec = if d >= 1.0 { format!(".{}", "0".repeat(d as usize)) } else { String::new() };
+            t(format_text(&Value::Number(numerics::round_decimal(x, d, numerics::Rounding::HalfAway)), &format!("$#,##0{dec};($#,##0{dec})")))
         }
         "NUMBERVALUE" => {
             let mut s = try_text!(a(0)).trim().to_string();
@@ -3989,8 +3967,221 @@ fn is_date_pattern(f: &str) -> bool {
     stripped.contains("yy") || stripped.contains("dd") || stripped.contains("mmm") || stripped.contains("hh") || stripped.contains("h:") || stripped.contains("d ")
 }
 
-/// Format a value with an Excel-like pattern: `0`, `0.00`, `#,##0`, `#,##0.00`, `0%`,
-/// `€#,##0.00`, `#,##0.00 "Kz"`, `#.##0,00` (decimal comma), `yyyy-mm-dd`, `d mmm yyyy hh:mm`.
+/// The sections of a pattern (`positive;negative;zero;text`), split at `;` outside quotes,
+/// brackets and escapes.
+fn split_sections(f: &str) -> Vec<String> {
+    let mut out = vec![String::new()];
+    let mut chars = f.chars();
+    let (mut inq, mut inb) = (false, false);
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if !inb => inq = !inq,
+            '[' if !inq => inb = true,
+            ']' if !inq => inb = false,
+            '\\' if !inq && !inb => {
+                out.last_mut().unwrap().push(c);
+                if let Some(n) = chars.next() {
+                    out.last_mut().unwrap().push(n);
+                }
+                continue;
+            }
+            ';' if !inq && !inb => {
+                out.push(String::new());
+                continue;
+            }
+            _ => {}
+        }
+        out.last_mut().unwrap().push(c);
+    }
+    out
+}
+
+/// One pattern element: a literal to print, or a character of the number's digits/separators.
+enum FmtTok {
+    Lit(String),
+    Num(char),
+    Text,
+}
+
+/// Quoted text, `\x` escapes, `_x` (a space as wide as x), `*x` (fill: nothing in text),
+/// `[Red]`/`[>0]` (ignored), `@`, and the number characters `0 # ? . , %`.
+fn tokenize_section(sec: &str) -> Vec<FmtTok> {
+    let chars: Vec<char> = sec.chars().collect();
+    let mut out = vec![];
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '"' => {
+                let mut lit = String::new();
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    lit.push(chars[i]);
+                    i += 1;
+                }
+                out.push(FmtTok::Lit(lit));
+            }
+            '\\' => {
+                if let Some(n) = chars.get(i + 1) {
+                    out.push(FmtTok::Lit(n.to_string()));
+                }
+                i += 1;
+            }
+            '_' => {
+                out.push(FmtTok::Lit(" ".into()));
+                i += 1;
+            }
+            '*' => i += 1,
+            '[' => {
+                while i < chars.len() && chars[i] != ']' {
+                    i += 1;
+                }
+            }
+            '@' => out.push(FmtTok::Text),
+            '0' | '#' | '?' | '.' | ',' | '%' => out.push(FmtTok::Num(c)),
+            _ => out.push(FmtTok::Lit(c.to_string())),
+        }
+        i += 1;
+    }
+    out
+}
+
+fn format_text_section(text: &str, sec: &str) -> String {
+    tokenize_section(sec)
+        .into_iter()
+        .map(|t| match t {
+            FmtTok::Lit(s) => s,
+            FmtTok::Num(c) => c.to_string(),
+            FmtTok::Text => text.to_string(),
+        })
+        .collect()
+}
+
+/// One numeric section applied to `x`; `signed` puts a minus in front of a negative result
+/// (only a pattern's single section does: a negative section writes its own sign).
+fn format_number_section(x: f64, sec: &str, signed: bool) -> String {
+    if sec.trim().eq_ignore_ascii_case("general") {
+        return numerics::general_text(if signed { x } else { x.abs() });
+    }
+    // prefix / number pattern / suffix: the number is the first run of number characters
+    let (mut prefix, mut core, mut suffix) = (String::new(), String::new(), String::new());
+    let mut state = 0;
+    let mut pct = false;
+    for tok in tokenize_section(sec) {
+        match (tok, state) {
+            (FmtTok::Num('%'), 2) => {
+                pct = true;
+                suffix.push('%');
+            }
+            (FmtTok::Num(c), 0 | 1) => {
+                state = 1;
+                core.push(c);
+            }
+            (FmtTok::Num(c), _) => suffix.push(c),
+            (FmtTok::Lit(s), 0) => prefix.push_str(&s),
+            (FmtTok::Lit(s), _) => {
+                state = 2;
+                suffix.push_str(&s);
+            }
+            (FmtTok::Text, _) => {}
+        }
+    }
+    if !core.chars().any(|c| "0#?".contains(c)) {
+        // no digit placeholder: the section is its literal text
+        let neg = signed && x < 0.0;
+        return format!("{}{}{}{}", if neg { "-" } else { "" }, prefix, core, suffix);
+    }
+    if core.contains('%') {
+        pct = true;
+    }
+    let core: String = core.chars().filter(|c| *c != '%').collect();
+    let x = if pct { x * 100.0 } else { x };
+    // commas after the last digit placeholder divide by 1000 each ("#,##0," thousands, "0.0,,"
+    // millions); a pattern never ends with its decimal comma
+    let trimmed = core.trim_end_matches(',');
+    let mut scale = 1000f64.powi((core.len() - trimmed.len()) as i32);
+    let core = trimmed;
+    // decimal comma style: "#.##0,00" or "0,00" (the last separator is a comma followed by zeros)
+    let decimal_comma = match (core.rfind('.'), core.rfind(',')) {
+        (Some(d), Some(c)) => c > d,
+        (None, Some(c)) => {
+            let after = &core[c + 1..];
+            !after.is_empty() && after.chars().all(|ch| ch == '0')
+        }
+        _ => false,
+    };
+    let (dec_sep, grp_sep) = if decimal_comma { (',', '.') } else { ('.', ',') };
+    let (int_pat, frac_pat) = match core.split_once(dec_sep) {
+        Some((i, f)) => (i, Some(f)),
+        None => (core, None),
+    };
+    let mut int_pat = int_pat;
+    while let Some(rest) = int_pat.strip_suffix(grp_sep).filter(|_| !decimal_comma) {
+        int_pat = rest; // "#,##0,.0"
+        scale *= 1000.0;
+    }
+    let x = x / scale;
+    let grouped = int_pat.contains(grp_sep);
+    let frac_ph: Vec<char> = frac_pat.unwrap_or("").chars().filter(|c| "0#?".contains(*c)).collect();
+    let body = numerics::fixed_abs(x, frac_ph.len());
+    let (int_digits, frac_digits) = match body.split_once('.') {
+        Some((i, f)) => (i.to_string(), f.to_string()),
+        None => (body.clone(), String::new()),
+    };
+    let nonzero = body.bytes().any(|c| (b'1'..=b'9').contains(&c));
+    // integer digits: "0" placeholders are shown, "#" and "?" only when significant
+    let min_digits = int_pat.chars().filter(|c| *c == '0').count();
+    let slots = int_pat.chars().filter(|c| "0#?".contains(*c)).count();
+    let mut int_digits = if int_digits == "0" { String::new() } else { int_digits };
+    if int_digits.len() < min_digits {
+        int_digits = format!("{}{}", "0".repeat(min_digits - int_digits.len()), int_digits);
+    }
+    let mut g = String::new();
+    if grouped {
+        let digits: Vec<char> = int_digits.chars().collect();
+        for (i, ch) in digits.iter().enumerate() {
+            if i > 0 && (digits.len() - i) % 3 == 0 {
+                g.push(grp_sep);
+            }
+            g.push(*ch);
+        }
+    } else {
+        g = int_digits;
+    }
+    let lead_q = int_pat.chars().take_while(|c| *c != '0' && *c != '#').filter(|c| *c == '?').count();
+    let digit_count = g.chars().filter(|c| c.is_ascii_digit()).count();
+    if lead_q > 0 && digit_count < slots {
+        g = format!("{}{}", " ".repeat((slots - digit_count).min(lead_q)), g);
+    }
+    // fraction: trailing "#" drop an insignificant zero, trailing "?" show a space
+    let mut frac: Vec<char> = frac_digits.chars().collect();
+    let mut j = frac.len();
+    while j > 0 {
+        let ph = frac_ph[j - 1];
+        if ph == '0' || frac[j - 1] != '0' {
+            break;
+        }
+        if ph == '#' {
+            frac.remove(j - 1);
+        } else {
+            frac[j - 1] = ' ';
+        }
+        j -= 1;
+    }
+    let num = match frac_pat {
+        Some(_) => format!("{}{}{}", g, dec_sep, frac.into_iter().collect::<String>()),
+        None => g,
+    };
+    let neg = signed && x < 0.0 && nonzero;
+    let pct_s = if pct && !suffix.contains('%') { "%" } else { "" };
+    format!("{}{}{}{}{}", if neg { "-" } else { "" }, prefix, num, pct_s, suffix)
+}
+
+/// Format a value with an Excel number pattern, as TEXT() does: `0`, `0.00`, `#,##0`,
+/// `#,##0.00`, `0%`, `€#,##0.00`, `#,##0.00 "Kz"`, `#.##0,00` (decimal comma), `#,##0,` (in
+/// thousands), sections `positive;negative;zero;text` (accounting:
+/// `_(* #,##0.00_);_(* (#,##0.00);_(* "-"??_);_(@_)`), `yyyy-mm-dd`, `d mmm yyyy hh:mm`.
+/// Numbers are rounded half away from zero on their 15-digit value (TEXT(1.005,"0.00") is 1.01).
 pub fn format_text(v: &Value, fmt: &str) -> String {
     let f = fmt.trim();
     if f.is_empty() {
@@ -4002,79 +4193,29 @@ pub fn format_text(v: &Value, fmt: &str) -> String {
         }
         return v.to_display();
     }
-    let x = match to_number(v) {
-        Ok(x) => x,
-        Err(_) => return v.to_display(),
+    let sections = split_sections(f);
+    let x = match v {
+        Value::Text(s) if text_number(s).is_none() => {
+            // text: the fourth section, or a single section that places it with "@"
+            return match sections.len() {
+                4.. => format_text_section(s, &sections[3]),
+                1 if sections[0].contains('@') => format_text_section(s, &sections[0]),
+                _ => s.clone(),
+            };
+        }
+        _ => match to_number(v) {
+            Ok(x) => x,
+            Err(_) => return v.to_display(),
+        },
     };
-    // split prefix / number pattern / suffix (literals in quotes or currency symbols)
-    let is_num_char = |c: char| "0#.,%".contains(c);
-    let mut prefix = String::new();
-    let mut suffix = String::new();
-    let mut core = String::new();
-    let mut state = 0; // 0 prefix, 1 number pattern, 2 suffix
-    let mut inq = false;
-    for c in f.chars() {
-        if c == '"' {
-            inq = !inq;
-            if state == 1 {
-                state = 2;
-            }
-            continue;
-        }
-        let numeric = !inq && is_num_char(c);
-        match state {
-            0 if numeric => {
-                state = 1;
-                core.push(c);
-            }
-            0 => prefix.push(c),
-            1 if numeric => core.push(c),
-            1 => {
-                state = 2;
-                suffix.push(c);
-            }
-            _ => suffix.push(c),
-        }
+    match sections.len() {
+        1 => format_number_section(x, &sections[0], true),
+        2 if x < 0.0 => format_number_section(-x, &sections[1], false),
+        2 => format_number_section(x, &sections[0], true),
+        _ if x < 0.0 => format_number_section(-x, &sections[1], false),
+        _ if x == 0.0 => format_number_section(x, &sections[2], false),
+        _ => format_number_section(x, &sections[0], true),
     }
-    let pct = core.ends_with('%');
-    let x = if pct { x * 100.0 } else { x };
-    // decimal comma style: "#.##0,00" or "0,00" (the last separator is a comma followed by zeros)
-    let decimal_comma = match (core.rfind('.'), core.rfind(',')) {
-        (Some(d), Some(c)) => c > d,
-        (None, Some(c)) => {
-            let after = core[c + 1..].trim_end_matches('%');
-            !after.is_empty() && after.chars().all(|ch| ch == '0')
-        }
-        _ => false,
-    };
-    let (dec_sep, grp_sep, decimals, grouped) = if decimal_comma {
-        let decimals = core.rsplit(',').next().map(|d| d.chars().filter(|c| *c == '0').count()).unwrap_or(0);
-        (',', '.', decimals, core.contains('.'))
-    } else {
-        let decimals = core.split('.').nth(1).map(|d| d.chars().filter(|c| *c == '0').count()).unwrap_or(0);
-        ('.', ',', decimals, core.contains(','))
-    };
-    let body = format!("{:.*}", decimals, x.abs());
-    let (int_part, frac) = match body.split_once('.') {
-        Some((i, fr)) => (i.to_string(), Some(fr.to_string())),
-        None => (body.clone(), None),
-    };
-    let mut g = String::new();
-    if grouped {
-        let digits: Vec<char> = int_part.chars().collect();
-        for (i, ch) in digits.iter().enumerate() {
-            if i > 0 && (digits.len() - i) % 3 == 0 {
-                g.push(grp_sep);
-            }
-            g.push(*ch);
-        }
-    } else {
-        g = int_part;
-    }
-    let num = format!("{}{}", g, frac.map(|fr| format!("{}{}", dec_sep, fr)).unwrap_or_default());
-    let neg = x < 0.0 && num.chars().any(|c| c.is_ascii_digit() && c != '0');
-    let pct_s = if pct { "%" } else { "" };
-    format!("{}{}{}{}{}", if neg { "-" } else { "" }, prefix, num, pct_s, suffix)
 }
 
 

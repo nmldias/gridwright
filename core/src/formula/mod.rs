@@ -542,6 +542,37 @@ mod tests {
         std::thread::Builder::new().stack_size(size).spawn(f).unwrap().join().unwrap();
     }
 
+    /// The table of Excel results in `excel_cases.tsv`: formula · expected · source.
+    #[test]
+    fn excel_cases() {
+        let wb = book();
+        let mut failures = vec![];
+        let mut count = 0;
+        for line in include_str!("excel_cases.tsv").lines() {
+            if line.trim().is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let cols: Vec<&str> = line.split('\t').collect();
+            assert_eq!(cols.len(), 3, "formula, expected and source: {line}");
+            let (formula, expected) = (cols[0], cols[1]);
+            let want = if let Some(t) = expected.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+                Value::Text(t.replace("\"\"", "\""))
+            } else if expected == "TRUE" || expected == "FALSE" {
+                Value::Bool(expected == "TRUE")
+            } else if expected.starts_with('#') {
+                serde_json::from_value(serde_json::json!({ "e": expected })).unwrap_or_else(|_| panic!("unknown error {expected}"))
+            } else {
+                Value::Number(expected.parse().unwrap_or_else(|_| panic!("expected value {expected}")))
+            };
+            let got = ev(&wb, formula);
+            if got != want {
+                failures.push(format!("={formula}: got {got:?}, Excel {want:?} ({})", cols[2]));
+            }
+            count += 1;
+        }
+        assert!(failures.is_empty(), "{} of {count} cases differ:\n{}", failures.len(), failures.join("\n"));
+    }
+
     /// Deeply nested or very long formulas are refused or evaluated without exhausting the stack.
     #[test]
     fn nesting_and_length_limits() {
@@ -563,9 +594,10 @@ mod tests {
             assert_eq!(ev(&wb, &chain), Value::Number(20_000.0));
             let tree = parse(&chain).unwrap();
             assert_eq!(parse(&to_string(&tree)).unwrap(), tree);
-            // the engine's own printing can be far longer than the input: still re-parses
+            // large literals print in Excel's General notation (they used to be written out in
+            // full, 301 digits each) and still re-parse to the same formula
             let big = format!("{}1E300", "1E300+".repeat(500));
-            assert!(to_string(&parse(&big).unwrap()).len() > 100_000);
+            assert_eq!(to_string(&parse("1E300").unwrap()), "1E+300");
             assert_eq!(parse(&to_string(&parse(&big).unwrap())).unwrap(), parse(&big).unwrap());
             // `(1+2)+3` and `1+2+3` are one chain, so they print alike
             assert_eq!(parse("(1+2)+3").unwrap(), parse("1+2+3").unwrap());
@@ -1071,6 +1103,7 @@ mod name_coverage {
         ("DECIMAL", "DECIMAL()"),
         ("DEGREES", "DEGREES()"),
         ("DEVSQ", "DEVSQ()"),
+        ("DOLLAR", "DOLLAR()"),
         ("DROP", "DROP()"),
         ("EDATE", "EDATE()"),
         ("EFFECT", "EFFECT()"),
