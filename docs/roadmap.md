@@ -19,7 +19,7 @@ before editing.
 | 2.3 | DAYS360, YEARFRAC (bases 0/1), EDATE month-end, DATE and parsed two-digit years as Excel (pivot 1930) | #10 |
 | 2.4 | Decimal comma (`1.234,56`) as a document setting: typed/pasted input, display, filters, highlight rules, validation; strict grouping, `(1.234,00)` negative, `08.10.2026` stays a date | #11 |
 | 2.5 | Comparison at 15 significant digits: operators, criteria, lookups, CHECK, filters, validation, highlight rules | #13 |
-| 2.6 | Rounding and number text on the 15-digit decimal value: ROUND family, MROUND, CEILING/FLOOR, TEXT with sections, FIXED, DOLLAR; General format for number → text; the browser formatter checked against the engine | #PR |
+| 2.6 | Rounding and number text on the 15-digit decimal value: ROUND family, MROUND, CEILING/FLOOR, TEXT with sections, FIXED, DOLLAR; General format for number → text; the browser formatter checked against the engine | #14 |
 
 Regression suites for these: `e2e/server_gates.py`, `history_log.mjs`, `sql_readonly.mjs`, `python_sandbox.mjs`,
 `code_trust.py`, `installer_nohup.sh`, `security.py`, `engine_limits.mjs`, `import_dates.mjs`,
@@ -45,7 +45,7 @@ Baselines below were reproduced on the shipped engine at `main` `8da8d82`, e.g. 
 
 * **Implemented:** shared 15-digit decimal comparison and numeric hash keys, consistent ordering, criteria and validation bounds; filters and CHECK inherit the comparator. UNIQUE follows the same equality; pivots/COUNTUNIQUE keep display-text grouping (README limitation). Regression coverage: Rust comparison/formula/filter/validation/key tests and `e2e/numeric_equality.mjs` (4 checks). Microsoft precision and function semantics are cited by tests; exact decimal examples have not been independently executed in Excel. Highlight rules evaluated in the browser (`client/src/grid/condfmt.ts`: value comparisons, duplicates, top/bottom N) use the engine's comparison through `Book.compare_numbers` (`e2e/numeric_equality_ui.py`, 14 checks). A numeric pre-check proves most pairs unequal without formatting (sorting 20,000 amounts: 368 ms → 18 ms; `main` 14 ms); UNIQUE/XLOOKUP indexes still build a 15-digit text key per value (≈2× `main`), left for 2.8.
 
-### 2.6 Rounding and display — one Excel-numerics module — `done` (#PR)
+### 2.6 Rounding and display — one Excel-numerics module — `done` (#14)
 * **Baseline:** `=ROUND(1.005,2)` → `1` (Excel `1.01`); every ROUND result truncated to 12 decimals; TEXT rounds
   differently from ROUND; text coercion prints binary noise (the review's example `888888888.3000000715`); TEXT
   ignores `;` sections (positive;negative;zero;text), so accounting formats break.
