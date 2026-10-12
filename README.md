@@ -232,6 +232,9 @@ Measured in headless Chromium with software WebGL (SwiftShader): filling a 5 000
 
 ## Tests
 
+Working on the code (people and coding agents such as Codex or Claude Code): the rules, build and test commands are in
+[`AGENTS.md`](AGENTS.md), and the open work, in order, is [`docs/roadmap.md`](docs/roadmap.md).
+
 ```bash
 cd core && cargo test                                   # engine: 47 tests (the agent runtime kept on a cell among them) (incl. a check that every listed function resolves,
                                                         # formula resource limits, the work-day functions against a day-by-day count, Excel's DAYS360/YEARFRAC results,
