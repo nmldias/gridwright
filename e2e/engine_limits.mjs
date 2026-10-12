@@ -80,6 +80,11 @@ const CASES = [
   ['UNIQUE of 100,000 values', '=ROWS(UNIQUE(SEQUENCE(100000)))', num(100000), 'hang (compares every pair)'],
   ['UNIQUE of 200,000 values with repeats', '=ROWS(UNIQUE(MOD(SEQUENCE(200000),1000)))', num(1000), 'slow'],
   ['XLOOKUP of 100,000 values in 100,000 keys', '=SUM(XLOOKUP(SEQUENCE(100000),SEQUENCE(100000),SEQUENCE(100000)))', num(5000050000), 'hang (10 billion comparisons)'],
+  // IRR, XIRR and RATE evaluate every flow per iteration: their iterations are charged to the budget
+  ['IRR of a million flows stops at the work budget', '=IRR(SEQUENCE(1E6)-2)', err('#NUM!'), '2.7 s'],
+  ['a second one in the same formula is stopped at once', '=IRR(SEQUENCE(1E6)-2)+IRR(SEQUENCE(1E6)-2)', err('#NUM!'), '5.5 s'],
+  ['XIRR of 300,000 dated flows', '=XIRR(SEQUENCE(300000)-2,SEQUENCE(300000,1,40000))', err('#NUM!'), '2.1 s'],
+  ['IRR of 100,000 flows still works', '=IRR(SEQUENCE(100000)-2)', num(1), ''],
   ['a name defined as INDIRECT of itself', (b) => {
     const name = (n, reference) => b.apply(JSON.stringify({ type: 'set_name', name: n, reference }));
     name('Loop', 'INDIRECT("Loop")');
