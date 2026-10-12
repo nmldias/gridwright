@@ -82,15 +82,18 @@ fn compare_bounds(wb: &Workbook, table: TableId, x: f64, rule: &Validation, what
     let b = rule.values.get(1).and_then(|s| bound(wb, table, s)).unwrap_or(f64::INFINITY);
     // the message is read by a person: numbers as the workbook shows them ("1,5" with a decimal comma)
     let fmt = |v: f64| crate::model::edit_text(&crate::model::format_number(v), wb.decimal_comma);
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    let ca = formula::numerics::compare_numbers(x, a);
+    let cb = formula::numerics::compare_numbers(x, b);
     let ok = match op {
-        "between" => x >= a && x <= b,
-        "not_between" => x < a || x > b,
-        "gt" => x > a,
-        "ge" => x >= a,
-        "lt" => x < a,
-        "le" => x <= a,
-        "eq" => x == a,
-        "ne" => x != a,
+        "between" => ca != Less && cb != Greater,
+        "not_between" => ca == Less || cb == Greater,
+        "gt" => ca == Greater,
+        "ge" => ca != Less,
+        "lt" => ca == Less,
+        "le" => ca != Greater,
+        "eq" => ca == Equal,
+        "ne" => ca != Equal,
         _ => true,
     };
     if ok {
@@ -142,4 +145,20 @@ pub fn list_entries(wb: &Workbook, table: TableId, rule: &Validation) -> Vec<Str
         }
     }
     rule.values.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+}
+
+#[cfg(test)]
+mod numeric_equality_tests {
+    use super::*;
+    #[test]
+    fn numeric_bounds() {
+        // https://support.microsoft.com/en-us/excel/get-started/apply-data-validation-to-cells
+        // Boundary equality follows the 15-digit policy documented in eval.rs tests.
+        let wb = Workbook::new("test");
+        for (op, expected) in [("eq", true), ("ne", false), ("gt", false), ("ge", true),
+                               ("lt", false), ("le", true), ("between", true), ("not_between", false)] {
+            let rule = Validation { op: Some(op.into()), values: vec!["0.3".into(), "0.3".into()], ..Default::default() };
+            assert_eq!(compare_bounds(&wb, 0, 0.1 + 0.2, &rule, "value").is_ok(), expected, "{op}");
+        }
+    }
 }

@@ -236,9 +236,10 @@ Working on the code (people and coding agents such as Codex or Claude Code): the
 [`AGENTS.md`](AGENTS.md), and the open work, in order, is [`docs/roadmap.md`](docs/roadmap.md).
 
 ```bash
-cd core && cargo test                                   # engine: 47 tests (the agent runtime kept on a cell among them) (incl. a check that every listed function resolves,
+cd core && cargo test                                   # engine: 53 tests (the agent runtime kept on a cell among them) (incl. a check that every listed function resolves,
                                                         # formula resource limits, the work-day functions against a day-by-day count, Excel's DAYS360/YEARFRAC results,
-                                                        # decimal-comma input and its round trip)
+                                                        # decimal-comma input and its round trip; 15-digit comparison, criteria, lookups, filters and validation)
+node e2e/numeric_equality.mjs server/engine             # 4 checks: decimal reconciliation, comparison, SUMIF, indexed XLOOKUP
 node e2e/engine_limits.mjs server/engine                # the shipped wasm engine, 61 cases (one process each, 20 s limit): 44 formulas that used to
                                                         # crash, hang or exhaust memory return an error quickly; volatile functions; Excel's day counts
 node e2e/import_dates.mjs server/dist                   # dates read by the guided import, incl. Excel's two-digit-year pivot (18 checks)
@@ -348,6 +349,8 @@ bash e2e/installer_nohup.sh                             # the installer without 
 CI (`.github/workflows/ci.yml`) runs all of this on every push against PostgreSQL, MariaDB and SQL Server containers plus a second server with identity on, with bubblewrap and the AppArmor profile installed so the real sandbox is the one exercised, a fail-closed check (a `bwrap` that cannot start must leave the runtime off), and command-line checks of the MCP endpoint and the SQL policy; it publishes the prebuilt tree to the `release` branch and a multi-arch image to GHCR.
 
 ## Limitations (honest list)
+
+- Numeric comparisons, criteria, lookup matches, filter comparisons and validation bounds compare at 15 significant digits; arithmetic and stored inputs remain binary doubles. UNIQUE uses the same numeric equality for consistent hash grouping. Pivots and COUNTUNIQUE retain their existing display-text grouping (including its type conflation); selected-value filters still match display text. Full Excel rounding and General-format parity remain roadmap item 2.6. Microsoft documents 15-digit precision, but these decimal regression cases have not been independently run in Excel.
 
 - Formulas are bounded so that none can crash or hang the engine: text up to Excel's 32,767 characters, dates from 1900 to 31 Dec 9999, arrays generated from size arguments (`SEQUENCE`, `EXPAND`, `WRAPROWS`/`WRAPCOLS`) up to one million cells, arrays read from ranges or computed element-wise up to ten million, 64 nested function calls (Excel's limit) and 256 levels of brackets, and roughly a second of work per evaluation. Past a limit the formula returns `#NUM!` (sizes, dates, work) or `#VALUE!` (text), and `IFERROR` cannot turn a stopped evaluation into a value. `XLOOKUP` matches exactly, first to last: its `match_mode` and `search_mode` arguments are not implemented yet.
 - Volatile functions — the clock (`TODAY`, `NOW`, and `FX`, `FXRATE`, `AGEING`, `AGE_BUCKET`, which default to today), `RAND`/`RANDBETWEEN`, and references computed while evaluating (`INDIRECT`, `OFFSET`), directly or through a name — are re-evaluated after every recalculation and when a workbook is opened, as in Excel; only a changed result is shown again or re-runs code cells. `TODAY()` and `NOW()` use the local time of the computer showing the workbook (of the server for headless runs), as in Excel.

@@ -1205,3 +1205,19 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod numeric_equality_tests {
+    use super::*;
+    #[test]
+    fn numeric_filters() {
+        // https://support.microsoft.com/en-au/excel/filter-data-in-a-workbook-in-the-browser
+        // Numeric boundaries use the 15-digit policy cited by eval.rs tests.
+        let mut t = Table::new(1, "test", 0.0, 0.0, 1, 1);
+        t.cells.insert(CellKey::new(0, 0), Cell { value: Value::Number(0.1 + 0.2), ..Default::default() });
+        for (op, expected) in [("eq", true), ("ne", false), ("gt", false), ("ge", true), ("lt", false), ("le", true)] {
+            let f = ColumnFilter { col: 0, values: None, op: Some(op.into()), value: Some("0.3".into()) };
+            assert_eq!(filter_keeps(&t, &f, 0), expected, "{op}");
+        }
+    }
+}

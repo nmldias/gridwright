@@ -2,6 +2,7 @@
 
 pub mod eval;
 pub mod lexer;
+pub mod numerics;
 pub mod parser;
 
 pub use eval::{collect_deps, eval, resolve_ref, Arg, Array, Ctx};
