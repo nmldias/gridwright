@@ -7,7 +7,7 @@ before and passes after, and is merged through CI (see [`AGENTS.md`](../AGENTS.m
 Status: `todo` · `partial` · `done` (merged; PR noted). Line numbers are from `a1f0a62`: locate the code again
 before editing.
 
-**Next item: 2.5.** Then the rest of Phase 2 in order, then Phase 3.
+**Next item: 2.6.** Then the rest of Phase 2 in order, then Phase 3.
 
 ## Done
 
@@ -28,7 +28,7 @@ Regression suites for these: `e2e/server_gates.py`, `history_log.mjs`, `sql_read
 Baselines below were reproduced on the shipped engine at `main` `8da8d82`, e.g. with
 `node -e` + `Book.eval_at` from `server/engine/gridwright_core.js` (see `e2e/decimal_comma.mjs` for the pattern).
 
-### 2.5 Exact equality breaks reconciliation checks — `todo`
+### 2.5 Exact equality breaks reconciliation checks — `done` (this branch; pending merge)
 * **Baseline:** `=0.1+0.2=0.3` → `FALSE`; `=SUMIF({0.3,0.1},0.1+0.2)` → `0`. So `CHECK(SUM(…)=Total)` fails on
   ordinary decimal amounts. Excel compares at 15 significant digits (`TRUE`, `0.3`).
 * **Where:** comparison operators in `core/src/formula/eval.rs` (`=`, `<>`, `<`, `<=`, `>`, `>=`); criteria
@@ -40,6 +40,8 @@ Baselines below were reproduced on the shipped engine at `main` `8da8d82`, e.g. 
   per function before changing it.
 * **Acceptance:** Rust unit tests for the helper and each site; a reconciliation case (`CHECK(SUM(A1:A3)=B1)` with
   decimal amounts) in an e2e engine suite; README *Limitations* updated if anything stays different from Excel.
+
+* **Implemented:** shared 15-digit decimal comparison and numeric hash keys, consistent ordering, criteria and validation bounds; filters and CHECK inherit the comparator. UNIQUE follows the same equality; pivots/COUNTUNIQUE keep display-text grouping (README limitation). Regression coverage: Rust comparison/formula/filter/validation/key tests and `e2e/numeric_equality.mjs` (4 checks). Microsoft precision and function semantics are cited by tests; exact decimal examples have not been independently executed in Excel.
 
 ### 2.6 Rounding and display — one Excel-numerics module — `todo`
 * **Baseline:** `=ROUND(1.005,2)` → `1` (Excel `1.01`); every ROUND result truncated to 12 decimals; TEXT rounds

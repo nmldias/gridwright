@@ -28,7 +28,7 @@ The README's *Architecture* and *Tests* sections have more detail; keep them tru
 
 ```bash
 rustup target add wasm32-unknown-unknown          # Rust stable; wasm-pack: cargo install wasm-pack (or scripts/build.sh)
-cargo test --manifest-path core/Cargo.toml        # Rust unit tests (in #[cfg(test)] modules of core/src; none in eval.rs yet)
+cargo test --manifest-path core/Cargo.toml        # Rust unit tests (in #[cfg(test)] modules of core/src, including eval.rs)
 cd core
 wasm-pack build --release --target web    --out-dir ../client/src/engine/pkg --out-name gridwright_core
 wasm-pack build --release --target nodejs --out-dir ../server/engine      --out-name gridwright_core

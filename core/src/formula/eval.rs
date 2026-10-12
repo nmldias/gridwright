@@ -4,6 +4,7 @@
 //! lifted over arrays element-wise (so `=ROUND(A1:A5, 1)` yields an array that
 //! spills), aggregates consume whole arrays, and a few functions are lazy.
 
+use super::numerics::{compare_numbers, number_key};
 use super::parser::{BinOp, Expr, RefExpr, RefKind};
 use crate::model::{CellKey, ErrorKind, Rect, TableId, Value, Workbook};
 
@@ -488,9 +489,9 @@ fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
         }
     }
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => x.partial_cmp(y).unwrap_or(Equal),
-        (Value::Empty, Value::Number(y)) => 0.0f64.partial_cmp(y).unwrap_or(Equal),
-        (Value::Number(x), Value::Empty) => x.partial_cmp(&0.0).unwrap_or(Equal),
+        (Value::Number(x), Value::Number(y)) => compare_numbers(*x, *y),
+        (Value::Empty, Value::Number(y)) => compare_numbers(0.0, *y),
+        (Value::Number(x), Value::Empty) => compare_numbers(*x, 0.0),
         (Value::Empty, Value::Empty) => Equal,
         (Value::Text(x), Value::Text(y)) => x.to_lowercase().cmp(&y.to_lowercase()),
         (Value::Empty, Value::Text(y)) => "".cmp(y.to_lowercase().as_str()),
@@ -512,7 +513,7 @@ fn same_type(a: &Value, b: &Value) -> bool {
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum ValueKey {
     Empty,
-    Number(u64),
+    Number(String),
     Text(String),
     Bool(bool),
     Error,
@@ -521,7 +522,7 @@ fn value_key(v: &Value) -> Option<ValueKey> {
     Some(match v {
         Value::Empty => ValueKey::Empty,
         Value::Number(x) if x.is_nan() => return None,
-        Value::Number(x) => ValueKey::Number(if *x == 0.0 { 0.0f64.to_bits() } else { x.to_bits() }),
+        Value::Number(x) => ValueKey::Number(number_key(*x)),
         Value::Text(s) => ValueKey::Text(s.to_lowercase()),
         Value::Bool(b) => ValueKey::Bool(*b),
         Value::Error(_) => ValueKey::Error,
@@ -819,7 +820,7 @@ fn matches_criteria(v: &Value, c: &Criteria) -> bool {
                 }
                 _ => return c.op == "<>",
             };
-            let ord = x.partial_cmp(&target).unwrap_or(Equal);
+            let ord = compare_numbers(x, target);
             match c.op.as_str() {
                 "=" => ord == Equal,
                 "<>" => ord != Equal,
@@ -4441,4 +4442,67 @@ fn pseudo_random() -> f64 {
         s.set(x);
         (x >> 11) as f64 / (1u64 << 53) as f64
     })
+}
+
+#[cfg(test)]
+mod numeric_equality_tests {
+    use super::*;
+    // Numeric expectations apply the requested 15-significant-digit policy, based on:
+    // https://learn.microsoft.com/en-us/office/troubleshoot/excel/floating-point-arithmetic-inaccurate-result
+    // Microsoft documents precision, not these exact decimal examples; these are policy regressions.
+    #[test]
+    fn numeric_comparison_precision() {
+        for (a, b) in [(0.1 + 0.2, 0.3), (-0.1 - 0.2, -0.3), (1.234567890123451, 1.234567890123452),
+                       (1e100 + 2e100, 3e100), (1e-100 + 2e-100, 3e-100), (-0.0, 0.0)] {
+            assert_eq!(compare_values(&Value::Number(a), &Value::Number(b)), std::cmp::Ordering::Equal, "{a}, {b}");
+        }
+        for (a, b) in [(0.0, 1e-300), (0.3, 0.300000000000001), (1e-300, 2e-300), (f64::MAX / 2.0, f64::MAX)] {
+            assert_eq!(compare_values(&Value::Number(a), &Value::Number(b)), std::cmp::Ordering::Less);
+        }
+    }
+    #[test]
+    fn numeric_hash_keys_agree() {
+        // Internal consistency: UNIQUE's indexed grouping follows comparison equality.
+        let a = Value::Number(0.1 + 0.2);
+        let b = Value::Number(0.3);
+        assert!(value_key(&a) == value_key(&b));
+        let wb = Workbook::new("test");
+        assert_eq!(crate::formula::evaluate(&wb, 0, None, "ROWS(UNIQUE({0.1+0.2;0.3}))"), Value::Number(1.0));
+    }
+    #[test]
+    fn numeric_formula_sites() {
+        let wb = Workbook::new("test");
+        // Operators and CHECK (Gridwright extension) use the precision policy cited above.
+        let cases = [
+            ("0.1+0.2=0.3", Value::Bool(true)),
+            ("0.1+0.2<>0.3", Value::Bool(false)),
+            ("0.1+0.2>0.3", Value::Bool(false)),
+            ("0.3<0.1+0.2", Value::Bool(false)),
+            ("0.1+0.2<=0.3", Value::Bool(true)),
+            ("0.3>=0.1+0.2", Value::Bool(true)),
+            ("CHECK(0.1+0.2=0.3)", Value::Bool(true)),
+            // Matching semantics: https://support.microsoft.com/en-us/excel/functions/sumif-function
+            ("SUMIF({0.3,0.1},0.1+0.2)", Value::Number(0.3)),
+            // https://support.microsoft.com/en-us/excel/excel-functions-by-category (criteria families).
+            ("COUNTIF({0.3,0.1},0.1+0.2)", Value::Number(1.0)),
+            // https://support.microsoft.com/en-us/excel/functions/averageif-function
+            ("AVERAGEIF({0.3,0.1},0.1+0.2)", Value::Number(0.3)),
+            // https://support.microsoft.com/en-us/excel/excel-functions-by-category
+            ("SUMIFS({3,1},{0.3,0.1},0.1+0.2)", Value::Number(3.0)),
+            ("COUNTIFS({0.3,0.1},0.1+0.2)", Value::Number(1.0)),
+            ("AVERAGEIFS({3,1},{0.3,0.1},0.1+0.2)", Value::Number(3.0)),
+            // https://support.microsoft.com/en-us/excel/excel-functions-by-category
+            ("MAXIFS({3,1},{0.3,0.1},0.1+0.2)", Value::Number(3.0)),
+            ("MINIFS({3,1},{0.3,0.1},0.1+0.2)", Value::Number(3.0)),
+            // https://support.microsoft.com/en-us/excel/look-up-values-with-vlookup-index-or-match
+            ("MATCH(0.1+0.2,{0.3,0.1},0)", Value::Number(1.0)),
+            ("VLOOKUP(0.1+0.2,{0.3,7;0.1,8},2,FALSE)", Value::Number(7.0)),
+            ("HLOOKUP(0.1+0.2,{0.3,0.1;7,8},2,FALSE)", Value::Number(7.0)),
+            // https://techcommunity.microsoft.com/blog/excelblog/announcing-xlookup/811376
+            ("XLOOKUP(0.1+0.2,{0.3,0.1},{7,8})", Value::Number(7.0)),
+        ];
+        for (src, expected) in cases {
+            assert_eq!(crate::formula::evaluate(&wb, 0, None, src), expected, "{src}");
+        }
+    }
 }
