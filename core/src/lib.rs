@@ -227,6 +227,16 @@ impl Book {
         }
     }
 
+    /// Two numbers compared as formulas compare them (15 significant digits): -1, 0 or 1.
+    /// Lets the client's highlight rules agree with the engine.
+    pub fn compare_numbers(a: f64, b: f64) -> i32 {
+        match formula::numerics::compare_numbers(a, b) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        }
+    }
+
     /// Evaluate a formula body for a specific cell position (conditional-format formulas); JSON value.
     pub fn eval_at(&self, table: u32, row: u32, col: u32, formula: &str) -> String {
         js(&formula::evaluate(&self.engine.wb, table, Some(model::CellKey::new(row, col)), formula::formula_body(formula)))
