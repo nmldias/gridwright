@@ -51,6 +51,14 @@ function textOf(v: CellValue): string {
   if ('b' in v) return v.b ? 'TRUE' : 'FALSE';
   return v.e;
 }
+// "Duplicate values" groups numbers at 15 significant digits, as formulas compare them, so
+// 0.1+0.2 and 0.3 are duplicates; otherwise as before (text ignoring case, numbers as their text).
+// toPrecision can differ from the engine only on exact ties in the 16th digit (16-digit integers
+// ending in 5), which is immaterial for a highlight.
+function duplicateKey(v: CellValue): string {
+  if (v && 'n' in v && Number.isFinite(v.n)) return String(Number(v.n.toPrecision(15)));
+  return textOf(v).toLowerCase();
+}
 
 function stats(meta: TableMeta, cellMap: Map<number, CellView> | undefined, idx: number, rule: CondFormat, version: number): RuleStats {
   if (version !== cacheVersion) {
@@ -73,7 +81,7 @@ function stats(meta: TableMeta, cellMap: Map<number, CellView> | undefined, idx:
         const n = numberOf(cell.v);
         if (n !== null) nums.push(n);
         if (rule.kind === 'duplicate') {
-          const t = textOf(cell.v).toLowerCase();
+          const t = duplicateKey(cell.v);
           counts.set(t, (counts.get(t) ?? 0) + 1);
         }
       }
@@ -102,24 +110,28 @@ function toHex(rgb: [number, number, number]): string {
   return '#' + rgb.map((x) => Math.round(Math.max(0, Math.min(255, x))).toString(16).padStart(2, '0')).join('');
 }
 
+// compared as formulas compare (15 significant digits), so 0.1+0.2 is "equal to 0.3"
 function cmpNumber(x: number, op: string, a: number, b: number): boolean {
+  if (Number.isNaN(x)) return false;
+  const lo = Math.min(a, b);
+  const hi = Math.max(a, b);
   switch (op) {
     case 'gt':
-      return x > a;
+      return book.compareNumbers(x, a) > 0;
     case 'ge':
-      return x >= a;
+      return book.compareNumbers(x, a) >= 0;
     case 'lt':
-      return x < a;
+      return book.compareNumbers(x, a) < 0;
     case 'le':
-      return x <= a;
+      return book.compareNumbers(x, a) <= 0;
     case 'eq':
-      return x === a;
+      return book.compareNumbers(x, a) === 0;
     case 'ne':
-      return x !== a;
+      return book.compareNumbers(x, a) !== 0;
     case 'between':
-      return x >= Math.min(a, b) && x <= Math.max(a, b);
+      return book.compareNumbers(x, lo) >= 0 && book.compareNumbers(x, hi) <= 0;
     case 'not_between':
-      return x < Math.min(a, b) || x > Math.max(a, b);
+      return book.compareNumbers(x, lo) < 0 || book.compareNumbers(x, hi) > 0;
     default:
       return false;
   }
@@ -174,7 +186,7 @@ export function condStyle(meta: TableMeta, cellMap: Map<number, CellView> | unde
       case 'duplicate': {
         if (v === null) break;
         const s = stats(meta, cellMap, idx, rule, version);
-        matched = (s.counts.get(textOf(v).toLowerCase()) ?? 0) > 1;
+        matched = (s.counts.get(duplicateKey(v)) ?? 0) > 1;
         break;
       }
       case 'top':
@@ -182,7 +194,9 @@ export function condStyle(meta: TableMeta, cellMap: Map<number, CellView> | unde
         const n = numberOf(v);
         if (n === null) break;
         const s = stats(meta, cellMap, idx, rule, version);
-        matched = rule.kind === 'top' ? s.topThreshold !== null && n >= s.topThreshold : s.bottomThreshold !== null && n <= s.bottomThreshold;
+        matched = rule.kind === 'top'
+          ? s.topThreshold !== null && book.compareNumbers(n, s.topThreshold) >= 0
+          : s.bottomThreshold !== null && book.compareNumbers(n, s.bottomThreshold) <= 0;
         break;
       }
       case 'color_scale': {

@@ -236,7 +236,7 @@ Working on the code (people and coding agents such as Codex or Claude Code): the
 [`AGENTS.md`](AGENTS.md), and the open work, in order, is [`docs/roadmap.md`](docs/roadmap.md).
 
 ```bash
-cd core && cargo test                                   # engine: 53 tests (the agent runtime kept on a cell among them) (incl. a check that every listed function resolves,
+cd core && cargo test                                   # engine: 54 tests (the agent runtime kept on a cell among them) (incl. a check that every listed function resolves,
                                                         # formula resource limits, the work-day functions against a day-by-day count, Excel's DAYS360/YEARFRAC results,
                                                         # decimal-comma input and its round trip; 15-digit comparison, criteria, lookups, filters and validation)
 node e2e/numeric_equality.mjs server/engine             # 4 checks: decimal reconciliation, comparison, SUMIF, indexed XLOOKUP
@@ -249,6 +249,8 @@ node e2e/decimal_comma.mjs server/engine                # a decimal-comma workbo
 python3 e2e/decimal_comma_ui.py --port 8807             # the same in the browser: typed, edited, formula bar, pasted, formats, status bar,
                                                         # chart labels, switched, undone, saved, opened in an English browser, switched live for a second editor,
                                                         # column filters, highlight rules and validation typed the comma way (39 checks)
+python3 e2e/numeric_equality_ui.py --port 8808          # highlight rules compare as formulas do: =0.1+0.2 is "equal to 0.3",
+                                                        # a duplicate of 0.3 and ties with it in top/bottom N (14 checks)
 python3 e2e/smoke.py http://localhost:8787 --python     # editing, handles, code cells, save/open (22 checks)
 node e2e/mock-llm.mjs &                                 # mock model for the assistant (also plays a tool round)
 python3 e2e/features.py http://localhost:8787 --pg host:port:db:user:pass --mock-llm http://127.0.0.1:8899/v1
@@ -350,7 +352,7 @@ CI (`.github/workflows/ci.yml`) runs all of this on every push against PostgreSQ
 
 ## Limitations (honest list)
 
-- Numeric comparisons, criteria, lookup matches, filter comparisons and validation bounds compare at 15 significant digits; arithmetic and stored inputs remain binary doubles. UNIQUE uses the same numeric equality for consistent hash grouping. Pivots and COUNTUNIQUE retain their existing display-text grouping (including its type conflation); selected-value filters still match display text. Full Excel rounding and General-format parity remain roadmap item 2.6. Microsoft documents 15-digit precision, but these decimal regression cases have not been independently run in Excel.
+- Numeric comparisons, criteria, lookup matches, filter comparisons, validation bounds and highlight rules (value comparisons, duplicates, top/bottom N) compare at 15 significant digits; arithmetic and stored inputs remain binary doubles. UNIQUE uses the same numeric equality for consistent hash grouping. Pivots and COUNTUNIQUE retain their existing display-text grouping (including its type conflation); selected-value filters still match display text. Full Excel rounding and General-format parity remain roadmap item 2.6. Microsoft documents 15-digit precision, but these decimal regression cases have not been independently run in Excel.
 
 - Formulas are bounded so that none can crash or hang the engine: text up to Excel's 32,767 characters, dates from 1900 to 31 Dec 9999, arrays generated from size arguments (`SEQUENCE`, `EXPAND`, `WRAPROWS`/`WRAPCOLS`) up to one million cells, arrays read from ranges or computed element-wise up to ten million, 64 nested function calls (Excel's limit) and 256 levels of brackets, and roughly a second of work per evaluation. Past a limit the formula returns `#NUM!` (sizes, dates, work) or `#VALUE!` (text), and `IFERROR` cannot turn a stopped evaluation into a value. `XLOOKUP` matches exactly, first to last: its `match_mode` and `search_mode` arguments are not implemented yet.
 - Volatile functions — the clock (`TODAY`, `NOW`, and `FX`, `FXRATE`, `AGEING`, `AGE_BUCKET`, which default to today), `RAND`/`RANDBETWEEN`, and references computed while evaluating (`INDIRECT`, `OFFSET`), directly or through a name — are re-evaluated after every recalculation and when a workbook is opened, as in Excel; only a changed result is shown again or re-runs code cells. `TODAY()` and `NOW()` use the local time of the computer showing the workbook (of the server for headless runs), as in Excel.

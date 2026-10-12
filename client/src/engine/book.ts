@@ -331,6 +331,14 @@ export function formatWithEngine(n: number, pattern: string): string {
 export function parseNumber(text: string): number {
   return Book.parse_number(text);
 }
+/** Order of two numbers as formulas compare them (15 significant digits): -1, 0 or 1, so
+ *  0.1+0.2 equals 0.3. Pairs further apart than any rounding can bridge are ordered here
+ *  without calling the engine (the same pre-check as core/src/formula/numerics.rs). */
+export function compareNumbers(a: number, b: number): number {
+  if (a === b) return 0;
+  if (Math.abs(a - b) > Math.max(Math.abs(a), Math.abs(b)) * 2e-14) return a < b ? -1 : 1;
+  return Book.compare_numbers(a, b);
+}
 
 export function trace(table: TableId, row: number, col: number): Trace {
   return JSON.parse(getBook().trace(table, row, col));
