@@ -1,5 +1,6 @@
 //! Operations, recalculation and undo/redo on top of the model.
 
+use crate::depindex::{CellSet, DepIndex};
 use crate::formula::{self, Arg};
 use crate::model::*;
 use serde::{Deserialize, Serialize};
@@ -455,6 +456,56 @@ pub struct Engine {
     pub wb: Workbook,
     undo: Vec<Inverse>,
     redo: Vec<Inverse>,
+    /// What recalculation needs to know about the cells without scanning them all on every edit
+    /// (see `track` and `resync`).
+    tracked: Tracked,
+}
+
+/// Recalculation state derived from the cells, kept in step with them: on a cell edit for the
+/// cells the operation changed (`Engine::track`), after any other operation by a full pass
+/// (`Engine::resync`). Unit tests check it against a full pass after every operation.
+#[derive(Default)]
+struct Tracked {
+    /// The formulas reading each cell: the formula cells' `deps` the other way round.
+    index: DepIndex,
+    /// Formulas using a volatile function.
+    volatile: HashSet<CellRef>,
+    /// Formulas showing #SPILL!: a blocking cell may have gone, so they get another chance when
+    /// a cell of their table changes.
+    blocked: HashSet<CellRef>,
+    /// Code cells that recorded what they read (`code_deps`).
+    code: HashSet<CellRef>,
+    /// Cells holding spilled output (`spill_from`) → the cell they spilled from.
+    spilled: HashMap<CellRef, CellRef>,
+    /// The other way round: cell → the cells holding its spilled output.
+    spills: HashMap<CellRef, HashSet<CellRef>>,
+}
+
+impl Tracked {
+    /// Record that `cell` holds output spilled from `origin` (None: that it holds none).
+    fn set_spilled(&mut self, cell: CellRef, origin: Option<CellRef>) {
+        if self.spilled.get(&cell).copied() == origin {
+            return;
+        }
+        if let Some(old) = self.spilled.remove(&cell) {
+            if let Some(set) = self.spills.get_mut(&old) {
+                set.remove(&cell);
+                if set.is_empty() {
+                    self.spills.remove(&old);
+                }
+            }
+        }
+        if let Some(o) = origin {
+            self.spilled.insert(cell, o);
+            self.spills.entry(o).or_default().insert(cell);
+        }
+    }
+    /// The cells holding output spilled from `origin`, in order.
+    fn spill_of(&self, origin: CellRef) -> Vec<CellRef> {
+        let mut out: Vec<CellRef> = self.spills.get(&origin).map(|s| s.iter().copied().collect()).unwrap_or_default();
+        out.sort();
+        out
+    }
 }
 
 const MAX_UNDO: usize = 200;
@@ -468,6 +519,7 @@ impl Engine {
             wb,
             undo: vec![],
             redo: vec![],
+            tracked: Tracked::default(),
         };
         for t in e.wb.tables.iter_mut() {
             t.normalise_geometry();
@@ -630,7 +682,7 @@ impl Engine {
 
     pub fn apply(&mut self, op: Op) -> Changes {
         let mut changes = Changes::default();
-        let result = self.apply_inner(op, &mut changes);
+        let result = self.apply_tracked(op, &mut changes);
         match result {
             Ok(inv) => {
                 if let Some(inv) = inv {
@@ -663,7 +715,7 @@ impl Engine {
             _ => None,
         };
         let mut changes = Changes::default();
-        let result = self.apply_inner(op, &mut changes);
+        let result = self.apply_tracked(op, &mut changes);
         match result {
             Ok(_) => {
                 if let Some((table, is_rows, at, count)) = transform {
@@ -788,6 +840,31 @@ impl Engine {
         if entry.is_blank() {
             t.cells.remove(&key);
         }
+    }
+
+    /// `apply_inner`, keeping the tracked recalculation state in step. Cell edits update it for
+    /// the cells they change (`recalc_from`); any other operation may change formulas anywhere
+    /// (structure, names, tables) and rebuilds it.
+    fn apply_tracked(&mut self, op: Op, ch: &mut Changes) -> Result<Option<Inverse>, String> {
+        let incremental = matches!(
+            op,
+            Op::SetCell { .. }
+                | Op::SetCells { .. }
+                | Op::ClearRange { .. }
+                | Op::CodeResult { .. }
+                | Op::RestoreCells { .. }
+                | Op::SetFormat { .. }
+                | Op::MoveTable { .. }
+                | Op::SetColWidth { .. }
+                | Op::SetRowHeight { .. }
+        );
+        let result = self.apply_inner(op, ch);
+        if !incremental {
+            self.resync();
+        }
+        #[cfg(test)]
+        self.check_tracked();
+        result
     }
 
     fn apply_inner(&mut self, op: Op, ch: &mut Changes) -> Result<Option<Inverse>, String> {
@@ -1098,7 +1175,7 @@ impl Engine {
                 let snapshot = t.clone();
                 let others = self.snapshot_other_tables(table);
                 let t = self.wb.table_mut(table).unwrap();
-                let mut moved = HashMap::new();
+                let mut moved = CellMap::default();
                 for (k, c) in t.cells.drain() {
                     let (mut k2, mut c2) = (k, c);
                     if is_rows && k.row >= at {
@@ -1165,7 +1242,7 @@ impl Engine {
                 let snapshot = t.clone();
                 let others = self.snapshot_other_tables(table);
                 let t = self.wb.table_mut(table).unwrap();
-                let mut moved = HashMap::new();
+                let mut moved = CellMap::default();
                 for (k, c) in t.cells.drain() {
                     let idx = if is_rows { k.row } else { k.col };
                     if idx >= at && idx < at + count {
@@ -1676,6 +1753,7 @@ impl Engine {
                                     ..Default::default()
                                 },
                             );
+                            self.tracked.set_spilled(CellRef::new(table, key.row, key.col), Some(origin));
                             changed.push(CellRef::new(table, key.row, key.col));
                         }
                     }
@@ -1730,11 +1808,9 @@ impl Engine {
     }
 
     fn snapshot_spill(&self, origin: CellRef, prev: &mut Vec<(CellRef, Option<Cell>)>) {
-        if let Some(t) = self.wb.table(origin.table) {
-            for (k, c) in &t.cells {
-                if c.spill_from == Some(origin.key()) {
-                    prev.push((CellRef::new(origin.table, k.row, k.col), Some(c.clone())));
-                }
+        for r in self.tracked.spill_of(origin) {
+            if let Some(c) = self.wb.cell(r) {
+                prev.push((r, Some(c.clone())));
             }
         }
     }
@@ -1742,14 +1818,12 @@ impl Engine {
     /// Remove cells spilled from `origin`; returns their refs.
     fn clear_spill(&mut self, origin: CellRef) -> Vec<CellRef> {
         let mut out = vec![];
+        let cells = self.tracked.spill_of(origin);
+        for r in &cells {
+            self.tracked.set_spilled(*r, None);
+        }
         if let Some(t) = self.wb.table_mut(origin.table) {
-            let keys: Vec<CellKey> = t
-                .cells
-                .iter()
-                .filter(|(_, c)| c.spill_from == Some(origin.key()))
-                .map(|(k, _)| *k)
-                .collect();
-            for k in keys {
+            for k in cells.iter().map(|r| r.key()) {
                 let keep_format = t.cells.get(&k).map(|c| c.format.clone()).unwrap_or_default();
                 if keep_format.is_default() {
                     t.cells.remove(&k);
@@ -1803,6 +1877,8 @@ impl Engine {
 
     fn restore(&mut self, inv: Inverse) -> (Inverse, Changes) {
         let mut ch = Changes::default();
+        // restoring cells updates the tracked state for them (`recalc_from`); anything else rebuilds it
+        let incremental = matches!(inv, Inverse::Cells(_) | Inverse::Charts(_));
         let (counter, op) = match inv {
             Inverse::Cells(cells) => self.restore_cells(cells, &mut ch),
             Inverse::Tables(tables) => self.restore_tables(tables, &mut ch),
@@ -1819,6 +1895,11 @@ impl Engine {
                 (counter, Op::SetDecimalComma { on })
             }
         };
+        if !incremental {
+            self.resync();
+        }
+        #[cfg(test)]
+        self.check_tracked();
         ch.ops.push(op);
         (counter, ch)
     }
@@ -1930,18 +2011,16 @@ impl Engine {
     // recalculation
     // ------------------------------------------------------------------
 
-    /// Make sure every formula cell has up-to-date dependency rectangles.
-    fn refresh_deps(&mut self, all: bool) {
+    /// Analyse the formula cells among `cells` whose dependency rectangles are out of date (all
+    /// of them when `all`).
+    fn analyse(&mut self, cells: &[CellRef], all: bool) {
         let mut todo: Vec<(CellRef, String)> = vec![];
-        for t in &self.wb.tables {
-            for (k, c) in &t.cells {
+        for r in cells {
+            if let Some(c) = self.wb.cell(*r) {
                 if c.kind == CellKind::Formula && (all || !c.deps_valid) {
-                    todo.push((CellRef::new(t.id, k.row, k.col), c.input.clone()));
+                    todo.push((*r, c.input.clone()));
                 }
             }
-        }
-        if todo.is_empty() {
-            return;
         }
         let computed: Vec<(CellRef, (Vec<Rect>, bool))> = todo
             .iter()
@@ -1957,16 +2036,83 @@ impl Engine {
             }
         }
     }
-    /// Formula cells using a volatile function (see `formula::VOLATILE_FUNCTIONS`).
-    fn volatile_cells(&self) -> Vec<CellRef> {
-        let mut out = vec![];
-        for t in &self.wb.tables {
-            for (k, c) in &t.cells {
-                if c.kind == CellKind::Formula && c.volatile {
-                    out.push(CellRef::new(t.id, k.row, k.col));
+    /// Bring the tracked state of `r` in step with the cell.
+    fn track(&mut self, r: CellRef) {
+        let tr = &mut self.tracked;
+        match self.wb.cell(r) {
+            Some(c) if c.kind == CellKind::Formula => {
+                if tr.index.deps(&r) != Some(&c.deps) {
+                    tr.index.set(r, c.deps.clone());
+                }
+                if c.volatile {
+                    tr.volatile.insert(r);
+                } else {
+                    tr.volatile.remove(&r);
+                }
+                if c.value == Value::Error(ErrorKind::Spill) {
+                    tr.blocked.insert(r);
+                } else {
+                    tr.blocked.remove(&r);
                 }
             }
+            _ => {
+                tr.index.remove(r);
+                tr.volatile.remove(&r);
+                tr.blocked.remove(&r);
+            }
         }
+        match self.wb.cell(r) {
+            Some(c) if c.is_code() && !c.code_deps.is_empty() => tr.code.insert(r),
+            _ => tr.code.remove(&r),
+        };
+        let origin = self.wb.cell(r).and_then(|c| c.spill_from).map(|k| CellRef::new(r.table, k.row, k.col));
+        tr.set_spilled(r, origin);
+    }
+    /// Every cell of the workbook, in the order the tracked state is rebuilt in.
+    fn all_cells(&self) -> Vec<CellRef> {
+        let mut out = vec![];
+        for t in &self.wb.tables {
+            for k in t.cells.keys() {
+                out.push(CellRef::new(t.id, k.row, k.col));
+            }
+        }
+        out
+    }
+    /// Analyse the out-of-date formulas and rebuild the tracked state with a pass over every cell.
+    fn resync(&mut self) {
+        let cells = self.all_cells();
+        self.analyse(&cells, false);
+        self.tracked = Tracked::default();
+        for r in cells {
+            self.track(r);
+        }
+    }
+    /// The tracked state rebuilt from scratch equals the one kept up to date (unit tests).
+    #[cfg(test)]
+    fn check_tracked(&self) {
+        let mut fresh = Engine {
+            wb: self.wb.clone(),
+            undo: vec![],
+            redo: vec![],
+            tracked: Tracked::default(),
+        };
+        fresh.resync();
+        let (a, b) = (&self.tracked, &fresh.tracked);
+        let mut have: Vec<_> = a.index.formulas().map(|r| (*r, a.index.deps(r).cloned())).collect();
+        let mut want: Vec<_> = b.index.formulas().map(|r| (*r, b.index.deps(r).cloned())).collect();
+        have.sort_by_key(|x| x.0);
+        want.sort_by_key(|x| x.0);
+        assert_eq!(have, want, "dependency index");
+        assert_eq!(a.volatile, b.volatile, "volatile formulas");
+        assert_eq!(a.blocked, b.blocked, "blocked spills");
+        assert_eq!(a.code, b.code, "code cells with dependencies");
+        assert_eq!(a.spilled, b.spilled, "spilled cells");
+        assert_eq!(a.spills, b.spills, "spill areas");
+    }
+    /// Formula cells using a volatile function (see `formula::VOLATILE_FUNCTIONS`).
+    fn volatile_cells(&self) -> Vec<CellRef> {
+        let mut out: Vec<CellRef> = self.tracked.volatile.iter().copied().collect();
+        out.sort();
         out
     }
     /// A formula's result: its value, the cells its spill covers, and their values.
@@ -1998,9 +2144,8 @@ impl Engine {
             return recomputed;
         }
         let before: Vec<_> = volatile.iter().map(|r| self.result_snapshot(*r)).collect();
-        let all = self.formula_cells();
         let mut scratch = Changes::default();
-        self.evaluate_dirty(&all, &volatile, &mut scratch);
+        self.evaluate_dirty(&volatile, &mut scratch);
         for id in scratch.tables.iter().map(|m| m.id).collect::<Vec<_>>() {
             ch.push_table(&self.wb, id);
         }
@@ -2041,6 +2186,8 @@ impl Engine {
         formula::eval::seed_random(serial.to_bits());
         let mut ch = Changes::default();
         self.recalc_from(&[], &mut ch);
+        #[cfg(test)]
+        self.check_tracked();
         let ids: Vec<TableId> = self.wb.tables.iter().filter(|t| !t.validations.is_empty()).map(|t| t.id).collect();
         for id in ids {
             for r in self.revalidate(id, None) {
@@ -2050,17 +2197,6 @@ impl Engine {
         ch
     }
 
-    fn formula_cells(&self) -> Vec<(CellRef, Vec<Rect>)> {
-        let mut out = vec![];
-        for t in &self.wb.tables {
-            for (k, c) in &t.cells {
-                if c.kind == CellKind::Formula {
-                    out.push((CellRef::new(t.id, k.row, k.col), c.deps.clone()));
-                }
-            }
-        }
-        out
-    }
 
     pub fn recalc_all(&mut self) {
         let mut ch = Changes::default();
@@ -2068,10 +2204,11 @@ impl Engine {
     }
 
     fn recalc_all_into(&mut self, ch: &mut Changes) {
-        self.refresh_deps(true);
-        let all = self.formula_cells();
-        let dirty: Vec<CellRef> = all.iter().map(|(r, _)| *r).collect();
-        let mut extra = self.evaluate_dirty(&all, &dirty, ch);
+        let cells = self.all_cells();
+        self.analyse(&cells, true);
+        self.resync();
+        let dirty: Vec<CellRef> = self.tracked.index.formulas().copied().collect();
+        let mut extra = self.evaluate_dirty(&dirty, ch);
         let mut rounds = 0;
         while !extra.is_empty() && rounds < MAX_SPILL_ROUNDS {
             rounds += 1;
@@ -2099,23 +2236,18 @@ impl Engine {
         for r in changed {
             ch.push_cell(&self.wb, *r);
         }
-        self.refresh_deps(false);
+        // the cells an edit changed are the only ones whose formula or dependencies can differ
+        self.analyse(changed, false);
+        for r in changed {
+            self.track(*r);
+        }
         let mut frontier: Vec<CellRef> = changed.to_vec();
         // blocked spills (#SPILL!) in a touched table get another chance: a blocking cell may have gone
         let tables_touched: HashSet<TableId> = changed.iter().map(|r| r.table).collect();
-        for t in &self.wb.tables {
-            if !tables_touched.contains(&t.id) {
-                continue;
-            }
-            for (k, c) in &t.cells {
-                if c.kind == CellKind::Formula && c.value == Value::Error(ErrorKind::Spill) {
-                    let me = CellRef::new(t.id, k.row, k.col);
-                    if !frontier.contains(&me) {
-                        frontier.push(me);
-                    }
-                }
-            }
-        }
+        let mut blocked: Vec<CellRef> = self.tracked.blocked.iter().filter(|r| tables_touched.contains(&r.table)).copied().collect();
+        blocked.sort();
+        let listed: HashSet<CellRef> = frontier.iter().copied().collect();
+        frontier.extend(blocked.into_iter().filter(|r| !listed.contains(r)));
         let mut all_changed: HashSet<CellRef> = changed.iter().cloned().collect();
         let mut rounds = 0;
         while !frontier.is_empty() && rounds < MAX_SPILL_ROUNDS {
@@ -2145,21 +2277,20 @@ impl Engine {
             ch.push_table(&self.wb, id);
         }
         // code cells reading any changed cell
-        let mut reruns = HashSet::new();
-        for t in &self.wb.tables {
-            for (k, c) in &t.cells {
-                if c.is_code() && !c.code_deps.is_empty() {
-                    let me = CellRef::new(t.id, k.row, k.col);
-                    // a code cell never re-runs because of its own cell or its own spilled output
-                    let is_own = |x: &CellRef| {
-                        *x == me
-                            || (x.table == me.table
-                                && t.cells.get(&x.key()).map(|cc| cc.spill_from == Some(*k)).unwrap_or(false))
-                    };
-                    if rects_hit(&c.code_deps, &all_changed, &is_own) {
-                        reruns.insert(me);
-                    }
-                }
+        let mut code: Vec<CellRef> = self.tracked.code.iter().copied().collect();
+        code.sort();
+        let mut reruns = vec![];
+        for me in code {
+            let (Some(t), Some(c)) = (self.wb.table(me.table), self.wb.cell(me)) else {
+                continue;
+            };
+            // a code cell never re-runs because of its own cell or its own spilled output
+            let is_own = |x: &CellRef| {
+                *x == me
+                    || (x.table == me.table && t.cells.get(&x.key()).map(|cc| cc.spill_from == Some(me.key())).unwrap_or(false))
+            };
+            if rects_hit(&c.code_deps, &all_changed, &is_own) {
+                reruns.push(me);
             }
         }
         for r in reruns {
@@ -2172,28 +2303,26 @@ impl Engine {
     /// One recalculation round: formulas reading `frontier` are re-evaluated; returns the
     /// cells written by spills (which may in turn feed other formulas).
     fn recalc_round(&mut self, frontier: &[CellRef], ch: &mut Changes) -> Vec<CellRef> {
-        let all = self.formula_cells();
-        let formula_set: HashSet<CellRef> = all.iter().map(|(r, _)| *r).collect();
         let mut dirty: HashSet<CellRef> = HashSet::new();
         for r in frontier {
-            if formula_set.contains(r) {
+            if self.tracked.index.deps(r).is_some() {
                 dirty.insert(*r);
             }
         }
         // iterative closure: formulas reading any changed cell become dirty, and their
         // own cells (plus their current spill areas) count as changed for the next round
-        let mut front: HashSet<CellRef> = frontier.iter().cloned().collect();
+        let mut front: Vec<CellRef> = frontier.to_vec();
         while !front.is_empty() {
-            let hit = formulas_reading(&all, &front, &dirty);
+            let hit = self.tracked.index.dependents(&CellSet::new(&front));
             front.clear();
             for f in hit {
                 if dirty.insert(f) {
-                    front.insert(f);
+                    front.push(f);
                     if let Some(c) = self.wb.cell(f) {
                         if let Some((sr, sc)) = c.spill_size {
                             for i in 0..sr {
                                 for j in 0..sc {
-                                    front.insert(CellRef::new(f.table, f.row + i, f.col + j));
+                                    front.push(CellRef::new(f.table, f.row + i, f.col + j));
                                 }
                             }
                         }
@@ -2202,17 +2331,16 @@ impl Engine {
             }
         }
         let dirty_vec: Vec<CellRef> = dirty.into_iter().collect();
-        self.evaluate_dirty(&all, &dirty_vec, ch)
+        self.evaluate_dirty(&dirty_vec, ch)
     }
 
     /// Evaluate `dirty` formula cells in dependency order (cycles → #CYCLE!).
     /// Returns cells changed by spills other than the formula cells themselves.
-    fn evaluate_dirty(&mut self, all: &[(CellRef, Vec<Rect>)], dirty: &[CellRef], ch: &mut Changes) -> Vec<CellRef> {
+    fn evaluate_dirty(&mut self, dirty: &[CellRef], ch: &mut Changes) -> Vec<CellRef> {
         if dirty.is_empty() {
             return vec![];
         }
-        let dirty_set: HashSet<CellRef> = dirty.iter().cloned().collect();
-        let rects: HashMap<CellRef, &Vec<Rect>> = all.iter().map(|(r, d)| (*r, d)).collect();
+        let dirty_set = CellSet::new(dirty);
         // spill areas of dirty formulas (from their previous evaluation)
         let spill_areas: Vec<(CellRef, Rect)> = dirty
             .iter()
@@ -2235,31 +2363,18 @@ impl Engine {
         let mut edges: HashMap<CellRef, Vec<CellRef>> = HashMap::new();
         for f in dirty {
             let mut precedents: Vec<CellRef> = vec![];
-            if let Some(rs) = rects.get(f) {
-                let mut seen: HashSet<CellRef> = HashSet::new();
+            if let Some(rs) = self.tracked.index.deps(f) {
                 for rect in rs.iter() {
-                    let area = (rect.rows() as u64) * (rect.cols() as u64);
-                    if area <= dirty_set.len() as u64 {
-                        for r in rect.r0..=rect.r1 {
-                            for c in rect.c0..=rect.c1 {
-                                let g = CellRef::new(rect.table, r, c);
-                                if dirty_set.contains(&g) && seen.insert(g) {
-                                    precedents.push(g);
-                                }
-                            }
-                        }
-                    } else {
-                        for g in dirty {
-                            if rect.table == g.table && rect.contains(g.key()) && seen.insert(*g) {
-                                precedents.push(*g);
-                            }
-                        }
-                    }
+                    dirty_set.cells_in(rect, &mut precedents);
                     for (g, area) in &spill_areas {
-                        if g != f && rect.intersects(area) && seen.insert(*g) {
+                        if g != f && rect.intersects(area) {
                             precedents.push(*g);
                         }
                     }
+                }
+                if rs.len() > 1 || !spill_areas.is_empty() {
+                    let mut seen: HashSet<CellRef> = HashSet::new();
+                    precedents.retain(|g| seen.insert(*g));
                 }
             }
             edges.insert(*f, precedents);
@@ -2344,6 +2459,11 @@ impl Engine {
                     }
                 }
             }
+            if self.wb.cell(r).map(|c| c.value == Value::Error(ErrorKind::Spill)).unwrap_or(false) {
+                self.tracked.blocked.insert(r);
+            } else {
+                self.tracked.blocked.remove(&r);
+            }
             ch.push_cell(&self.wb, r);
         }
         // cells removed and re-written in the same pass only count once
@@ -2414,6 +2534,17 @@ impl Engine {
                             ..Default::default()
                         },
                     );
+                }
+            }
+            // every output cell is spilled from the pivot's top-left cell
+            let origin = CellRef::new(id, 0, 0);
+            for r in self.tracked.spill_of(origin) {
+                self.tracked.set_spilled(r, None);
+            }
+            let t = self.wb.table(id).unwrap();
+            for (k, c) in &t.cells {
+                if c.spill_from.is_some() {
+                    self.tracked.set_spilled(CellRef::new(id, k.row, k.col), Some(origin));
                 }
             }
             ch.push_table(&self.wb, id);
@@ -2501,19 +2632,6 @@ fn rects_hit(rects: &[Rect], set: &HashSet<CellRef>, skip: &dyn Fn(&CellRef) -> 
     false
 }
 
-/// Formulas (not already dirty) that read at least one cell of `frontier`.
-fn formulas_reading(all: &[(CellRef, Vec<Rect>)], frontier: &HashSet<CellRef>, dirty: &HashSet<CellRef>) -> Vec<CellRef> {
-    let mut out = vec![];
-    for (f, rects) in all {
-        if dirty.contains(f) {
-            continue;
-        }
-        if rects_hit(rects, frontier, &|_| false) {
-            out.push(*f);
-        }
-    }
-    out
-}
 
 fn op_kind(op: &Op) -> char {
     match op {

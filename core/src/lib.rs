@@ -3,6 +3,7 @@
 //! code-cell spill handling and undo/redo. Exposed to JavaScript through
 //! wasm-bindgen as the `Book` class; all payloads cross the boundary as JSON.
 
+pub mod depindex;
 pub mod engine;
 pub mod formula;
 pub mod model;
