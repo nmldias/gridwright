@@ -7,7 +7,7 @@ before and passes after, and is merged through CI (see [`AGENTS.md`](../AGENTS.m
 Status: `todo` · `partial` · `done` (merged; PR noted). Line numbers are from `a1f0a62`: locate the code again
 before editing.
 
-**Next item: 2.7.** Then the rest of Phase 2 in order, then Phase 3.
+**Next item: 2.8.** Then the rest of Phase 2 in order, then Phase 3.
 
 ## Done
 
@@ -20,6 +20,7 @@ before editing.
 | 2.4 | Decimal comma (`1.234,56`) as a document setting: typed/pasted input, display, filters, highlight rules, validation; strict grouping, `(1.234,00)` negative, `08.10.2026` stays a date | #11 |
 | 2.5 | Comparison at 15 significant digits: operators, criteria, lookups, CHECK, filters, validation, highlight rules | #13 |
 | 2.6 | Rounding and number text on the 15-digit decimal value: ROUND family, MROUND, CEILING/FLOOR, TEXT with sections, FIXED, DOLLAR; General format for number → text; the browser formatter checked against the engine | #14 |
+| 2.7 | IRR / XIRR / RATE: residual relative to the discounted terms, `#NUM!` when not converged, bracket nearest the guess, dates before the first `#NUM!`, iterations on the work budget | #PR |
 
 Regression suites for these: `e2e/server_gates.py`, `history_log.mjs`, `sql_readonly.mjs`, `python_sandbox.mjs`,
 `code_trust.py`, `installer_nohup.sh`, `security.py`, `engine_limits.mjs`, `import_dates.mjs`,
@@ -65,13 +66,20 @@ Baselines below were reproduced on the shipped engine at `main` `8da8d82`, e.g. 
   `main`) and the browser formatter against the engine (9,840 number × pattern pairs; `main` already differed on
   General for long decimals). Not done: General fitted to column width, TEXT conditions/scientific/fractions.
 
-### 2.7 IRR / XIRR / RATE convergence — `todo`
+### 2.7 IRR / XIRR / RATE convergence — `done` (#PR)
 * **Problem:** absolute tolerance, so small-scale cash flows return the guess; the bisection fallback returns its
   midpoint even when it did not converge; XNPV/XIRR accept dates before the first one.
 * **Approach:** relative residual, `#NUM!` when not converged, `#NUM!` for a date before the first; keep Newton with
   a bracketed fallback.
 * **Acceptance:** the same cash flows scaled by 1e-6 and 1e9 give the same rate; non-convergent input → `#NUM!`;
   examples from Microsoft's documentation of each function.
+* **Implemented:** one solver, `solve_rate` (`eval.rs`): Newton from the guess, then bisection on the sign change
+  nearest it; a root is accepted when |Σ| ≤ 1e-10 × Σ|terms| at that rate (a residual relative to Σ|flows|
+  accepted rates where every flow is discounted to nothing: `IRR(SEQUENCE(1E6)-2)` was 0.998); `#NUM!` otherwise;
+  each evaluation charged to the work budget (4 units per IRR flow, 16 per XIRR flow). IRR/XIRR need a positive and
+  a negative flow; XNPV/XIRR truncate dates and refuse one before the first. Cases in `excel_cases.tsv` (Microsoft's
+  IRR, XIRR, XNPV, RATE, MIRR examples; scaled flows 1e-12…1e9; on `main` 8 of 19 fail, incl.
+  `IRR({-1E-12,2E-12})` = the 0.1 guess) and `e2e/engine_limits.mjs` (4 cases).
 
 ### 2.8 Recalculation is quadratic — `todo`
 * **Baseline:** setting a 10,000-row running balance (`B(n)=B(n-1)+A(n)`) takes ≈ 16.7 s (3,000 rows ≈ 1.5 s);

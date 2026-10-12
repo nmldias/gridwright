@@ -2341,17 +2341,21 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
             if flows.len() != dates.len() || flows.is_empty() {
                 return Arg::err(ErrorKind::Num);
             }
+            // Excel truncates dates to whole days; one before the first is #NUM!
             let d0 = match date_arg(&dates[0]) {
-                Ok(x) => x,
+                Ok(x) => x.trunc(),
                 Err(e) => return Arg::err(e),
             };
             let mut total = 0.0;
             for (f, d) in flows.iter().zip(dates.iter()) {
                 let fv = try_num!(f);
                 let dv = match date_arg(d) {
-                    Ok(x) => x,
+                    Ok(x) => x.trunc(),
                     Err(e) => return Arg::err(e),
                 };
+                if dv < d0 {
+                    return Arg::err(ErrorKind::Num);
+                }
                 total += fv / (1.0 + rate).powf((dv - d0) / 365.0);
             }
             n(total)
@@ -2369,9 +2373,14 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
                 return Arg::err(ErrorKind::Num);
             }
             let guess = if args.len() > 2 { try_num!(a(2)) } else { 0.1 };
+            // Excel: whole days, none before the first, a positive and a negative flow
+            let dates: Vec<f64> = dates.iter().map(|d| d.trunc()).collect();
             let d0 = dates[0];
-            let f = |r: f64| flows.iter().zip(dates.iter()).map(|(cf, d)| cf / (1.0 + r).powf((d - d0) / 365.0)).sum::<f64>();
-            match newton(f, guess) {
+            if dates.iter().any(|d| *d < d0) || !flows.iter().any(|x| *x > 0.0) || !flows.iter().any(|x| *x < 0.0) {
+                return Arg::err(ErrorKind::Num);
+            }
+            let f = |r: f64| discounted(flows.iter().zip(dates.iter()).map(|(cf, d)| cf / (1.0 + r).powf((d - d0) / 365.0)));
+            match solve_rate(f, guess, 16 * flows.len() as u64) {
                 Some(r) => n(r),
                 None => Arg::err(ErrorKind::Num),
             }
@@ -3700,55 +3709,104 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
     }
 }
 
-/// Newton–Raphson root finding with numeric derivative; falls back to bisection on [-0.99, 10].
-fn newton(f: impl Fn(f64) -> f64, guess: f64) -> Option<f64> {
+/// The rate where `f` is zero (IRR, XIRR, RATE): Newton from the guess, then bisection on the
+/// sign change nearest the guess. `f(r)` returns the sum and the sum of its terms' sizes; a
+/// root is accepted only when the sum is small *relative to its terms*, so the same flows in
+/// cents or in billions give the same rate, and a rate where every flow is discounted to
+/// nothing is not mistaken for one. When nothing converges the answer is `None` (#NUM!),
+/// never the last estimate. Each evaluation of `f` costs `cost` work units: past the
+/// formula's budget the answer is #NUM!, so a million flows cannot hold the engine.
+fn solve_rate(f: impl Fn(f64) -> (f64, f64), guess: f64, cost: u64) -> Option<f64> {
+    if !guess.is_finite() || guess <= -1.0 {
+        return None;
+    }
+    let spent = std::cell::Cell::new(false);
+    let f = |r: f64| -> (f64, f64) {
+        if spent.get() || !spend(cost) {
+            spent.set(true);
+            return (f64::NAN, f64::NAN);
+        }
+        f(r)
+    };
+    let root = |(y, size): (f64, f64), rel: f64| y.is_finite() && size.is_finite() && size > 0.0 && y.abs() <= rel * size;
     let mut r = guess;
     for _ in 0..100 {
-        let y = f(r);
-        if y.abs() < 1e-9 {
+        let fr = f(r);
+        if root(fr, 1e-14) {
             return Some(r);
         }
-        let h = 1e-6;
-        let dy = (f(r + h) - f(r - h)) / (2.0 * h);
-        if dy == 0.0 || !dy.is_finite() {
+        let h = 1e-6 * (1.0 + r.abs());
+        let dy = (f(r + h).0 - f(r - h).0) / (2.0 * h);
+        if dy == 0.0 || !dy.is_finite() || !fr.0.is_finite() {
             break;
         }
-        let next = r - y / dy;
+        let next = r - fr.0 / dy;
         if !next.is_finite() || next <= -1.0 {
             break;
         }
-        if (next - r).abs() < 1e-12 {
-            return Some(next);
+        if (next - r).abs() <= 1e-14 * (1.0 + r.abs()) {
+            if root(f(next), 1e-10) {
+                return Some(next);
+            }
+            break;
         }
         r = next;
     }
-    // bisection
-    let (mut lo, mut hi) = (-0.99, 10.0);
-    let (flo, fhi) = (f(lo), f(hi));
-    if flo.is_nan() || fhi.is_nan() || flo.signum() == fhi.signum() {
-        return None;
+    // bisection on the bracket nearest the guess
+    let mut grid = vec![-0.999, -0.99, -0.9, -0.75, -0.5, -0.25, -0.1, 0.0, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0, 100.0];
+    grid.push(guess);
+    grid.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    grid.dedup();
+    let values: Vec<f64> = grid.iter().map(|x| f(*x).0).collect();
+    let mut brackets: Vec<(f64, f64, f64)> = vec![];
+    for i in 1..grid.len() {
+        let (lo, hi, fa, fb) = (grid[i - 1], grid[i], values[i - 1], values[i]);
+        if fa.is_finite() && fb.is_finite() && fa != 0.0 && fb != 0.0 && fa.signum() != fb.signum() {
+            let dist = if guess < lo { lo - guess } else if guess > hi { guess - hi } else { 0.0 };
+            brackets.push((dist, lo, hi));
+        }
+        if fa == 0.0 && root(f(lo), 1e-10) {
+            return Some(lo);
+        }
     }
-    for _ in 0..200 {
+    brackets.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    for (_, mut lo, mut hi) in brackets {
+        let flo = f(lo).0;
+        for _ in 0..200 {
+            let mid = (lo + hi) / 2.0;
+            if mid <= lo || mid >= hi {
+                break;
+            }
+            let fm = f(mid).0;
+            if !fm.is_finite() {
+                return None;
+            }
+            if fm.signum() == flo.signum() {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
         let mid = (lo + hi) / 2.0;
-        let fm = f(mid);
-        if fm.abs() < 1e-10 {
+        if root(f(mid), 1e-10) {
             return Some(mid);
         }
-        if fm.signum() == flo.signum() {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
     }
-    Some((lo + hi) / 2.0)
+    None
+}
+
+/// Σ cf / (1+r)^t and Σ |cf / (1+r)^t|.
+fn discounted(terms: impl Iterator<Item = f64>) -> (f64, f64) {
+    terms.fold((0.0, 0.0), |(sum, size), t| (sum + t, size + t.abs()))
 }
 
 fn irr(flows: &[f64], guess: f64) -> Option<f64> {
-    if flows.len() < 2 {
+    // Excel: at least one positive and one negative value
+    if flows.len() < 2 || !flows.iter().any(|x| *x > 0.0) || !flows.iter().any(|x| *x < 0.0) {
         return None;
     }
-    let f = |r: f64| flows.iter().enumerate().map(|(i, cf)| cf / (1.0 + r).powi(i as i32)).sum::<f64>();
-    newton(f, guess)
+    let f = |r: f64| discounted(flows.iter().enumerate().map(|(i, cf)| cf / (1.0 + r).powi(i as i32)));
+    solve_rate(f, guess, 4 * flows.len() as u64)
 }
 
 /// Excel's annuity family: PMT, IPMT, PPMT, PV, FV, NPER, RATE (type 0 = end of period, 1 = beginning).
@@ -3860,13 +3918,11 @@ fn annuity(name: &str, args: &[Arg]) -> Arg {
             let kind = g!(num(4, 0.0));
             let guess = g!(num(5, 0.1));
             let f = |r: f64| {
-                if r == 0.0 {
-                    return pv + pmt * nper + fv;
-                }
-                let k = (1.0 + r).powf(nper);
-                pv * k + pmt * (1.0 + r * kind) * (k - 1.0) / r + fv
+                let (k, annuity) = if r == 0.0 { (1.0, nper) } else { let k = (1.0 + r).powf(nper); (k, (k - 1.0) / r) };
+                let terms = [pv * k, pmt * (1.0 + r * kind) * annuity, fv];
+                discounted(terms.into_iter())
             };
-            match newton(f, guess) {
+            match solve_rate(f, guess, 1) {
                 Some(r) => n(r),
                 None => Arg::err(ErrorKind::Num),
             }
