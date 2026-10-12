@@ -228,7 +228,9 @@ What to watch once people use it — all of it comes out of the audit log (`Hist
 
 ## Performance notes
 
-Measured in headless Chromium with software WebGL (SwiftShader): filling a 5 000 × 30 table (150 000 cells, 5 000 formulas) takes ≈0.6 s; a single edit with a dependent formula ≈8 ms median (dependency rectangles are cached in the engine and the client patches its cell maps in place); a frame costs ≈11 ms only when something changed. Formulas that read a whole column re-evaluate in ≈10 ms.
+Measured in headless Chromium with software WebGL (SwiftShader), `e2e/perf.py`: filling a 5 000 × 30 table (150 000 cells, 5 000 formulas) takes ≈1.4 s; a single edit with a dependent formula ≈0.2 ms median, and an edit feeding a whole-column `SUM` ≈1 ms; a frame costs ≈11 ms only when something changed.
+
+An edit costs what it changes, not the size of the workbook: the engine keeps a reverse-dependency index (cell → formulas reading it, `core/src/depindex.rs`) and tracks volatile formulas, blocked spills, spilled cells and code-cell readers as cells change, instead of scanning every cell. Typing a 10 000-row running balance cell by cell takes ≈1 s on the wasm engine (80 s before), editing the head of a 5 000-cell chain ≈40 ms (2.9 s before); `e2e/recalc_perf.mjs` holds these under budgets. Ranges are still read by copying their values (≈25 ns a cell), so 2 000 `SUM(A:A)` over 2 000 rows recompute in ≈0.3 s.
 
 ## Tests
 
@@ -236,10 +238,12 @@ Working on the code (people and coding agents such as Codex or Claude Code): the
 [`AGENTS.md`](AGENTS.md), and the open work, in order, is [`docs/roadmap.md`](docs/roadmap.md).
 
 ```bash
-cd core && cargo test                                   # engine: 55 tests (the agent runtime kept on a cell among them) (incl. a check that every listed function resolves,
+cd core && cargo test                                   # engine: 58 tests (the agent runtime kept on a cell among them) (incl. a check that every listed function resolves,
                                                         # formula resource limits, the work-day functions against a day-by-day count, Excel's DAYS360/YEARFRAC results,
                                                         # decimal-comma input and its round trip; 15-digit comparison, criteria, lookups, filters and validation;
                                                         # the Excel cases table core/src/formula/excel_cases.tsv)
+node e2e/recalc_perf.mjs server/engine                  # recalculation cost on the shipped wasm engine: 9 timed cases with budgets (typed and pasted
+                                                        # running balances, chain edits, undo, whole-column sums, spills, inserted rows), results checked
 node e2e/numeric_equality.mjs server/engine             # 4 checks: decimal reconciliation, comparison, SUMIF, indexed XLOOKUP
 node e2e/numerics.mjs server/engine                     # Excel results on the shipped wasm engine: the 95 cases of excel_cases.tsv (rounding,
                                                         # number text, IRR/XIRR/RATE), and the browser's formatter giving the engine's text for

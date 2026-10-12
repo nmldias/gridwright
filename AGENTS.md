@@ -47,6 +47,7 @@ targets after any change in `core/`, otherwise the browser and server suites tes
   ```bash
   cargo test --release --manifest-path core/Cargo.toml
   node e2e/engine_limits.mjs server/engine     # resource limits, volatile functions, day counts
+  node e2e/recalc_perf.mjs server/engine       # recalculation timings under budgets
   node e2e/import_dates.mjs server/dist        # guided-import dates
   node e2e/decimal_comma.mjs server/engine     # decimal-comma workbooks
   node e2e/numerics.mjs server/engine          # rounding, number text, browser formatter == engine

@@ -77,6 +77,8 @@ jobs:
         run: cd server && npm ci --no-audit --no-fund && npm run build
       - name: Engine limits on the shipped WebAssembly build
         run: node e2e/engine_limits.mjs server/engine
+      - name: Recalculation cost on the shipped WebAssembly build (timed, with budgets)
+        run: node e2e/recalc_perf.mjs server/engine
       - name: Numeric equality and reconciliation on the shipped WebAssembly build
         run: node e2e/numeric_equality.mjs server/engine
       - name: Rounding and number text as Excel; the browser formatter agrees with the engine

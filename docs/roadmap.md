@@ -7,7 +7,7 @@ before and passes after, and is merged through CI (see [`AGENTS.md`](../AGENTS.m
 Status: `todo` · `partial` · `done` (merged; PR noted). Line numbers are from `a1f0a62`: locate the code again
 before editing.
 
-**Next item: 2.8.** Then the rest of Phase 2 in order, then Phase 3.
+**Next item: 2.9.** Then the rest of Phase 2 in order, then Phase 3.
 
 ## Done
 
@@ -21,10 +21,12 @@ before editing.
 | 2.5 | Comparison at 15 significant digits: operators, criteria, lookups, CHECK, filters, validation, highlight rules | #13 |
 | 2.6 | Rounding and number text on the 15-digit decimal value: ROUND family, MROUND, CEILING/FLOOR, TEXT with sections, FIXED, DOLLAR; General format for number → text; the browser formatter checked against the engine | #14 |
 | 2.7 | IRR / XIRR / RATE: residual relative to the discounted terms, `#NUM!` when not converged, bracket nearest the guess, dates before the first `#NUM!`, iterations on the work budget | #15 |
+| 2.8 | Recalculation proportional to the change: reverse-dependency index, tracked volatile/blocked-spill/spilled/code cells instead of whole-workbook scans, a position hasher for cell maps | #16 |
 
 Regression suites for these: `e2e/server_gates.py`, `history_log.mjs`, `sql_readonly.mjs`, `python_sandbox.mjs`,
 `code_trust.py`, `installer_nohup.sh`, `security.py`, `engine_limits.mjs`, `import_dates.mjs`,
-`decimal_comma.mjs`, `decimal_comma_ui.py`, `numeric_equality.mjs`, `numeric_equality_ui.py`, `numerics.mjs`.
+`decimal_comma.mjs`, `decimal_comma_ui.py`, `numeric_equality.mjs`, `numeric_equality_ui.py`, `numerics.mjs`,
+`recalc_perf.mjs`.
 
 ## Phase 2 — Engine correctness (Rust core)
 
@@ -81,7 +83,7 @@ Baselines below were reproduced on the shipped engine at `main` `8da8d82`, e.g. 
   IRR, XIRR, XNPV, RATE, MIRR examples; scaled flows 1e-12…1e9; on `main` 8 of 19 fail, incl.
   `IRR({-1E-12,2E-12})` = the 0.1 guess) and `e2e/engine_limits.mjs` (4 cases).
 
-### 2.8 Recalculation is quadratic — `todo`
+### 2.8 Recalculation is quadratic — `done` (#16)
 * **Baseline:** setting a 10,000-row running balance (`B(n)=B(n-1)+A(n)`) takes ≈ 16.7 s (3,000 rows ≈ 1.5 s);
   editing the head of a 5,000-cell chain ≈ 0.9 s; 2,000 `SUM(A:A)` cells ≈ 2.9 s. Formulas are re-parsed on every
   evaluation and dependents are found by linear scan.
@@ -89,6 +91,20 @@ Baselines below were reproduced on the shipped engine at `main` `8da8d82`, e.g. 
   per cell and invalidated on input change; borrowed range views instead of copies. Keep 2.1 limits and 2.2 volatile
   handling.
 * **Acceptance:** a timing test with budgets measured on CI (release build), and `e2e/perf.py` no worse.
+* **Implemented:** `core/src/depindex.rs` indexes each formula's rectangles the other way round (≤ 64 cells per
+  cell, tall ones per column, wide ones per table); the closure in `recalc_round` and the edges in `evaluate_dirty`
+  query it with cells grouped by column instead of testing every formula. The engine's `Tracked` state (index,
+  volatile formulas, `#SPILL!` formulas, spilled cells per origin, code cells with `code_deps`) is updated for the
+  cells an edit changed (`SetCell`, `SetCells`, `ClearRange`, `CodeResult`, `RestoreCells`, spills, pivots) and
+  rebuilt after any other operation; unit tests compare it with a rebuild after every operation. Five whole-workbook
+  scans per edit are gone (the deps refresh, blocked spills, volatile cells, code-cell reruns, and the spill
+  snapshot/clear of the edited cell), which made even value-only typing quadratic. Cell maps hash positions with a
+  MurmurHash3 finaliser instead of SipHash (≈3× faster `SUM(A:A)` in wasm). `e2e/recalc_perf.mjs` (9 cases, one
+  process each, budgets): typing a 10,000-row running balance 80 s → ≈1 s, editing the head of a 5,000 chain
+  2.9 s → ≈40 ms, inserting a row into a 10,000-row balance and editing 26 s → ≈0.3 s; `e2e/perf.py` single edit
+  ≈25 ms → 0.2 ms, fill unchanged. Not done: borrowed range views (a range read copies its values; the cost is the
+  per-cell lookup of a 336-byte `Cell`, which a view would not remove) and an AST cache (parsing is ≈1 µs a formula,
+  under 2% of an evaluation in these cases).
 
 ### 2.9 Excel-verified tests for `eval.rs` — `todo`
 * `eval.rs` has no unit tests. Add ~200 table-driven cases (e.g. a data file of `formula · expected · source` read by

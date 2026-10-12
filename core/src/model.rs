@@ -4,8 +4,39 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 pub type TableId = u32;
+
+/// A table's cells by position. Reading a range looks up every cell in it, so the key is hashed
+/// with `PositionHasher` rather than SipHash, which cost most of the time of `SUM(A:A)`.
+pub type CellMap<V> = HashMap<CellKey, V, BuildHasherDefault<PositionHasher>>;
+
+/// A fast hasher for cell positions (`CellKey`, `CellRef`): it packs the integers it is given
+/// into one word and mixes it with MurmurHash3's 64-bit finaliser, so neighbouring cells spread
+/// over the whole table. Not keyed; neither is SipHash in WebAssembly, where `RandomState` has
+/// no source of randomness.
+#[derive(Default, Clone, Copy)]
+pub struct PositionHasher(u64);
+
+impl Hasher for PositionHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ b as u64;
+        }
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.0 = self.0.rotate_left(32) ^ n as u64;
+    }
+    fn finish(&self) -> u64 {
+        let mut h = self.0;
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        h ^ (h >> 33)
+    }
+}
 
 pub const DEFAULT_COL_WIDTH: f64 = 100.0;
 pub const DEFAULT_ROW_HEIGHT: f64 = 24.0;
@@ -704,7 +735,7 @@ pub struct Table {
     pub col_widths: Vec<f64>,
     pub row_heights: Vec<f64>,
     #[serde(with = "cells_serde")]
-    pub cells: HashMap<CellKey, Cell>,
+    pub cells: CellMap<Cell>,
     /// Set when this table is the output of a pivot over another table (cells are read-only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pivot: Option<PivotSpec>,
@@ -726,9 +757,8 @@ pub struct Table {
 /// Cells are stored as a JSON array of `{"r":..,"c":..,"cell":{..}}` entries
 /// (JSON object keys must be strings).
 mod cells_serde {
-    use super::{Cell, CellKey};
+    use super::{Cell, CellKey, CellMap};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use std::collections::HashMap;
 
     #[derive(Serialize, Deserialize)]
     struct Entry {
@@ -737,7 +767,7 @@ mod cells_serde {
         cell: Cell,
     }
 
-    pub fn serialize<S: Serializer>(cells: &HashMap<CellKey, Cell>, ser: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(cells: &CellMap<Cell>, ser: S) -> Result<S::Ok, S::Error> {
         let mut entries: Vec<Entry> = cells
             .iter()
             .filter(|(_, c)| !c.is_blank())
@@ -751,7 +781,7 @@ mod cells_serde {
         entries.serialize(ser)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<HashMap<CellKey, Cell>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<CellMap<Cell>, D::Error> {
         let entries: Vec<Entry> = Vec::deserialize(de)?;
         Ok(entries
             .into_iter()
@@ -772,7 +802,7 @@ impl Default for Table {
             header_rows: 1,
             col_widths: vec![],
             row_heights: vec![],
-            cells: HashMap::new(),
+            cells: CellMap::default(),
             pivot: None,
             filters: vec![],
             hidden_rows: vec![],
@@ -796,7 +826,7 @@ impl Table {
             header_rows: 1,
             col_widths: vec![DEFAULT_COL_WIDTH; cols as usize],
             row_heights: vec![DEFAULT_ROW_HEIGHT; rows as usize],
-            cells: HashMap::new(),
+            cells: CellMap::default(),
             pivot: None,
             filters: vec![],
             hidden_rows: vec![],
