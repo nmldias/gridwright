@@ -79,6 +79,8 @@ jobs:
         run: node e2e/engine_limits.mjs server/engine
       - name: Numeric equality and reconciliation on the shipped WebAssembly build
         run: node e2e/numeric_equality.mjs server/engine
+      - name: Rounding and number text as Excel; the browser formatter agrees with the engine
+        run: node e2e/numerics.mjs server/engine
       - name: Dates read by the guided import
         run: node e2e/import_dates.mjs server/dist
       - name: Numbers with a decimal comma (1.234,56) on the shipped WebAssembly build

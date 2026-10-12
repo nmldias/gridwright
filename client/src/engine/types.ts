@@ -306,10 +306,63 @@ export function valueToString(v: CellValue): string {
   return '';
 }
 
+/** A finite number as 15 significant digits: `digits` (< 10^15, exact in a double) × 10^`exp`.
+ *  Mirrors `dec15` in core/src/formula/numerics.rs; ties at the 16th digit go away from zero. */
+export function dec15(x: number): { neg: boolean; digits: number; exp: number } {
+  const [m, e] = Math.abs(x).toExponential(14).split('e');
+  const digits = Number(m.replace('.', ''));
+  return { neg: x < 0 && digits !== 0, digits, exp: Number(e) - 14 };
+}
+
+/** |x| with exactly `places` decimals, rounded half away from zero on its 15-digit value
+ *  (TEXT(1.005,"0.00") is 1.01). Mirrors `fixed_abs` in numerics.rs. */
+export function fixedAbs(x: number, places: number): string {
+  if (!Number.isFinite(x)) return String(Math.abs(x));
+  const d = dec15(x);
+  let m = d.digits;
+  let scale = d.exp;
+  if (d.exp < -places) {
+    const k = -places - d.exp;
+    if (k >= 16) m = 0;
+    else {
+      const p = 10 ** k;
+      const q = Math.floor(d.digits / p);
+      m = q + (d.digits - q * p >= p / 2 ? 1 : 0);
+    }
+    scale = -places;
+  }
+  let s = String(m);
+  if (m !== 0) s += '0'.repeat(Math.max(0, scale + places));
+  if (places === 0) return s;
+  if (s.length <= places) s = '0'.repeat(places + 1 - s.length) + s;
+  return `${s.slice(0, s.length - places)}.${s.slice(s.length - places)}`;
+}
+
+/** Number → text as Excel's General format: up to 15 significant digits, no trailing zeros,
+ *  scientific from 1E+15 and below 1E-9. Mirrors `general_text` in numerics.rs. */
 export function formatNumberPlain(n: number): string {
+  if (Number.isNaN(n)) return '#NUM!';
+  if (!Number.isFinite(n)) return String(n);
+  if (n === 0) return '0';
   if (Number.isInteger(n) && Math.abs(n) < 1e15) return String(n);
-  const s = n.toFixed(10).replace(/0+$/, '').replace(/\.$/, '');
-  return s;
+  const d = dec15(n);
+  let digits = d.digits;
+  let exp = d.exp;
+  while (digits % 10 === 0) {
+    digits /= 10;
+    exp++;
+  }
+  const ds = String(digits);
+  const sci = exp + ds.length - 1;
+  const sign = d.neg ? '-' : '';
+  if (sci >= 15 || sci < -9) {
+    const mant = ds.length > 1 ? `${ds[0]}.${ds.slice(1)}` : ds;
+    return `${sign}${mant}E${sci < 0 ? '-' : '+'}${String(Math.abs(sci)).padStart(2, '0')}`;
+  }
+  if (exp >= 0) return sign + ds + '0'.repeat(exp);
+  const places = -exp;
+  const padded = ds.length <= places ? '0'.repeat(places + 1 - ds.length) + ds : ds;
+  return `${sign}${padded.slice(0, padded.length - places)}.${padded.slice(padded.length - places)}`;
 }
 
 export function isErrorValue(v: CellValue): boolean {

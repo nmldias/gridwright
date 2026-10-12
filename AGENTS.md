@@ -49,6 +49,7 @@ targets after any change in `core/`, otherwise the browser and server suites tes
   node e2e/engine_limits.mjs server/engine     # resource limits, volatile functions, day counts
   node e2e/import_dates.mjs server/dist        # guided-import dates
   node e2e/decimal_comma.mjs server/engine     # decimal-comma workbooks
+  node e2e/numerics.mjs server/engine          # rounding, number text, browser formatter == engine
   (cd client && npx tsc --noEmit) && (cd server && npx tsc --noEmit)
   ```
 * **Browser suites** need Python 3 with Playwright Chromium (`pip install playwright pandas -r integrations/companion/requirements.lock.txt && python3 -m playwright install --with-deps chromium`),
@@ -101,7 +102,10 @@ targets after any change in `core/`, otherwise the browser and server suites tes
   killing it stops the server: `(cd server && exec node dist/index.js > log 2>&1 & echo $! > pid)`.
 * Two editors saving at once can produce an expected `409` on `PUT /api/files/<id>` (stale save). The client
   catches up and retries; it is not an error.
-* `client/src/grid/format.ts` mirrors the engine's `format_number`; keep them in step (or format through the
-  engine with `Book.format_number`).
+* `client/src/grid/format.ts` and `formatNumberPlain`/`fixedAbs` in `client/src/engine/types.ts` mirror the
+  engine's `format_text` (`eval.rs`) and `numerics.rs`; keep them in step. `e2e/numerics.mjs` compares them on
+  thousands of number × pattern pairs (formatting every grid cell through WASM costs ~15× more).
+* Numeric behaviour with an Excel source goes in `core/src/formula/excel_cases.tsv` (formula · result · source);
+  both `cargo test` and `e2e/numerics.mjs` read it.
 * Line numbers in `docs/roadmap.md` come from the review of `main` at `a1f0a62`; find the code again before
   editing.

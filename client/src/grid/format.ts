@@ -1,10 +1,11 @@
-// Display formatting of cell values — the same rules as the engine's TEXT():
-// `0`, `0.00`, `#,##0`, `#,##0.00`, `0%`, `€#,##0.00`, `#,##0.00 "Kz"`, `#.##0,00`
-// (decimal comma), `yyyy-mm-dd`, `dd/mm/yyyy hh:mm`, `d mmm yyyy`, `dddd`, and the
-// legacy `currency:EUR` shortcut.
+// Display formatting of cell values — the same rules as the engine's TEXT() (format_text in
+// core/src/formula/eval.rs; e2e/numerics.mjs checks they agree): `0`, `0.00`, `#,##0`,
+// `#,##0.00`, `0%`, `€#,##0.00`, `#,##0.00 "Kz"`, `#.##0,00` (decimal comma), `#,##0,`
+// (thousands), sections `positive;negative;zero;text` (accounting formats), `yyyy-mm-dd`,
+// `dd/mm/yyyy hh:mm`, `d mmm yyyy`, `dddd`, and the legacy `currency:EUR` shortcut.
 
 import type { CellValue, CellView, Format } from '../engine/types';
-import { formatNumberPlain } from '../engine/types';
+import { fixedAbs, formatNumberPlain } from '../engine/types';
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 const DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
@@ -86,79 +87,190 @@ export function setDecimalCommaDisplay(on: boolean) {
   decimalCommaDisplay = on;
 }
 
-const fmtCache = new Map<string, (n: number, comma: boolean) => string>();
+/** The sections of a pattern (`positive;negative;zero;text`), split at `;` outside quotes,
+ *  brackets and escapes. */
+function splitSections(f: string): string[] {
+  const out = [''];
+  let inq = false;
+  let inb = false;
+  for (let i = 0; i < f.length; i++) {
+    const c = f[i];
+    if (c === '"' && !inb) inq = !inq;
+    else if (c === '[' && !inq) inb = true;
+    else if (c === ']' && !inq) inb = false;
+    else if (c === '\\' && !inq && !inb) {
+      out[out.length - 1] += c + (f[i + 1] ?? '');
+      i++;
+      continue;
+    } else if (c === ';' && !inq && !inb) {
+      out.push('');
+      continue;
+    }
+    out[out.length - 1] += c;
+  }
+  return out;
+}
 
-function compileNumber(pattern: string): (n: number, comma: boolean) => string {
+type Tok = { lit: string } | { num: string } | { text: true };
+
+/** Quoted text, `\x`, `_x` (a space), `*x` (fill: nothing), `[Red]` (ignored), `@`, `0 # ? . , %`. */
+function tokenize(sec: string): Tok[] {
+  const out: Tok[] = [];
+  for (let i = 0; i < sec.length; i++) {
+    const c = sec[i];
+    if (c === '"') {
+      let lit = '';
+      i++;
+      while (i < sec.length && sec[i] !== '"') lit += sec[i++];
+      out.push({ lit });
+    } else if (c === '\\') {
+      if (i + 1 < sec.length) out.push({ lit: sec[i + 1] });
+      i++;
+    } else if (c === '_') {
+      out.push({ lit: ' ' });
+      i++;
+    } else if (c === '*') i++;
+    else if (c === '[') {
+      while (i < sec.length && sec[i] !== ']') i++;
+    } else if (c === '@') out.push({ text: true });
+    else if ('0#?.,%'.includes(c)) out.push({ num: c });
+    else out.push({ lit: c });
+  }
+  return out;
+}
+
+function textSection(text: string, sec: string): string {
+  return tokenize(sec)
+    .map((t) => ('lit' in t ? t.lit : 'num' in t ? t.num : text))
+    .join('');
+}
+
+type NumberSection = (x: number, signed: boolean, comma: boolean) => string;
+
+/** One numeric section, compiled; mirrors format_number_section in eval.rs. `comma` (a
+ *  decimal-comma workbook) shows every pattern as "1.234,56": the pattern still decides
+ *  the decimals and the grouping. */
+function compileSection(sec: string): NumberSection {
+  if (sec.trim().toLowerCase() === 'general') {
+    return (x, signed, comma) => {
+      const s = formatNumberPlain(signed ? x : Math.abs(x));
+      return comma ? s.replace('.', ',') : s;
+    };
+  }
+  let prefix = '';
+  let core = '';
+  let suffix = '';
+  let state = 0;
+  let pct = false;
+  for (const t of tokenize(sec)) {
+    if ('num' in t) {
+      if (t.num === '%' && state === 2) {
+        pct = true;
+        suffix += '%';
+      } else if (state < 2) {
+        state = 1;
+        core += t.num;
+      } else suffix += t.num;
+    } else if ('lit' in t) {
+      if (state === 0) prefix += t.lit;
+      else {
+        state = 2;
+        suffix += t.lit;
+      }
+    }
+  }
+  if (!/[0#?]/.test(core)) {
+    return (x, signed) => `${signed && x < 0 ? '-' : ''}${prefix}${core}${suffix}`;
+  }
+  if (core.includes('%')) pct = true;
+  core = core.replace(/%/g, '');
+  // commas after the last digit placeholder divide by 1000 each ("#,##0," "0.0,,")
+  const trimmed = core.replace(/,+$/, '');
+  let scale = 1000 ** (core.length - trimmed.length);
+  core = trimmed;
+  const lastDot = core.lastIndexOf('.');
+  const lastComma = core.lastIndexOf(',');
+  let decimalComma = false;
+  if (lastDot >= 0 && lastComma >= 0) decimalComma = lastComma > lastDot;
+  else if (lastComma >= 0) {
+    const after = core.slice(lastComma + 1);
+    decimalComma = after.length > 0 && /^0+$/.test(after);
+  }
+  const decSep = decimalComma ? ',' : '.';
+  const grpSep = decimalComma ? '.' : ',';
+  const at = core.indexOf(decSep);
+  let intPat = at >= 0 ? core.slice(0, at) : core;
+  const fracPat = at >= 0 ? core.slice(at + 1) : null;
+  while (!decimalComma && intPat.endsWith(grpSep)) {
+    intPat = intPat.slice(0, -1);
+    scale *= 1000;
+  }
+  const grouped = intPat.includes(grpSep);
+  const fracPh = [...(fracPat ?? '')].filter((c) => '0#?'.includes(c));
+  const minDigits = [...intPat].filter((c) => c === '0').length;
+  const slots = [...intPat].filter((c) => '0#?'.includes(c)).length;
+  const leadQ = [...(intPat.match(/^[^0#]*/)?.[0] ?? '')].filter((c) => c === '?').length;
+  return (x0, signed, comma) => {
+    const ds = comma ? ',' : decSep;
+    const gs = comma ? '.' : grpSep;
+    const x = (pct ? x0 * 100 : x0) / scale;
+    const body = fixedAbs(x, fracPh.length);
+    const dot = body.indexOf('.');
+    let intDigits = dot >= 0 ? body.slice(0, dot) : body;
+    const frac = dot >= 0 ? [...body.slice(dot + 1)] : [];
+    const nonzero = /[1-9]/.test(body);
+    if (intDigits === '0') intDigits = '';
+    if (intDigits.length < minDigits) intDigits = '0'.repeat(minDigits - intDigits.length) + intDigits;
+    let g = intDigits;
+    if (grouped) {
+      g = '';
+      for (let i = 0; i < intDigits.length; i++) {
+        if (i > 0 && (intDigits.length - i) % 3 === 0) g += gs;
+        g += intDigits[i];
+      }
+    }
+    if (leadQ > 0 && intDigits.length < slots) g = ' '.repeat(Math.min(slots - intDigits.length, leadQ)) + g;
+    for (let j = frac.length; j > 0; j--) {
+      const ph = fracPh[j - 1];
+      if (ph === '0' || frac[j - 1] !== '0') break;
+      if (ph === '#') frac.splice(j - 1, 1);
+      else frac[j - 1] = ' ';
+    }
+    const num = fracPat !== null ? `${g}${ds}${frac.join('')}` : g;
+    const neg = signed && x < 0 && nonzero;
+    return `${neg ? '-' : ''}${prefix}${num}${pct && !suffix.includes('%') ? '%' : ''}${suffix}`;
+  };
+}
+
+type Compiled = { number: (n: number, comma: boolean) => string; text: ((s: string) => string) | null };
+const fmtCache = new Map<string, Compiled>();
+
+function compileNumber(pattern: string): Compiled {
   const cached = fmtCache.get(pattern);
   if (cached) return cached;
-  let fn: (n: number, comma: boolean) => string;
+  let out: Compiled;
   const p = pattern.trim();
   if (p.startsWith('currency:')) {
     const code = p.slice(9).trim().toUpperCase() || 'USD';
     const symbol = code === 'AOA' ? 'Kz' : code === 'EUR' ? '€' : code === 'USD' ? '$' : code === 'GBP' ? '£' : code;
-    const inner = compileNumber(code === 'AOA' ? `#,##0.00 "${symbol}"` : `${symbol}#,##0.00`);
-    fn = inner;
+    out = compileNumber(code === 'AOA' ? `#,##0.00 "${symbol}"` : `${symbol}#,##0.00`);
   } else {
-    // split prefix / core / suffix
-    let prefix = '';
-    let core = '';
-    let suffix = '';
-    let state = 0;
-    let inq = false;
-    for (const c of p) {
-      if (c === '"') {
-        inq = !inq;
-        if (state === 1) state = 2;
-        continue;
-      }
-      const numeric = !inq && '0#.,%'.includes(c);
-      if (state === 0 && numeric) {
-        state = 1;
-        core += c;
-      } else if (state === 0) prefix += c;
-      else if (state === 1 && numeric) core += c;
-      else if (state === 1) {
-        state = 2;
-        suffix += c;
-      } else suffix += c;
-    }
-    const pct = core.endsWith('%');
-    const lastDot = core.lastIndexOf('.');
-    const lastComma = core.lastIndexOf(',');
-    let decimalComma = false;
-    if (lastDot >= 0 && lastComma >= 0) decimalComma = lastComma > lastDot;
-    else if (lastComma >= 0) {
-      const after = core.slice(lastComma + 1).replace(/%$/, '');
-      decimalComma = after.length > 0 && /^0+$/.test(after);
-    }
-    const decimals = decimalComma ? (core.split(',').pop() ?? '').split('0').length - 1 : (core.split('.')[1] ?? '').split('0').length - 1;
-    const grouped = decimalComma ? core.includes('.') : core.includes(',');
-    const decSep = decimalComma ? ',' : '.';
-    const grpSep = decimalComma ? '.' : ',';
-    // In a decimal-comma workbook every pattern shows "1.234,56"; the pattern still decides
-    // the decimals and the grouping.
-    fn = (n: number, comma: boolean) => {
-      const ds = comma ? ',' : decSep;
-      const gs = comma ? '.' : grpSep;
-      const x = pct ? n * 100 : n;
-      const body = Math.abs(x).toFixed(decimals);
-      const [intPart, frac] = body.split('.');
-      let g = intPart;
-      if (grouped) {
-        g = '';
-        for (let i = 0; i < intPart.length; i++) {
-          if (i > 0 && (intPart.length - i) % 3 === 0) g += gs;
-          g += intPart[i];
-        }
-      }
-      const num = frac !== undefined ? `${g}${ds}${frac}` : g;
-      const neg = x < 0 && /[1-9]/.test(num);
-      return `${neg ? '-' : ''}${prefix}${num}${pct ? '%' : ''}${suffix}`;
+    const sections = splitSections(p);
+    const fns = sections.slice(0, 3).map(compileSection);
+    const n = sections.length;
+    out = {
+      number: (x, comma) => {
+        if (n === 1) return fns[0](x, true, comma);
+        if (x < 0) return fns[1](-x, false, comma);
+        if (n >= 3 && x === 0) return fns[2](x, false, comma);
+        return fns[0](x, true, comma);
+      },
+      text: n >= 4 ? (s) => textSection(s, sections[3]) : n === 1 && sections[0].includes('@') ? (s) => textSection(s, sections[0]) : null,
     };
   }
   if (fmtCache.size > 500) fmtCache.clear();
-  fmtCache.set(pattern, fn);
-  return fn;
+  fmtCache.set(pattern, out);
+  return out;
 }
 
 /** Format a number with a spreadsheet-style pattern. `canonical` ignores the workbook's decimal
@@ -171,13 +283,17 @@ export function formatNumber(n: number, pattern?: string, canonical = false): st
     return comma ? s.replace('.', ',') : s;
   }
   if (isDatePattern(p)) return formatDate(n, p);
-  return compileNumber(p)(n, comma);
+  return compileNumber(p).number(n, comma);
 }
 
 export function displayValue(v: CellValue, f?: Format, canonical = false): string {
   if (v === null || v === undefined) return '';
   if ('n' in v) return formatNumber(v.n, f?.number_format, canonical);
-  if ('s' in v) return v.s;
+  if ('s' in v) {
+    // a pattern's text section ("…;…;…;@") applies to text, as in TEXT()
+    const p = f?.number_format?.trim();
+    return p && !isDatePattern(p) ? (compileNumber(p).text?.(v.s) ?? v.s) : v.s;
+  }
   if ('b' in v) return v.b ? 'TRUE' : 'FALSE';
   if ('e' in v) return v.e;
   return '';

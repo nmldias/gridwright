@@ -302,18 +302,9 @@ pub fn parse_number_literal(t: &str) -> Option<f64> {
     Some(if neg { -n } else { n })
 }
 
+/// A number as text, as Excel's General format writes it (15 significant digits).
 pub fn format_number(n: f64) -> String {
-    if n.is_nan() {
-        return "#NUM!".into();
-    }
-    if n == n.trunc() && n.abs() < 1e15 {
-        format!("{}", n as i64)
-    } else {
-        // up to 10 significant decimals, trimmed
-        let s = format!("{:.10}", n);
-        let s = s.trim_end_matches('0').trim_end_matches('.');
-        s.to_string()
-    }
+    crate::formula::numerics::general_text(n)
 }
 
 impl Serialize for Value {
@@ -1186,7 +1177,7 @@ mod tests {
     fn number_display() {
         assert_eq!(format_number(3.0), "3");
         assert_eq!(format_number(3.5), "3.5");
-        assert_eq!(format_number(1.0 / 3.0), "0.3333333333");
+        assert_eq!(format_number(1.0 / 3.0), "0.333333333333333");
         assert_eq!(format_number(-0.1 - 0.2), "-0.3");
     }
 
