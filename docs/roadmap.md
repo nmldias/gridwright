@@ -20,7 +20,7 @@ before editing.
 | 2.4 | Decimal comma (`1.234,56`) as a document setting: typed/pasted input, display, filters, highlight rules, validation; strict grouping, `(1.234,00)` negative, `08.10.2026` stays a date | #11 |
 | 2.5 | Comparison at 15 significant digits: operators, criteria, lookups, CHECK, filters, validation, highlight rules | #13 |
 | 2.6 | Rounding and number text on the 15-digit decimal value: ROUND family, MROUND, CEILING/FLOOR, TEXT with sections, FIXED, DOLLAR; General format for number → text; the browser formatter checked against the engine | #14 |
-| 2.7 | IRR / XIRR / RATE: residual relative to the discounted terms, `#NUM!` when not converged, bracket nearest the guess, dates before the first `#NUM!`, iterations on the work budget | #PR |
+| 2.7 | IRR / XIRR / RATE: residual relative to the discounted terms, `#NUM!` when not converged, bracket nearest the guess, dates before the first `#NUM!`, iterations on the work budget | #15 |
 
 Regression suites for these: `e2e/server_gates.py`, `history_log.mjs`, `sql_readonly.mjs`, `python_sandbox.mjs`,
 `code_trust.py`, `installer_nohup.sh`, `security.py`, `engine_limits.mjs`, `import_dates.mjs`,
@@ -66,7 +66,7 @@ Baselines below were reproduced on the shipped engine at `main` `8da8d82`, e.g. 
   `main`) and the browser formatter against the engine (9,840 number × pattern pairs; `main` already differed on
   General for long decimals). Not done: General fitted to column width, TEXT conditions/scientific/fractions.
 
-### 2.7 IRR / XIRR / RATE convergence — `done` (#PR)
+### 2.7 IRR / XIRR / RATE convergence — `done` (#15)
 * **Problem:** absolute tolerance, so small-scale cash flows return the guess; the bisection fallback returns its
   midpoint even when it did not converge; XNPV/XIRR accept dates before the first one.
 * **Approach:** relative residual, `#NUM!` when not converged, `#NUM!` for a date before the first; keep Newton with
