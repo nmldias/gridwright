@@ -112,3 +112,286 @@ ROUND(XIRR({-10000,2750,4250,3250,2750}*1E-9,{39448,39508,39751,39859,39904}),12
 ROUND(RATE(48,-200E-9,8000E-9),12)=ROUND(RATE(48,-200,8000),12)	TRUE	ms:rate
 ROUND(IRR({-1E-12,2E-12}),9)	1	ms:irr
 ROUND(XIRR({-1E-12,2E-12},{39448,39813}),9)	1	ms:xirr
+#
+# ---- 2.9 Excel-verified cases for eval.rs (review 11 Oct). Each is an example from the Microsoft page
+# of the function (ms:<function>); dates are compared with DATE() so no serial is typed by hand.
+# ms:leapyear  "Excel incorrectly assumes that the year 1900 is a leap year"
+#              (https://learn.microsoft.com/office/troubleshoot/excel/wrongly-assumes-1900-is-leap-year):
+#              serial 60 is 29 Feb 1900, serial 1 is 1 Jan 1900, and weekdays before March 1900 follow the serial.
+DATE(1900,1,1)	1	ms:leapyear
+DATE(1900,2,28)	59	ms:leapyear
+DATE(1900,2,29)	60	ms:leapyear
+DATE(1900,3,1)	61	ms:leapyear
+DATE(2008,1,1)	39448	ms:date
+DAY(60)	29	ms:leapyear
+MONTH(60)	2	ms:leapyear
+DAY(59)	28	ms:leapyear
+DAY(61)	1	ms:leapyear
+MONTH(61)	3	ms:leapyear
+YEAR(1)	1900	ms:leapyear
+WEEKDAY(1)	1	ms:leapyear
+WEEKDAY(61)	5	ms:leapyear
+TEXT(60,"yyyy-mm-dd")	"1900-02-29"	ms:leapyear
+TEXT(59,"yyyy-mm-dd")	"1900-02-28"	ms:leapyear
+YEAR(DATE(2008,7,5))	2008	ms:year
+MONTH(DATE(2011,4,15))	4	ms:month
+DAY(DATE(2011,4,15))	15	ms:day
+WEEKDAY(DATE(2008,2,14))	5	ms:weekday
+WEEKDAY(DATE(2008,2,14),2)	4	ms:weekday
+WEEKDAY(DATE(2008,2,14),3)	3	ms:weekday
+EDATE(DATE(2011,1,15),1)=DATE(2011,2,15)	TRUE	ms:edate
+EDATE(DATE(2011,1,15),-1)=DATE(2010,12,15)	TRUE	ms:edate
+EDATE(DATE(2011,1,15),2)=DATE(2011,3,15)	TRUE	ms:edate
+EOMONTH(DATE(2011,1,1),1)=DATE(2011,2,28)	TRUE	ms:eomonth
+EOMONTH(DATE(2011,1,1),-3)=DATE(2010,10,31)	TRUE	ms:eomonth
+DAYS(DATE(2021,3,15),DATE(2021,2,1))	42	ms:days
+DATEDIF(DATE(2001,1,1),DATE(2003,1,1),"Y")	2	ms:datedif
+DATEDIF(DATE(2001,6,1),DATE(2002,8,15),"D")	440	ms:datedif
+DATEDIF(DATE(2001,6,1),DATE(2002,8,15),"YD")	75	ms:datedif
+DAYS360(DATE(2011,1,30),DATE(2011,2,1))	1	ms:days360
+DAYS360(DATE(2011,1,1),DATE(2011,12,31))	360	ms:days360
+ROUND(YEARFRAC(DATE(2012,1,1),DATE(2012,7,30)),8)	0.58055556	ms:yearfrac
+ROUND(YEARFRAC(DATE(2012,1,1),DATE(2012,7,30),1),8)	0.57650273	ms:yearfrac
+ROUND(YEARFRAC(DATE(2012,1,1),DATE(2012,7,30),3),8)	0.57808219	ms:yearfrac
+NETWORKDAYS(DATE(2012,10,1),DATE(2013,3,1))	110	ms:networkdays
+NETWORKDAYS(DATE(2012,10,1),DATE(2013,3,1),DATE(2012,11,22))	109	ms:networkdays
+NETWORKDAYS(DATE(2012,10,1),DATE(2013,3,1),{41235,41247,41295})	107	ms:networkdays
+NETWORKDAYS.INTL(DATE(2006,1,1),DATE(2006,1,31))	22	ms:networkdays.intl
+NETWORKDAYS.INTL(DATE(2006,1,31),DATE(2006,1,1))	-22	ms:networkdays.intl
+NETWORKDAYS.INTL(DATE(2006,1,1),DATE(2006,2,1),7,{38719,38733})	22	ms:networkdays.intl
+NETWORKDAYS.INTL(DATE(2006,1,1),DATE(2006,2,1),"0010001",{38719,38733})	20	ms:networkdays.intl
+NETWORKDAYS.INTL(DATE(2006,1,1),DATE(2006,1,31),8)	#NUM!	ms:networkdays.intl
+NETWORKDAYS.INTL(DATE(2006,1,1),DATE(2006,1,31),0)	#NUM!	ms:networkdays.intl
+NETWORKDAYS.INTL(DATE(2006,1,1),DATE(2006,1,31),"weekend")	#VALUE!	ms:networkdays.intl
+WORKDAY(DATE(2008,10,1),151)=DATE(2009,4,30)	TRUE	ms:workday
+WORKDAY(DATE(2008,10,1),151,{39778,39786,39834})=DATE(2009,5,5)	TRUE	ms:workday
+WORKDAY.INTL(DATE(2012,1,1),30,0)	#NUM!	ms:workday.intl
+WORKDAY.INTL(DATE(2012,1,1),90,11)=DATE(2012,4,14)	TRUE	ms:workday.intl
+WORKDAY.INTL(DATE(2012,1,1),30,17)=DATE(2012,2,5)	TRUE	ms:workday.intl
+WORKDAY.INTL(DATE(2012,1,1),30,"0000011x")	#VALUE!	ms:workday.intl
+#
+# text
+LEFT("Sale Price",4)	"Sale"	ms:left
+LEFT("Sweden")	"S"	ms:left
+RIGHT("Sale Price",5)	"Price"	ms:right
+RIGHT("Stock Number")	"r"	ms:right
+MID("Fluid Flow",1,5)	"Fluid"	ms:mid
+MID("Fluid Flow",7,20)	"Flow"	ms:mid
+MID("Fluid Flow",20,5)	""	ms:mid
+LEN("Phoenix, AZ")	11	ms:len
+LEN("")	0	ms:len
+LEN("     One   ")	11	ms:len
+UPPER("total")	"TOTAL"	ms:upper
+LOWER("E. E. Cummings")	"e. e. cummings"	ms:lower
+PROPER("this is a TITLE")	"This Is A Title"	ms:proper
+PROPER("2-way street")	"2-Way Street"	ms:proper
+PROPER("76BudGet")	"76Budget"	ms:proper
+TRIM(" First Quarter Earnings ")	"First Quarter Earnings"	ms:trim
+FIND("M","Miriam McGovern")	1	ms:find
+FIND("m","Miriam McGovern")	6	ms:find
+FIND("M","Miriam McGovern",3)	8	ms:find
+SEARCH("e","Statements",6)	7	ms:search
+SEARCH("margin","Profit Margin")	8	ms:search
+SUBSTITUTE("Sales Data","Sales","Cost")	"Cost Data"	ms:substitute
+SUBSTITUTE("Quarter 1, 2008","1","2",1)	"Quarter 2, 2008"	ms:substitute
+SUBSTITUTE("Quarter 1, 2011","1","2",3)	"Quarter 1, 2012"	ms:substitute
+SUBSTITUTE("Quarter 1, 2011","1","2",9)	"Quarter 1, 2011"	ms:substitute
+SUBSTITUTE("Quarter 1, 2011","1","2",0)	#VALUE!	ms:substitute
+REPLACE("abcdefghijk",6,5,"*")	"abcde*k"	ms:replace
+REPLACE("2009",3,2,"10")	"2010"	ms:replace
+REPT("*-",3)	"*-*-*-"	ms:rept
+EXACT("word","word")	TRUE	ms:exact
+EXACT("Word","word")	FALSE	ms:exact
+EXACT("w ord","word")	FALSE	ms:exact
+CHAR(65)	"A"	ms:char
+CHAR(33)	"!"	ms:char
+CODE("A")	65	ms:code
+CODE("!")	33	ms:code
+UNICHAR(66)	"B"	ms:unichar
+UNICODE("B")	66	ms:unicode
+CLEAN(CHAR(9)&"Monthly report"&CHAR(10))	"Monthly report"	ms:clean
+TEXTJOIN(" ",TRUE,"The","sun","will","come","up","tomorrow.")	"The sun will come up tomorrow."	ms:textjoin
+TEXTBEFORE("Little Red Riding Hood's red hood","basket")	#N/A	ms:textbefore
+NUMBERVALUE("2.500,27",",",".")	2500.27	ms:numbervalue
+NUMBERVALUE("3.5%")	0.035	ms:numbervalue
+T("Rainfall")	"Rainfall"	ms:t
+T(19)	""	ms:t
+N(7)	7	ms:n
+N("Even")	0	ms:n
+N(TRUE)	1	ms:n
+#
+# maths
+ABS(-4)	4	ms:abs
+MOD(3,2)	1	ms:mod
+MOD(-3,2)	1	ms:mod
+MOD(3,-2)	-1	ms:mod
+MOD(-3,-2)	-1	ms:mod
+INT(8.9)	8	ms:int
+INT(-8.9)	-9	ms:int
+POWER(5,2)	25	ms:power
+SQRT(16)	4	ms:sqrt
+SQRT(-16)	#NUM!	ms:sqrt
+QUOTIENT(5,2)	2	ms:quotient
+QUOTIENT(4.5,3.1)	1	ms:quotient
+QUOTIENT(-10,3)	-3	ms:quotient
+GCD(5,2)	1	ms:gcd
+GCD(24,36)	12	ms:gcd
+GCD(5,0)	5	ms:gcd
+LCM(5,2)	10	ms:lcm
+LCM(24,36)	72	ms:lcm
+FACT(5)	120	ms:fact
+FACT(1.9)	1	ms:fact
+FACT(0)	1	ms:fact
+FACT(-1)	#NUM!	ms:fact
+COMBIN(8,2)	28	ms:combin
+PERMUT(100,3)	970200	ms:permut
+PERMUT(3,2)	6	ms:permut
+EVEN(1.5)	2	ms:even
+EVEN(3)	4	ms:even
+EVEN(2)	2	ms:even
+EVEN(-1)	-2	ms:even
+ODD(1.5)	3	ms:odd
+ODD(3)	3	ms:odd
+ODD(2)	3	ms:odd
+ODD(-1)	-1	ms:odd
+ODD(-2)	-3	ms:odd
+SIGN(10)	1	ms:sign
+SIGN(4-4)	0	ms:sign
+SIGN(-0.00003)	-1	ms:sign
+SUMSQ(3,4)	25	ms:sumsq
+LOG(10)	1	ms:log
+LOG(8,2)	3	ms:log
+LOG10(1E5)	5	ms:log10
+BASE(7,2)	"111"	ms:base
+BASE(100,16)	"64"	ms:base
+BASE(15,2,10)	"0000001111"	ms:base
+DECIMAL("FF",16)	255	ms:decimal
+DECIMAL(111,2)	7	ms:decimal
+DECIMAL("zap",36)	45745	ms:decimal
+CEILING.MATH(24.3,5)	25	ms:ceiling.math
+CEILING.MATH(6.7)	7	ms:ceiling.math
+CEILING.MATH(-8.1,2)	-8	ms:ceiling.math
+CEILING.MATH(-5.5,2,-1)	-6	ms:ceiling.math
+FLOOR.MATH(24.3,5)	20	ms:floor.math
+FLOOR.MATH(6.7)	6	ms:floor.math
+FLOOR.MATH(-8.1,2)	-10	ms:floor.math
+FLOOR.MATH(-5.5,2,-1)	-4	ms:floor.math
+DEGREES(PI())	180	ms:degrees
+ROUND(RADIANS(270),6)	4.712389	ms:radians
+#
+# statistics
+AVERAGE(10,7,9,27,2)	11	ms:average
+MEDIAN(1,2,3,4,5)	3	ms:median
+MEDIAN(1,2,3,4,5,6)	3.5	ms:median
+MODE({5.6,4,4,3,2,4})	4	ms:mode
+LARGE({3,5,3,5,4,4,2,4,6,7},3)	5	ms:large
+LARGE({3,5,3,5,4,4,2,4,6,7},7)	4	ms:large
+SMALL({3,4,5,2,3,4,5,6,4,7},4)	4	ms:small
+SMALL({1,4,8,3,7,12,54,8,23},2)	3	ms:small
+ROUND(STDEV({1345,1301,1368,1322,1310,1370,1318,1350,1303,1299}),8)	27.46391572	ms:stdev
+ROUND(VAR({1345,1301,1368,1322,1310,1370,1318,1350,1303,1299}),7)	754.2666667	ms:var
+ROUND(GEOMEAN({4,5,8,7,11,4,3}),6)	5.476987	ms:geomean
+ROUND(HARMEAN({4,5,8,7,11,4,3}),9)	5.028375962	ms:harmean
+ROUND(AVEDEV({4,5,6,7,5,4,3}),9)	1.020408163	ms:avedev
+DEVSQ({4,5,8,7,11,4,3})	48	ms:devsq
+ROUND(TRIMMEAN({4,5,6,7,2,3,4,5,1,2,3},0.2),9)	3.777777778	ms:trimmean
+PERCENTILE({1,3,2,4},0.3)	1.9	ms:percentile
+QUARTILE({1,2,4,7,8,9,10,12},1)	3.5	ms:quartile
+PERCENTRANK({13,12,11,8,4,3,2,1,1,1},2)	0.333	ms:percentrank
+PERCENTRANK({13,12,11,8,4,3,2,1,1,1},4)	0.555	ms:percentrank
+PERCENTRANK({13,12,11,8,4,3,2,1,1,1},8)	0.666	ms:percentrank
+PERCENTRANK({13,12,11,8,4,3,2,1,1,1},5)	0.583	ms:percentrank
+ROUND(CORREL({3,2,4,5,6},{9,7,12,15,17}),9)	0.997054486	ms:correl
+ROUND(SLOPE({2,3,9,1,8,7,5},{6,5,11,7,5,4,4}),9)	0.305555556	ms:slope
+ROUND(INTERCEPT({2,3,9,1,8},{6,5,11,7,5}),9)	0.048387097	ms:intercept
+ROUND(RSQ({2,3,9,1,8,7,5},{6,5,11,7,5,4,4}),5)	0.05795	ms:rsq
+ROUND(FORECAST(30,{6,7,9,15,21},{20,28,31,38,40}),6)	10.607253	ms:forecast
+ROUND(STEYX({2,3,9,1,8,7,5},{6,5,11,7,5,4,4}),6)	3.305719	ms:steyx
+COVARIANCE.P({3,2,4,5,6},{9,7,12,15,17})	5.2	ms:covariance.p
+ROUND(COVARIANCE.S({2,4,8},{5,11,12}),9)	9.666666667	ms:covariance.s
+ROUND(STANDARDIZE(42,40,1.5),9)	1.333333333	ms:standardize
+ROUND(NORM.DIST(42,40,1.5,TRUE),4)	0.9088	ms:norm.dist
+ROUND(NORM.DIST(42,40,1.5,FALSE),5)	0.10934	ms:norm.dist
+ROUND(NORM.INV(0.908789,40,1.5),4)	42	ms:norm.inv
+ROUND(NORM.S.INV(0.908789),4)	1.3333	ms:norm.s.inv
+COUNTIF({"apples","oranges","peaches","apples"},"apples")	2	ms:countif
+COUNTIF({32,54,75,86},">55")	2	ms:countif
+SUMIF({100000,200000,300000,400000},">160000",{7000,14000,21000,28000})	63000	ms:sumif
+SUMIF({100000,200000,300000,400000},">160000")	900000	ms:sumif
+SUMIF({100000,200000,300000,400000},300000,{7000,14000,21000,28000})	21000	ms:sumif
+AVERAGEIF({7000,14000,21000,28000},"<23000")	14000	ms:averageif
+AVERAGEIF({100000,200000,300000,400000},"<23000")	#DIV/0!	ms:averageif
+#
+# finance (Microsoft shows these rounded to cents)
+ROUND(PMT(0.08/12,10,10000),2)	-1037.03	ms:pmt
+ROUND(PMT(0.06/12,18*12,0,50000),2)	-129.08	ms:pmt
+ROUND(IPMT(0.1/12,1,3*12,8000),2)	-66.67	ms:ipmt
+ROUND(IPMT(0.1,3,3,8000),2)	-292.45	ms:ipmt
+ROUND(PPMT(0.1/12,1,2*12,2000),2)	-75.62	ms:ppmt
+ROUND(PPMT(0.08,10,10,200000),2)	-27598.05	ms:ppmt
+ROUND(PV(0.08/12,12*20,500,,0),2)	-59777.15	ms:pv
+ROUND(PV(0.08/12,12*20,500),2)	-59777.15	ms:pv
+ROUND(FV(0.06/12,10,-200,-500,1),2)	2581.4	ms:fv
+ROUND(FV(0.12/12,12,-1000),2)	12682.5	ms:fv
+ROUND(FV(0.11/12,35,-2000,,1),2)	82846.25	ms:fv
+ROUND(NPER(0.12/12,-100,-1000,10000,1),2)	59.67	ms:nper
+ROUND(NPER(0.12/12,-100,-1000,10000),2)	60.08	ms:nper
+ROUND(NPER(0.12/12,-100,-1000),2)	-9.58	ms:nper
+ROUND(NPV(0.1,-10000,3000,4200,6800),2)	1188.44	ms:npv
+SLN(30000,7500,10)	2250	ms:sln
+ROUND(SYD(30000,7500,10,1),2)	4090.91	ms:syd
+ROUND(SYD(30000,7500,10,10),2)	409.09	ms:syd
+ROUND(DB(1000000,100000,6,1,7),2)	186083.33	ms:db
+ROUND(DB(1000000,100000,6,2,7),2)	259639.42	ms:db
+ROUND(DDB(2400,300,10*365,1),2)	1.32	ms:ddb
+ROUND(DDB(2400,300,10*12,1,2),2)	40	ms:ddb
+DDB(2400,300,10,1,2)	480	ms:ddb
+ROUND(DDB(2400,300,10,2,1.5),2)	306	ms:ddb
+ROUND(DDB(2400,300,10,10),2)	22.12	ms:ddb
+ROUND(EFFECT(0.0525,4),6)	0.053543	ms:effect
+ROUND(NOMINAL(0.053543,4),6)	0.0525	ms:nominal
+ROUND(FVSCHEDULE(1,{0.09,0.11,0.1}),5)	1.33089	ms:fvschedule
+ROUND(CUMIPMT(0.09/12,30*12,125000,13,24,0),2)	-11135.23	ms:cumipmt
+ROUND(CUMIPMT(0.09/12,30*12,125000,1,1,0),2)	-937.5	ms:cumipmt
+ROUND(CUMPRINC(0.09/12,30*12,125000,13,24,0),7)	-934.1071234	ms:cumprinc
+ROUND(CUMPRINC(0.09/12,30*12,125000,1,1,0),8)	-68.27827118	ms:cumprinc
+ROUND(ISPMT(0.1/12,1,3*12,8000000),1)	-64814.8	ms:ispmt
+ROUND(ISPMT(0.1,1,3,8000000),2)	-533333.33	ms:ispmt
+ROUND(RRI(96,10000,11000),7)	0.0009933	ms:rri
+ROUND(PDURATION(0.025,2000,2200),2)	3.86	ms:pduration
+ROUND(PDURATION(0.025/12,1000,1200),1)	87.6	ms:pduration
+#
+# logic, lookup and information
+SWITCH(2,1,"Sunday",2,"Monday",3,"Tuesday","No match")	"Monday"	ms:switch
+SWITCH(99,1,"Sunday",2,"Monday",3,"Tuesday")	#N/A	ms:switch
+XOR(3>0,2<9)	FALSE	ms:xor
+XOR(3>12,4>6)	FALSE	ms:xor
+VLOOKUP(2,{1,"a";2,"b";3,"c"},2,FALSE)	"b"	ms:vlookup
+MATCH(39,{25,38,40,41},1)	2	ms:match
+MATCH(41,{25,38,40,41},0)	4	ms:match
+MATCH(40,{25,38,40,41},-1)	#N/A	ms:match
+INDEX({1,2;3,4},2,2)	4	ms:index
+CHOOSE(2,"1st","2nd","3rd","Finished")	"2nd"	ms:choose
+LOOKUP(4.19,{4.14,4.19,5.17,5.77,6.39},{"red","orange","yellow","green","blue"})	"orange"	ms:lookup
+LOOKUP(5.75,{4.14,4.19,5.17,5.77,6.39},{"red","orange","yellow","green","blue"})	"yellow"	ms:lookup
+LOOKUP(7.66,{4.14,4.19,5.17,5.77,6.39},{"red","orange","yellow","green","blue"})	"blue"	ms:lookup
+LOOKUP(0,{4.14,4.19,5.17,5.77,6.39},{"red","orange","yellow","green","blue"})	#N/A	ms:lookup
+ROWS({1,2,3;4,5,6})	2	ms:rows
+COLUMNS({1,2,3;4,5,6})	3	ms:columns
+ROWS(1/0)	#DIV/0!	ms:rows
+COLUMNS(NA())	#N/A	ms:columns
+TYPE(1)	1	ms:type
+TYPE("a")	2	ms:type
+TYPE(TRUE)	4	ms:type
+TYPE(1/0)	16	ms:type
+TYPE({1,2})	64	ms:type
+ERROR.TYPE(1/0)	2	ms:error.type
+ERROR.TYPE(NA())	7	ms:error.type
+#
+# RANDARRAY([rows],[columns],[min],[max],[whole_number]) (ms:randarray): the shape and range, not the draw
+ROWS(RANDARRAY(3,2))	3	ms:randarray
+COLUMNS(RANDARRAY(3,2))	2	ms:randarray
+AND(RANDARRAY(5,5)>=0,RANDARRAY(5,5)<1)	TRUE	ms:randarray
+AND(RANDARRAY(5,5,10,20,TRUE)>=10,RANDARRAY(5,5,10,20,TRUE)<=20)	TRUE	ms:randarray
+SUM(--(RANDARRAY(4,4,1,9,TRUE)=INT(RANDARRAY(4,4,1,9,TRUE))))>=0	TRUE	ms:randarray
+RANDARRAY(2,2,5,1)	#VALUE!	ms:randarray

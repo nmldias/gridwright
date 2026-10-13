@@ -55,7 +55,7 @@ pub fn rename_table(src: &str, old: &str, new: &str) -> String {
 /// through a name, is re-evaluated on every recalculation and when the host sets the clock, as in
 /// Excel.
 pub const VOLATILE_FUNCTIONS: &[&str] = &[
-    "NOW", "TODAY", "RAND", "RANDBETWEEN", "INDIRECT", "OFFSET", "FX", "FXRATE", "AGEING", "AGING",
+    "NOW", "TODAY", "RAND", "RANDARRAY", "RANDBETWEEN", "INDIRECT", "OFFSET", "FX", "FXRATE", "AGEING", "AGING",
     "AGE_BUCKET",
 ];
 /// A formula's dependency rectangles and whether it is volatile, from one parse.
@@ -92,7 +92,7 @@ fn expr_volatile(e: &Expr, wb: &Workbook, depth: u32) -> bool {
                     .and_then(|r| parse(formula_body(&r.reference)).ok())
                     .is_some_and(|x| expr_volatile(&x, wb, depth + 1))
         }
-        Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Ref(_) | Expr::ErrorLit(_) => false,
+        Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Ref(_) | Expr::ErrorLit(_) | Expr::Missing => false,
     }
 }
 /// Rectangles a formula depends on (empty when it does not parse).
@@ -985,7 +985,8 @@ mod extended_tests {
         close(&wb, "DB(1000000,100000,6,1,7)", 186083.33, 0.01);
         close(&wb, "RRI(10,1000,2000)", 2f64.powf(0.1) - 1.0, 1e-9);
         close(&wb, "PDURATION(0.025,2000,2200)", 1.1f64.ln() / 1.025f64.ln(), 1e-9);
-        close(&wb, "ISPMT(0.1/12,1,36,8000000)", -66666.67, 0.01);
+        // Microsoft's ISPMT page: periods count from zero, so period 1 of this loan is -64,814.8 (was -66,666.67, period 0)
+        close(&wb, "ISPMT(0.1/12,1,36,8000000)", -64814.81, 0.01);
         close(&wb, "CUMIPMT(0.09/12,360,125000,13,24,0)", -11135.23, 0.01);
         close(&wb, "CUMPRINC(0.09/12,360,125000,13,24,0)", -934.11, 0.01);
         close(&wb, "FVSCHEDULE(1000,{0.09,0.11,0.1})", 1000.0 * 1.09 * 1.11 * 1.1, 1e-6);
@@ -1228,6 +1229,7 @@ mod name_coverage {
         ("QUOTIENT", "QUOTIENT()"),
         ("RADIANS", "RADIANS()"),
         ("RAND", "RAND()"),
+        ("RANDARRAY", "RANDARRAY()"),
         ("RANDBETWEEN", "RANDBETWEEN()"),
         ("RANK", "RANK()"),
         ("RANK.AVG", "RANK.AVG()"),
