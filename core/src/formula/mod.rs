@@ -317,6 +317,59 @@ mod tests {
         evaluate(wb, 1, Some(CellKey::new(4, 2)), f)
     }
 
+    /// XLOOKUP and XMATCH match_mode / search_mode (the Excel examples are in excel_cases.tsv).
+    #[test]
+    fn xlookup_and_xmatch_modes() {
+        let wb = book();
+        let num = |f: &str| ev(&wb, f);
+        let n = Value::Number;
+        let na = Value::Error(ErrorKind::NA);
+        let bad = Value::Error(ErrorKind::Value);
+        // next smaller / larger, linear and binary, ascending and descending
+        assert_eq!(num("XMATCH(25,{10,20,30,40})"), na);
+        assert_eq!(num("XMATCH(25,{10,20,30,40},-1)"), n(2.0));
+        assert_eq!(num("XMATCH(25,{10,20,30,40},1)"), n(3.0));
+        assert_eq!(num("XMATCH(25,{40,10,30,20},-1)"), n(4.0));
+        assert_eq!(num("XMATCH(25,{40,10,30,20},1)"), n(3.0));
+        assert_eq!(num("XMATCH(5,{10,20},-1)"), na);
+        assert_eq!(num("XMATCH(50,{10,20},1)"), na);
+        assert_eq!(num("XMATCH(25,{10,20,30,40},-1,2)"), n(2.0));
+        assert_eq!(num("XMATCH(25,{10,20,30,40},1,2)"), n(3.0));
+        assert_eq!(num("XMATCH(30,{10,20,30,40},0,2)"), n(3.0));
+        assert_eq!(num("XMATCH(25,{10,20,30,40},0,2)"), na);
+        assert_eq!(num("XMATCH(25,{40,30,20,10},-1,-2)"), n(3.0));
+        assert_eq!(num("XMATCH(25,{40,30,20,10},1,-2)"), n(2.0));
+        assert_eq!(num("XMATCH(5,{10,20,30},-1,2)"), na);
+        assert_eq!(num("XMATCH(99,{10,20,30},1,2)"), na);
+        // last to first
+        assert_eq!(num("XMATCH(20,{10,20,20,40})"), n(2.0));
+        assert_eq!(num("XMATCH(20,{10,20,20,40},0,-1)"), n(3.0));
+        // next smaller only among numbers; text is another type
+        assert_eq!(num("XMATCH(25,{\"x\",10,\"y\"},-1)"), n(2.0));
+        // wildcards, ignoring case; ~ takes * and ? literally
+        assert_eq!(num("XMATCH(\"b*\",{\"apple\",\"Banana\",\"berry\"},2)"), n(2.0));
+        assert_eq!(num("XMATCH(\"b*\",{\"apple\",\"Banana\",\"berry\"},2,-1)"), n(3.0));
+        assert_eq!(num("XMATCH(\"?pple\",{\"apple\"},2)"), n(1.0));
+        assert_eq!(num("XMATCH(\"*~*\",{\"a\",\"b*\"},2)"), n(2.0));
+        assert_eq!(num("XMATCH(\"a~?\",{\"ab\",\"a?\"},2)"), n(2.0));
+        assert_eq!(num("XMATCH(\"b*\",{\"apple\",\"b*\"})"), n(2.0));
+        assert_eq!(num(&format!("XMATCH(\"{}b\",{{\"{}\"}},2)", "*a".repeat(30), "a".repeat(200))), na);
+        // XLOOKUP
+        assert_eq!(num("XLOOKUP(25,{10,20,30},{\"a\",\"b\",\"c\"},\"none\",1)"), Value::Text("c".into()));
+        assert_eq!(num("XLOOKUP(25,{10,20,30},{\"a\",\"b\",\"c\"},\"none\",-1)"), Value::Text("b".into()));
+        assert_eq!(num("XLOOKUP(5,{10,20,30},{\"a\",\"b\",\"c\"},\"none\",-1)"), Value::Text("none".into()));
+        assert_eq!(num("XLOOKUP(5,{10,20,30},{\"a\",\"b\",\"c\"},,-1)"), na);
+        assert_eq!(num("XLOOKUP(20,{10,20,20},{\"a\",\"b\",\"c\"},,0,-1)"), Value::Text("c".into()));
+        assert_eq!(num("XLOOKUP(\"ba*\",{\"apple\",\"banana\"},{1,2},,2)"), n(2.0));
+        assert_eq!(num("TEXTJOIN(\",\",,XLOOKUP({25,5},{10,20,30},{\"a\",\"b\",\"c\"},\"-\",-1))"), Value::Text("b,-".into()));
+        // other modes are #VALUE!
+        assert_eq!(num("XMATCH(1,{1},3)"), bad);
+        assert_eq!(num("XMATCH(1,{1},0,0)"), bad);
+        assert_eq!(num("XLOOKUP(1,{1},{1},,0,3)"), bad);
+        // COUNTIF criteria use the same wildcards
+        assert_eq!(num("COUNTIF(B1:B2,\"b*\")"), n(1.0));
+    }
+
     #[test]
     fn arithmetic_and_refs() {
         let wb = book();

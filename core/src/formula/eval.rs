@@ -782,18 +782,121 @@ fn parse_criteria(v: &Value) -> Criteria {
     }
 }
 
+/// Excel's wildcards, ignoring case: `*` any run of characters, `?` one character, `~` before
+/// `*`, `?` or `~` takes it literally. Greedy with one backtrack point, so the time is at most
+/// pattern × text (the recursive version was exponential on patterns such as `*a*a*a*b`).
 fn wildcard_match(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.to_lowercase().chars().collect();
-    let t: Vec<char> = text.to_lowercase().chars().collect();
-    fn go(p: &[char], t: &[char]) -> bool {
-        match p.first() {
-            None => t.is_empty(),
-            Some('*') => (0..=t.len()).any(|i| go(&p[1..], &t[i..])),
-            Some('?') => !t.is_empty() && go(&p[1..], &t[1..]),
-            Some(c) => !t.is_empty() && t[0] == *c && go(&p[1..], &t[1..]),
+    #[derive(PartialEq)]
+    enum Tok {
+        Any,
+        One,
+        Lit(char),
+    }
+    let mut p = vec![];
+    let mut chars = pattern.to_lowercase().chars().collect::<Vec<char>>().into_iter().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '~' if matches!(chars.peek(), Some('*') | Some('?') | Some('~')) => p.push(Tok::Lit(chars.next().unwrap())),
+            '*' => p.push(Tok::Any),
+            '?' => p.push(Tok::One),
+            c => p.push(Tok::Lit(c)),
         }
     }
-    go(&p, &t)
+    let t: Vec<char> = text.to_lowercase().chars().collect();
+    let (mut pi, mut ti) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        match p.get(pi) {
+            Some(Tok::Any) => {
+                star = Some((pi, ti));
+                pi += 1;
+            }
+            Some(Tok::One) => {
+                pi += 1;
+                ti += 1;
+            }
+            Some(Tok::Lit(c)) if *c == t[ti] => {
+                pi += 1;
+                ti += 1;
+            }
+            _ => match star {
+                Some((sp, st)) => {
+                    pi = sp + 1;
+                    ti = st + 1;
+                    star = Some((sp, st + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    p[pi..].iter().all(|x| *x == Tok::Any)
+}
+
+/// Where XLOOKUP and XMATCH find `x` in `keys` (Microsoft's XLOOKUP and XMATCH pages).
+/// match_mode: 0 exact, -1 exact or the next smaller item, 1 exact or the next larger item,
+/// 2 wildcard (`*`, `?`, `~`). search_mode: 1 first to last, -1 last to first, 2 binary search of
+/// keys sorted ascending, -2 sorted descending (unsorted keys give an arbitrary result, as in
+/// Excel). Next smaller/larger only consider items of the lookup value's type; blanks never match.
+/// `#VALUE!` for any other mode.
+fn xmatch(x: &Value, keys: &[Value], match_mode: i64, search_mode: i64) -> Result<Option<usize>, ErrorKind> {
+    use std::cmp::Ordering::*;
+    if ![0, -1, 1, 2].contains(&match_mode) || ![1, -1, 2, -2].contains(&search_mode) {
+        return Err(ErrorKind::Value);
+    }
+    let equal = |v: &Value| compare(v, x) == Equal && same_type(v, x);
+    let comparable = |v: &Value| same_type(v, x) && !v.is_empty();
+    if search_mode.abs() == 2 && match_mode != 2 {
+        // binary search: the first item not before `x` in the sort order
+        let ascending = search_mode == 2;
+        let before = |v: &Value| if ascending { compare(v, x) == Less } else { compare(v, x) == Greater };
+        let (mut lo, mut hi) = (0usize, keys.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if before(&keys[mid]) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo < keys.len() && equal(&keys[lo]) {
+            return Ok(Some(lo));
+        }
+        // keys[lo - 1] comes before x, keys[lo] after it
+        let (smaller, larger) = if ascending { (lo.checked_sub(1), Some(lo)) } else { (Some(lo), lo.checked_sub(1)) };
+        let pick = match match_mode {
+            -1 => smaller,
+            1 => larger,
+            _ => None,
+        };
+        return Ok(pick.filter(|&i| i < keys.len() && comparable(&keys[i])));
+    }
+    let pattern = match (match_mode, x) {
+        (2, Value::Text(t)) => Some(t.as_str()),
+        _ => None,
+    };
+    let order: Box<dyn Iterator<Item = usize>> = if search_mode < 0 { Box::new((0..keys.len()).rev()) } else { Box::new(0..keys.len()) };
+    let mut best: Option<usize> = None;
+    for i in order {
+        let v = &keys[i];
+        if let Some(p) = pattern {
+            if matches!(v, Value::Text(t) if wildcard_match(p, t)) {
+                return Ok(Some(i));
+            }
+            continue;
+        }
+        if equal(v) {
+            return Ok(Some(i));
+        }
+        if match_mode == 0 || match_mode == 2 || !comparable(v) {
+            continue;
+        }
+        let side = compare(v, x);
+        let closer = |b: usize| compare(v, &keys[b]) == if match_mode == -1 { Greater } else { Less };
+        if side == if match_mode == -1 { Less } else { Greater } && best.map(closer).unwrap_or(true) {
+            best = Some(i);
+        }
+    }
+    Ok(best)
 }
 
 fn matches_criteria(v: &Value, c: &Criteria) -> bool {
@@ -1796,7 +1899,21 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
             }
             let keys = args[1].as_array();
             let vals = args[2].as_array();
-            let find = |key: &Value| keys.data.iter().position(|kv| compare(kv, key) == std::cmp::Ordering::Equal && same_type(kv, key));
+            // XLOOKUP(lookup_value, lookup_array, return_array, [if_not_found], [match_mode], [search_mode])
+            let mode = |i: usize, default: i64| -> Result<i64, ErrorKind> {
+                match args.get(i).map(|v| v.clone().scalar()) {
+                    None | Some(Value::Empty) => Ok(default),
+                    Some(v) => to_number(&v).map(|x| x.trunc() as i64),
+                }
+            };
+            let (match_mode, search_mode) = match (mode(4, 0), mode(5, 1)) {
+                (Ok(m), Ok(s)) => (m, s),
+                (Err(e), _) | (_, Err(e)) => return Arg::err(e),
+            };
+            if let Err(e) = xmatch(&Value::Empty, &[], match_mode, search_mode) {
+                return Arg::err(e);
+            }
+            let find = |key: &Value| xmatch(key, &keys.data, match_mode, search_mode).ok().flatten();
             let lookup_at = |found: Option<usize>| -> Arg {
                 if let Some(i) = found {
                     {
@@ -1820,17 +1937,22 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
                         return Arg::Scalar(vals.data.get(i).cloned().unwrap_or(Value::Empty));
                     }
                 }
-                if args.len() > 3 {
-                    Arg::Scalar(a(3))
-                } else {
-                    Arg::err(ErrorKind::NA)
+                // an omitted if_not_found (XLOOKUP(x, keys, values, , 1)) is #N/A as well
+                match args.get(3).map(|v| v.clone().scalar()) {
+                    None | Some(Value::Empty) => Arg::err(ErrorKind::NA),
+                    Some(v) => Arg::Scalar(v),
                 }
             };
             match &args[0] {
                 Arg::Array(ks) if ks.rows * ks.cols != 1 => {
                     // many lookup values: index the keys once (first match wins, as in a scan)
                     // rather than scanning them for each value
-                    let index: Option<std::collections::HashMap<ValueKey, usize>> = keys.data.iter().enumerate().rev().map(|(i, kv)| value_key(kv).map(|k| (k, i))).collect();
+                    // (exact match first to last only; other modes search for each value)
+                    let index: Option<std::collections::HashMap<ValueKey, usize>> = if (match_mode, search_mode) == (0, 1) {
+                        keys.data.iter().enumerate().rev().map(|(i, kv)| value_key(kv).map(|k| (k, i))).collect()
+                    } else {
+                        None
+                    };
                     let data: Vec<Value> = match &index {
                         Some(index) => ks.data.iter().map(|k| lookup_at(match value_key(k) {
                             Some(key) => index.get(&key).copied(),
@@ -3149,37 +3271,23 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
             }
         }
         "XMATCH" => {
+            // XMATCH(lookup_value, lookup_array, [match_mode], [search_mode])
             let x = a(0);
             let arr = args.get(1).map(|v| v.as_array()).unwrap_or_else(empty_arr);
-            let mode = match args.get(2).map(|v| v.clone().scalar()) {
-                None | Some(Value::Empty) => 0i64,
-                Some(v) => try_num!(v) as i64,
-            };
-            let mut best: Option<(usize, Value)> = None;
-            for (i, v) in arr.data.iter().enumerate() {
-                let ord = compare(v, &x);
-                match mode {
-                    0 => {
-                        if ord == std::cmp::Ordering::Equal {
-                            return n(i as f64 + 1.0);
-                        }
-                    }
-                    -1 => {
-                        if ord != std::cmp::Ordering::Greater && best.as_ref().map(|(_, bv)| compare(v, bv) == std::cmp::Ordering::Greater).unwrap_or(true) {
-                            best = Some((i, v.clone()));
-                        }
-                    }
-                    1 => {
-                        if ord != std::cmp::Ordering::Less && best.as_ref().map(|(_, bv)| compare(v, bv) == std::cmp::Ordering::Less).unwrap_or(true) {
-                            best = Some((i, v.clone()));
-                        }
-                    }
-                    _ => return Arg::err(ErrorKind::Value),
+            let mode = |i: usize, default: i64| -> Result<i64, ErrorKind> {
+                match args.get(i).map(|v| v.clone().scalar()) {
+                    None | Some(Value::Empty) => Ok(default),
+                    Some(v) => to_number(&v).map(|x| x.trunc() as i64),
                 }
-            }
-            match best {
-                Some((i, v)) if mode != 0 && (mode != -1 || compare(&v, &x) != std::cmp::Ordering::Greater) => n(i as f64 + 1.0),
-                _ => Arg::err(ErrorKind::NA),
+            };
+            let (match_mode, search_mode) = match (mode(2, 0), mode(3, 1)) {
+                (Ok(m), Ok(s)) => (m, s),
+                (Err(e), _) | (_, Err(e)) => return Arg::err(e),
+            };
+            match xmatch(&x, &arr.data, match_mode, search_mode) {
+                Ok(Some(i)) => n(i as f64 + 1.0),
+                Ok(None) => Arg::err(ErrorKind::NA),
+                Err(e) => Arg::err(e),
             }
         }
         "HSTACK" | "VSTACK" => {

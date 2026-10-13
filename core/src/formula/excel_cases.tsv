@@ -395,3 +395,25 @@ AND(RANDARRAY(5,5)>=0,RANDARRAY(5,5)<1)	TRUE	ms:randarray
 AND(RANDARRAY(5,5,10,20,TRUE)>=10,RANDARRAY(5,5,10,20,TRUE)<=20)	TRUE	ms:randarray
 SUM(--(RANDARRAY(4,4,1,9,TRUE)=INT(RANDARRAY(4,4,1,9,TRUE))))>=0	TRUE	ms:randarray
 RANDARRAY(2,2,5,1)	#VALUE!	ms:randarray
+#
+# ---- 2.10 XLOOKUP / XMATCH match_mode and search_mode (review 11 Oct). ms:xlookup and ms:xmatch: the
+# behaviour each mode is documented to have, on small arrays (more cases in formula::tests::xlookup_and_xmatch_modes)
+XMATCH(4,{5,4,3,2,1})	2	ms:xmatch
+XMATCH(4.5,{5,4,3,2,1},1)	1	ms:xmatch
+XMATCH(4.5,{5,4,3,2,1},-1)	2	ms:xmatch
+XMATCH("Gra?",{"Apple","Grape","Pear","Banana","Cherry"},1)	2	ms:xmatch
+XMATCH("Gra??",{"Apple","Grape","Pear","Banana","Cherry"},2)	2	ms:xmatch
+XMATCH("Gra?",{"Apple","Grape","Pear","Banana","Cherry"},2)	#N/A	ms:xmatch
+XMATCH("*e",{"Apple","Grape","Pear","Banana","Cherry"},2,-1)	2	ms:xmatch
+XMATCH(3,{1,2,3,3,5},0,-1)	4	ms:xmatch
+XMATCH(4,{1,2,3,5,8},-1,2)	3	ms:xmatch
+XMATCH(4,{1,2,3,5,8},1,2)	4	ms:xmatch
+XMATCH(4,{8,5,3,2,1},1,-2)	2	ms:xmatch
+XMATCH(4,{1,2,3},5)	#VALUE!	ms:xmatch
+XLOOKUP(46523,{0,9701,39476,84201},{0.1,0.12,0.22,0.24},0,-1)	0.22	ms:xlookup
+XLOOKUP(46523,{0,9701,39476,84201},{0.1,0.12,0.22,0.24},0,1)	0.24	ms:xlookup
+XLOOKUP(99999999,{0,9701,39476,84201},{0.1,0.12,0.22,0.24},"none",1)	"none"	ms:xlookup
+XLOOKUP(99999999,{0,9701,39476,84201},{0.1,0.12,0.22,0.24},,1)	#N/A	ms:xlookup
+XLOOKUP("Ch*",{"Apple","Grape","Pear","Banana","Cherry"},{1,2,3,4,5},,2)	5	ms:xlookup
+XLOOKUP(2,{2,1,2},{"first","middle","last"},,0,-1)	"last"	ms:xlookup
+XLOOKUP(1,{1},{1},,0,3)	#VALUE!	ms:xlookup
