@@ -22,11 +22,19 @@ function pad(n: number, w = 2) {
   return String(n).padStart(w, '0');
 }
 
+/** Year, month and day of a serial as Excel shows them: before 1 March 1900 Excel counts from
+ *  31 December 1899 and has a 29 February 1900 (serial 60); serial 0 is 0 January 1900. The engine's
+ *  `ymd_from_serial` (core/src/formula/eval.rs) does the same. */
+function excelYmd(serial: number): [number, number, number] {
+  const day = Math.floor(serial);
+  if (day === 60) return [1900, 2, 29];
+  if (day === 0) return [1900, 1, 0];
+  const d = serialToDate(day >= 1 && day < 60 ? serial + 1 : serial);
+  return [d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate()];
+}
+
 export function formatDate(serial: number, pattern: string): string {
-  const d = serialToDate(serial);
-  const y = d.getUTCFullYear();
-  const m = d.getUTCMonth() + 1;
-  const day = d.getUTCDate();
+  const [y, m, day] = excelYmd(serial);
   const secs = Math.round((serial - Math.floor(serial)) * 86400);
   const hh = Math.floor(secs / 3600);
   const mi = Math.floor(secs / 60) % 60;

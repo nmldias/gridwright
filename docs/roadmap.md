@@ -106,12 +106,17 @@ Baselines below were reproduced on the shipped engine at `main` `8da8d82`, e.g. 
   per-cell lookup of a 336-byte `Cell`, which a view would not remove) and an AST cache (parsing is ≈1 µs a formula,
   under 2% of an evaluation in these cases).
 
-### 2.9 Excel-verified tests for `eval.rs` — `todo`
-* `eval.rs` has no unit tests. Add ~200 table-driven cases (e.g. a data file of `formula · expected · source` read by
-  a Rust test), each citing its source.
-* Known differences to fix and cover: invalid weekend codes in NETWORKDAYS.INTL/WORKDAY.INTL fall back to
-  Saturday/Sunday (Excel `#NUM!`); serials below 61 (Excel's 1900 leap-year quirk); `=ROWS(#NAME?)` → `1` (Excel
-  propagates the error); `RANDARRAY` is not implemented (`#NAME?`).
+### 2.9 Excel-verified tests for `eval.rs` — `done` (#19)
+* `core/src/formula/excel_cases.tsv` now holds 360 cases (`formula · expected · source`), read by `cargo test` and by
+  `e2e/numerics.mjs` on the shipped wasm engine; the 2.9 cases come from the examples on Microsoft's function pages.
+  Before: 330 of 360 matched Excel; after: 360.
+* Fixed: invalid weekend codes in NETWORKDAYS.INTL/WORKDAY.INTL are `#NUM!` (`#VALUE!` for a malformed string);
+  serials below 61 follow Excel's 1900 leap-year quirk (serial 60 is 29 Feb 1900, in the engine and the browser
+  formatter); `ROWS`/`COLUMNS` pass an error on; `RANDARRAY` is implemented (bounded like `SEQUENCE`).
+* Found by the new cases and fixed: an omitted argument (`PV(r,n,p,,0)`) was the text `""` and refused by numeric
+  functions (now a `Missing` node, also written back as omitted); `PROPER` after a digit; `SUBSTITUTE`'s
+  instance_num was ignored; `CEILING.MATH`/`FLOOR.MATH` ignored their mode; `ISPMT` counted periods from 1 instead
+  of 0; `TYPE` of an array is 64.
 
 ### 2.10 XLOOKUP match_mode and search_mode — `todo`
 * Arguments 5 and 6 are ignored: exact match, first-to-last only (stated in README *Limitations*). Implement

@@ -561,15 +561,26 @@ pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
 
 const UNIX_EPOCH_SERIAL: i64 = 25569; // 1970-01-01
 
+/// Serials count days from 30 December 1899, as Excel's do from 1 March 1900 on. Before that Excel
+/// counts from 31 December 1899 and has a 29 February 1900 (serial 60), a bug kept from Lotus 1-2-3
+/// (Microsoft: "Excel incorrectly assumes that the year 1900 is a leap year"): serial 1 is
+/// 1 January 1900 and serial 0 is shown as 0 January 1900. These two functions follow Excel.
 pub fn serial_from_ymd(y: i64, m: i64, d: i64) -> f64 {
     // normalise month overflow like Excel: DATE(2024, 13, 1) = 2025-01-01
     let y2 = y + (m - 1).div_euclid(12);
     let m2 = (m - 1).rem_euclid(12) + 1;
-    (days_from_civil(y2, m2, 1) + d - 1 + UNIX_EPOCH_SERIAL) as f64
+    let before_march_1900 = (y2, m2) < (1900, 3);
+    (days_from_civil(y2, m2, 1) + d - 1 + UNIX_EPOCH_SERIAL - before_march_1900 as i64) as f64
 }
 
 pub fn ymd_from_serial(serial: f64) -> (i64, i64, i64) {
-    civil_from_days(serial.floor() as i64 - UNIX_EPOCH_SERIAL)
+    let day = serial.floor() as i64;
+    match day {
+        60 => (1900, 2, 29),
+        0 => (1900, 1, 0),
+        1..=59 => civil_from_days(day + 1 - UNIX_EPOCH_SERIAL),
+        _ => civil_from_days(day - UNIX_EPOCH_SERIAL),
+    }
 }
 
 /// Monday = 0 … Sunday = 6
@@ -867,6 +878,7 @@ fn eval_depth(e: &Expr, ctx: &Ctx, depth: u32) -> Arg {
     match e {
         Expr::Num(x) => n(*x),
         Expr::Str(s) => t(s.clone()),
+        Expr::Missing => Arg::Scalar(Value::Empty),
         Expr::Bool(x) => b(*x),
         Expr::Ref(r) => match resolve_ref_at(r, ctx.wb, ctx.table, ctx.at) {
             Ok(rect) => {
@@ -1070,7 +1082,7 @@ const LIFTED: &[&str] = &[
     "SLN", "SWITCH", "AGE_BUCKET", "QUOTIENT", "GCD", "LCM", "FACT", "COMBIN", "PERMUT", "MROUND", "EVEN", "ODD", "SQRTPI", "RADIANS", "DEGREES", "SIN", "COS", "TAN",
     "ASIN", "ACOS", "ATAN", "ATAN2", "SINH", "COSH", "TANH", "CEILING.MATH", "FLOOR.MATH", "BASE", "DECIMAL", "CHAR", "CODE", "UNICHAR", "UNICODE", "CLEAN", "FIXED", "DOLLAR",
     "NUMBERVALUE", "REPLACE", "TEXTBEFORE", "TEXTAFTER", "REGEXMATCH", "REGEXEXTRACT", "REGEXREPLACE", "DAYS360", "WEEKNUM", "ISOWEEKNUM", "TIMEVALUE", "ISERR",
-    "ISNONTEXT", "TYPE", "ERROR.TYPE", "SYD", "DB", "DDB", "RRI", "PDURATION", "ISPMT", "NORM.DIST", "NORMDIST", "NORM.S.DIST", "NORMSDIST", "NORM.INV", "NORMINV",
+    "ISNONTEXT", "ERROR.TYPE", "SYD", "DB", "DDB", "RRI", "PDURATION", "ISPMT", "NORM.DIST", "NORMDIST", "NORM.S.DIST", "NORMSDIST", "NORM.INV", "NORMINV",
     "NORM.S.INV", "NORMSINV", "STANDARDIZE", "ADDRESS",
 ];
 
@@ -1602,8 +1614,10 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
             let s = try_text!(a(0));
             let mut out = String::new();
             let mut new_word = true;
+            // a letter after anything that is not a letter is capitalised, digits included
+            // (Microsoft's PROPER page: "76BudGet" is "76Budget")
             for ch in s.chars() {
-                if ch.is_alphanumeric() {
+                if ch.is_alphabetic() {
                     if new_word {
                         out.extend(ch.to_uppercase());
                     } else {
@@ -1696,7 +1710,20 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
                     return Arg::err(ErrorKind::Value);
                 }
             }
-            t(s.replace(&old, &new))
+            // instance_num replaces only that occurrence; below 1 it is #VALUE! (Microsoft's SUBSTITUTE page)
+            match args.get(3).map(|v| v.clone().scalar()) {
+                None | Some(Value::Empty) => t(s.replace(&old, &new)),
+                Some(v) => {
+                    let k = try_num!(v).trunc();
+                    if k < 1.0 {
+                        return Arg::err(ErrorKind::Value);
+                    }
+                    match (!old.is_empty()).then(|| s.match_indices(old.as_str()).nth(k as usize - 1)).flatten() {
+                        Some((at, _)) => t(format!("{}{}{}", &s[..at], new, &s[at + old.len()..])),
+                        None => t(s),
+                    }
+                }
+            }
         }
         "REPT" => {
             let s = try_text!(a(0));
@@ -1900,8 +1927,15 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
             }
             Arg::Scalar(arr.get(r - 1, c - 1).clone())
         }
-        "ROWS" => n(args.first().map(|x| x.as_array().rows).unwrap_or(0) as f64),
-        "COLUMNS" => n(args.first().map(|x| x.as_array().cols).unwrap_or(0) as f64),
+        // an error given as the array is passed on, as Excel does (=ROWS(#NAME?) is #NAME?)
+        "ROWS" | "COLUMNS" => match args.first() {
+            Some(Arg::Scalar(Value::Error(e))) => Arg::err(e.clone()),
+            Some(x) => {
+                let arr = x.as_array();
+                n((if name == "ROWS" { arr.rows } else { arr.cols }) as f64)
+            }
+            None => n(0.0),
+        },
         "TRANSPOSE" => {
             let arr = args.first().map(|x| x.as_array()).unwrap_or_else(empty_arr);
             let mut data = Vec::with_capacity(arr.data.len());
@@ -2287,7 +2321,7 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
                 Err(e) => return Arg::err(e),
             };
             let holidays = holiday_list(args.get(2));
-            let weekend = weekend_mask(1);
+            let weekend = weekend_mask(1).unwrap();
             let hs = working_holidays(&holidays, &weekend);
             let (s, e, sign) = if start <= end { (start, end, 1.0) } else { (end, start, -1.0) };
             n(count_workdays(s as i64, e as i64, &weekend, &hs) as f64 * sign)
@@ -2299,7 +2333,7 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
             };
             let days = try_num!(a(1));
             let holidays = holiday_list(args.get(2));
-            let weekend = weekend_mask(1);
+            let weekend = weekend_mask(1).unwrap();
             let hs = working_holidays(&holidays, &weekend);
             match add_workdays(start as i64, days, &weekend, &hs) {
                 Some(d) => date_result(d as f64),
@@ -2552,6 +2586,55 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
         "COSH" => n(try_num!(a(0)).cosh()),
         "TANH" => n(try_num!(a(0)).tanh()),
         "RAND" => n(pseudo_random()),
+        "RANDARRAY" => {
+            // RANDARRAY([rows],[columns],[min],[max],[whole_number]): defaults 1, 1, 0, 1, FALSE;
+            // min above max is #VALUE! (Microsoft's RANDARRAY page). Fewer than one row or column is
+            // Excel's #CALC! (an empty array), which this engine writes as #VALUE!.
+            let given = |i: usize| args.get(i).map(|v| v.clone().scalar()).filter(|v| !v.is_empty());
+            let count = |i: usize| -> Result<f64, ErrorKind> {
+                match given(i) {
+                    None => Ok(1.0),
+                    Some(v) => to_number(&v).map(f64::trunc),
+                }
+            };
+            let (rows, cols) = match (count(0), count(1)) {
+                (Ok(r), Ok(c)) => (r, c),
+                (Err(e), _) | (_, Err(e)) => return Arg::err(e),
+            };
+            let lo = match given(2) {
+                None => 0.0,
+                Some(v) => try_num!(v),
+            };
+            let hi = match given(3) {
+                None => 1.0,
+                Some(v) => try_num!(v),
+            };
+            let whole = match given(4) {
+                None => false,
+                Some(v) => match to_bool(&v) {
+                    Ok(b) => b,
+                    Err(e) => return Arg::err(e),
+                },
+            };
+            if rows < 1.0 || cols < 1.0 || lo > hi {
+                return Arg::err(ErrorKind::Value);
+            }
+            if !fits(rows as u64, cols as u64, MAX_GENERATED_CELLS) {
+                return Arg::err(ErrorKind::Num);
+            }
+            let (lo_w, hi_w) = (lo.ceil(), hi.floor());
+            if whole && lo_w > hi_w {
+                return Arg::err(ErrorKind::Value);
+            }
+            let (rows, cols) = (rows as u32, cols as u32);
+            let data = (0..rows * cols)
+                .map(|_| {
+                    let r = pseudo_random();
+                    Value::Number(if whole { lo_w + (r * (hi_w - lo_w + 1.0)).floor() } else { lo + r * (hi - lo) })
+                })
+                .collect();
+            Arg::Array(Array { rows, cols, data }).normalise()
+        }
         "RANDBETWEEN" => {
             let lo = try_num!(a(0)).ceil();
             let hi = try_num!(a(1)).floor();
@@ -2569,8 +2652,15 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
             if sig == 0.0 {
                 return n(0.0);
             }
+            // a non-zero mode rounds a negative number the other way: CEILING.MATH away from zero,
+            // FLOOR.MATH toward zero (Microsoft's pages: CEILING.MATH(-5.5,2,-1) = -6, FLOOR.MATH(-5.5,2,-1) = -4)
+            let mode = match args.get(2).map(|v| v.clone().scalar()) {
+                None | Some(Value::Empty) => 0.0,
+                Some(v) => try_num!(v),
+            };
+            let up = (name == "CEILING.MATH") != (x < 0.0 && mode != 0.0);
             let q = numerics::normalize15(x / sig);
-            n(numerics::normalize15(if name == "CEILING.MATH" { q.ceil() } else { q.floor() } * sig))
+            n(numerics::normalize15(if up { q.ceil() } else { q.floor() } * sig))
         }
         "BASE" => {
             let x = try_num!(a(0)).floor();
@@ -3248,6 +3338,7 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
             let data: Vec<Value> = (0..rows).flat_map(|r| (0..cols).map(move |c| (r, c))).map(|(r, c)| if r < arr.rows && c < arr.cols { arr.get(r, c).clone() } else { pad.clone() }).collect();
             Arg::Array(Array { rows, cols, data })
         }
+        "TYPE" if matches!(args.first(), Some(Arg::Array(_))) => n(64.0),
         "TYPE" => n(match a(0) {
             Value::Number(_) => 1.0,
             Value::Text(_) => 2.0,
@@ -3338,10 +3429,19 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
                 Ok(x) => x.floor(),
                 Err(e) => return Arg::err(e),
             };
+            // Microsoft's NETWORKDAYS.INTL and WORKDAY.INTL pages: a weekend number outside 1–7 and
+            // 11–17 is #NUM!; a weekend string not made of seven 0s and 1s is #VALUE!
             let weekend = match args.get(2).map(|v| v.clone().scalar()) {
-                None | Some(Value::Empty) => weekend_mask(1),
+                None | Some(Value::Empty) => weekend_mask(1).unwrap(),
                 Some(Value::Text(s)) if s.len() == 7 && s.chars().all(|c| c == '0' || c == '1') => s.chars().map(|c| c == '1').collect::<Vec<bool>>(),
-                Some(v) => weekend_mask(try_num!(v) as i64),
+                Some(Value::Text(_)) => return Arg::err(ErrorKind::Value),
+                Some(v) => {
+                    let code = try_num!(v);
+                    match weekend_mask(code.trunc() as i64) {
+                        Some(m) => m,
+                        None => return Arg::err(ErrorKind::Num),
+                    }
+                }
             };
             let holidays = holiday_list(args.get(3));
             let hs = working_holidays(&holidays, &weekend);
@@ -3449,7 +3549,8 @@ fn call_eager(name: &str, args: &[Arg], ctx: &Ctx, depth: u32) -> Arg {
             if nper == 0.0 {
                 return Arg::err(ErrorKind::Div0);
             }
-            n(-pv * rate * (1.0 - (per - 1.0) / nper))
+            // Microsoft's ISPMT page: period 1 of a 36-month 8,000,000 loan at 10 % is -64,814.8
+            n(-pv * rate * (1.0 - per / nper))
         }
         "MIRR" => {
             let flows = match args.first().map(cash_flows) {
@@ -4532,7 +4633,9 @@ fn add_workdays(start: i64, days: f64, weekend: &[bool], hs: &[i64]) -> Option<i
     }
 }
 
-fn weekend_mask(code: i64) -> Vec<bool> {
+/// The weekend days (Monday first) of a NETWORKDAYS.INTL/WORKDAY.INTL weekend number; None when
+/// the number is not one of Excel's (1–7, 11–17).
+fn weekend_mask(code: i64) -> Option<Vec<bool>> {
     let mut m = vec![false; 7];
     match code {
         1 => {
@@ -4570,12 +4673,9 @@ fn weekend_mask(code: i64) -> Vec<bool> {
         15 => m[3] = true,
         16 => m[4] = true,
         17 => m[5] = true,
-        _ => {
-            m[5] = true;
-            m[6] = true;
-        }
+        _ => return None,
     }
-    m
+    Some(m)
 }
 
 /// Standard normal CDF (Abramowitz–Stegun 7.1.26, |error| < 1.5e-7).

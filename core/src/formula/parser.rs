@@ -71,6 +71,8 @@ pub enum Expr {
     ErrorLit(String),
     /// Workbook-level named range (resolved at evaluation time).
     Name(String),
+    /// An omitted argument, as in `PV(r, n, p, , 1)`: Excel treats it as missing, not as the text "".
+    Missing,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -346,7 +348,7 @@ impl Parser {
                         loop {
                             // allow empty arguments like IF(A1,,"x")
                             if self.peek() == &Token::Comma || self.peek() == &Token::Semicolon {
-                                args.push(Expr::Str(String::new()));
+                                args.push(Expr::Missing);
                             } else {
                                 args.push(self.expr()?);
                             }
@@ -354,7 +356,7 @@ impl Parser {
                                 Token::Comma | Token::Semicolon => {
                                     self.next();
                                     if self.peek() == &Token::RParen {
-                                        args.push(Expr::Str(String::new()));
+                                        args.push(Expr::Missing);
                                     }
                                 }
                                 _ => break,
@@ -593,6 +595,7 @@ fn op_str(op: BinOp) -> &'static str {
 pub fn to_string(e: &Expr) -> String {
     fn go(e: &Expr, parent_prec: u8) -> String {
         match e {
+            Expr::Missing => String::new(),
             Expr::Num(n) => crate::model::format_number(*n),
             Expr::Str(s) => format!("\"{}\"", s.replace('"', "\"\"")),
             Expr::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),

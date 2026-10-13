@@ -39,6 +39,8 @@ const CASES = [
   ['SEQUENCE(1E10,1E10)', '=SEQUENCE(1E10,1E10)', err('#NUM!'), 'out of memory'],
   ['EXPAND to 10 billion cells', '=EXPAND(1,1E5,1E5)', err('#NUM!'), 'out of memory'],
   ['WRAPROWS with 1E9 columns', '=WRAPROWS({1,2,3},1E9)', err('#NUM!'), 'out of memory'],
+  ['RANDARRAY(1E10,1E10)', '=RANDARRAY(1E10,1E10)', err('#NUM!'), 'out of memory'],
+  ['RANDARRAY overflowing rows×cols', '=RANDARRAY(65537,65537,0,1,TRUE)', err('#NUM!'), 'u32 overflow, huge allocation'],
   ['a million-cell SEQUENCE still works', '=SUM(SEQUENCE(1000,1000))', num(500000500000), ''],
   // text past Excel's 32,767-character limit
   ['REPT 1E10 times', '=REPT("x",1E10)', err('#VALUE!'), 'out of memory'],
