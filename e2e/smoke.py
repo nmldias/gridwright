@@ -49,6 +49,9 @@ def main():
         time.sleep(0.8)
         page.screenshot(path=f"{OUT}/01-loaded.png")
         check("page loads with canvas", True)
+        shown = page.inner_text(".brand-version").strip()
+        served = page.evaluate("() => fetch('/api/health').then(r => r.json()).then(h => h.version)")
+        check("the version next to the logo is the server's", shown == "v" + served, f"shown {shown!r}, /api/health {served!r}")
 
         # helpers -------------------------------------------------------------
         def state():

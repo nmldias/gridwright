@@ -192,8 +192,12 @@ export function TopBar() {
 
   return (
     <header className="topbar">
-      <div className="brand" title="Gridwright">
+      <div className="brand" title={`Gridwright ${__GW_VERSION__}`}>
         <span className="logo">▦</span>
+        <span className="brand-version">
+          <span className="brand-v">v</span>
+          {__GW_VERSION__}
+        </span>
       </div>
       {renaming ? (
         <input

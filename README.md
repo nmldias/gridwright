@@ -270,7 +270,7 @@ python3 e2e/drill_ui.py --port 8810                     # drill-through records 
                                                         # (counts checked against an independent reference), the source chart only highlights, Esc and
                                                         # re-click clear, a drag still moves, the workbook JSON/filters/undo are untouched, blank values,
                                                         # mixed currencies and ratios are stated, the binding follows a table rename (19 checks)
-python3 e2e/smoke.py http://localhost:8787 --python     # editing, handles, code cells, save/open (22 checks)
+python3 e2e/smoke.py http://localhost:8787 --python     # editing, handles, code cells, save/open, the version by the logo (23 checks)
 node e2e/mock-llm.mjs &                                 # mock model for the assistant (also plays a tool round)
 python3 e2e/features.py http://localhost:8787 --pg host:port:db:user:pass --mock-llm http://127.0.0.1:8899/v1
                                                         # arrays, refs, filters, rules, pivots, SQL cells, history,
