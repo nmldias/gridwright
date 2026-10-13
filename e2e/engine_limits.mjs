@@ -42,6 +42,9 @@ const CASES = [
   ['RANDARRAY(1E10,1E10)', '=RANDARRAY(1E10,1E10)', err('#NUM!'), 'out of memory'],
   ['RANDARRAY overflowing rows×cols', '=RANDARRAY(65537,65537,0,1,TRUE)', err('#NUM!'), 'u32 overflow, huge allocation'],
   ['a million-cell SEQUENCE still works', '=SUM(SEQUENCE(1000,1000))', num(500000500000), ''],
+  ['XMATCH next smaller over a million keys', '=XMATCH(500000.5,SEQUENCE(1000000),-1)', num(500000), ''],
+  ['XMATCH binary search over a million keys', '=XMATCH(500000.5,SEQUENCE(1000000),-1,2)', num(500000), ''],
+  ['a wildcard with 50 stars on a 30,000-character text', '=XMATCH(REPT("*a",50)&"b",REPT("a",30000),2)', err('#N/A'), 'exponential backtracking'],
   // text past Excel's 32,767-character limit
   ['REPT 1E10 times', '=REPT("x",1E10)', err('#VALUE!'), 'out of memory'],
   ['nested REPT', '=REPT(REPT("x",30000),30000)', err('#VALUE!'), '900 MB string'],

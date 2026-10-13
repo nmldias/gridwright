@@ -118,10 +118,13 @@ Baselines below were reproduced on the shipped engine at `main` `8da8d82`, e.g. 
   instance_num was ignored; `CEILING.MATH`/`FLOOR.MATH` ignored their mode; `ISPMT` counted periods from 1 instead
   of 0; `TYPE` of an array is 64.
 
-### 2.10 XLOOKUP match_mode and search_mode — `todo`
-* Arguments 5 and 6 are ignored: exact match, first-to-last only (stated in README *Limitations*). Implement
-  wildcard (2), next smaller/larger (-1/1), last-to-first (-1) and binary search (±2) with 2.9's Excel-verified
-  cases; then remove the limitation line.
+### 2.10 XLOOKUP match_mode and search_mode — `done` (#20)
+* XLOOKUP and XMATCH share one search: exact, exact-or-next-smaller (-1), exact-or-next-larger (1) and wildcard (2)
+  matches; first-to-last, last-to-first and binary search on ascending (2) or descending (-2) keys; other modes are
+  `#VALUE!`; an omitted if_not_found is `#N/A`. Next smaller/larger only consider items of the lookup value's type.
+* Wildcards (`*`, `?`, `~`) match in pattern × text time (the recursive matcher was exponential on `*a*a*…b`), also
+  for criteria such as COUNTIF. 19 Excel cases in `excel_cases.tsv`, more in `xlookup_and_xmatch_modes`, three
+  `engine_limits` cases. The README limitation is removed.
 
 ## Phase 3 — Multiplayer: silent divergence
 
