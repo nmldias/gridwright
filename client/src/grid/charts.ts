@@ -9,9 +9,10 @@
 // square bar corners, a dashed reference line with an inline label, a 3-column
 // stat-card strip and a source footnote.
 
-import type { Chart } from '../engine/types';
+import type { Chart, KeyValue } from '../engine/types';
 import * as book from '../engine/book';
-import { getState } from '../state/store';
+import { getState, type MarkSelection } from '../state/store';
+import { incoming, keyId, ownSelection } from './crossfilter';
 
 export const PALETTE = {
   navy: '#0C447C',
@@ -34,13 +35,21 @@ export interface ChartData {
   categories: string[];
   series: ChartSeriesData[];
   error?: string;
+  /** analytical chart: the canonical key of each category (its mark identity) */
+  keys?: KeyValue[];
+  /** analytical chart: whether each series' measure may be summed across categories */
+  additive?: boolean[];
+  /** analytical chart with a selection: whether each category is selected */
+  selected?: boolean[];
+  /** lines under the subtitle saying what the chart filters, leaves out or cannot add */
+  strip?: { text: string; tone: 'filter' | 'select' | 'warn' }[];
 }
 
 export type Prim =
-  | { k: 'rect'; x: number; y: number; w: number; h: number; fill: string; alpha?: number }
+  | { k: 'rect'; x: number; y: number; w: number; h: number; fill: string; alpha?: number; mark?: number }
   | { k: 'line'; pts: [number, number][]; stroke: string; width: number; dash?: boolean; alpha?: number }
   | { k: 'area'; pts: [number, number][]; fill: string; alpha: number }
-  | { k: 'circle'; cx: number; cy: number; r: number; fill: string }
+  | { k: 'circle'; cx: number; cy: number; r: number; fill: string; mark?: number }
   | { k: 'text'; x: number; y: number; text: string; size: number; color: string; anchor: 'start' | 'middle' | 'end'; baseline: 'top' | 'middle' | 'bottom'; weight?: 400 | 500; spacing?: number };
 
 export const CHART_FONT = 'Inter, "Segoe UI", Helvetica, Arial, sans-serif';
@@ -128,6 +137,7 @@ function flatten(rows: (number | string | boolean | null | { e: string })[][] | 
 }
 
 export function chartData(chart: Chart): ChartData {
+  if (chart.analytic) return analyticData(chart);
   const st = getState();
   const first = st.tables.values().next().value;
   const ctxTable = first ? first.id : 0;
@@ -143,6 +153,70 @@ export function chartData(chart: Chart): ChartData {
   if (!series.length) error = 'add a series';
   else if (series.every((s) => s.values.every((v) => v === null))) error = 'no numeric data in the series ranges';
   return { categories: cats, series, error };
+}
+
+/** Short list of labels: "Luanda, Huambo and 3 more". */
+function listLabels(labels: string[], max = 3): string {
+  const ls = labels.map((l) => l || '(blank)');
+  return ls.length <= max ? ls.join(', ') : `${ls.slice(0, max).join(', ')} and ${ls.length - max} more`;
+}
+
+/** An analytical chart: one engine query over the bound table (docs/analytical-model.md). */
+export function analyticData(chart: Chart, sels?: Record<number, MarkSelection>): ChartData {
+  const an = chart.analytic!;
+  const st = getState();
+  const selections = sels ?? st.markSelections;
+  if (!an.table || !an.dims.length || !an.measures.length) return { categories: [], series: [], error: 'choose a table, a dimension and a measure' };
+  const inc = incoming(chart, st.charts, selections);
+  const a = book.analyze({ table: an.table, dims: an.dims.slice(0, 1), measures: an.measures, selections: inc.selections, sort: an.sort || 'key' });
+  if (a.error) return { categories: [], series: [], error: a.error };
+  const categories = a.groups.map((g) => (g.label[0] === '' ? '(blank)' : g.label[0]));
+  const keys = a.groups.map((g) => g.key[0]);
+  const series: ChartSeriesData[] = a.measures.map((m, i) => ({
+    name: m.name,
+    values: a.groups.map((g) => g.values[i].value),
+    color: SERIES_COLORS[i % SERIES_COLORS.length],
+  }));
+  const strip: NonNullable<ChartData['strip']> = [];
+  if (inc.from.length) {
+    const by = inc.from.map((f) => `${f.field}: ${listLabels(f.labels)}`).join(' · ');
+    // the value left out, unless the first measure only counts rows (the row count says it)
+    const ex = a.measures[0]?.agg === 'count' && !an.measures[0]?.field ? undefined : a.excluded.values[0];
+    const exText = ex ? (ex.status === 'mixed_currency' ? ', mixed currencies' : ex.value !== null ? `, ${fmtNum(ex.value)}` : '') : '';
+    strip.push({ text: `Filtered by ${by} — ${a.excluded.by_selection.toLocaleString('en-US')} rows left out${exText}`, tone: 'filter' });
+  }
+  const own = ownSelection(chart, selections);
+  let selected: boolean[] | undefined;
+  if (own && own.keys.length) {
+    const ids = new Set(own.keys.map(keyId));
+    selected = keys.map((k) => ids.has(keyId(k)));
+    strip.push({ text: `${listLabels(own.labels)} selected — filters linked charts · Esc clears`, tone: 'select' });
+  }
+  a.measures.forEach((m, i) => {
+    const t = a.total[i];
+    if (t.status === 'mixed_currency') strip.push({ text: `${m.name}: amounts in ${(t.by_currency ?? []).map((c) => c.currency || '(none)').join(', ')} are not added together`, tone: 'warn' });
+    else if (t.missing + t.invalid > 0 && m.agg !== 'count' && m.agg !== 'count_distinct') strip.push({ text: `${m.name}: ${t.missing + t.invalid} value(s) blank or not a number — left out, not counted as 0`, tone: 'warn' });
+  });
+  if (a.excluded.by_table_filter > 0) strip.push({ text: `${a.excluded.by_table_filter.toLocaleString('en-US')} rows hidden by the table's filters are left out`, tone: 'warn' });
+  let error: string | undefined;
+  if (!categories.length) error = inc.from.length ? 'no rows match the selection in the linked charts' : 'no data rows';
+  return { categories, series, keys, selected, strip, error, additive: a.measures.map((m) => m.additive) };
+}
+
+/** The mark under a point of a chart (chart-local coordinates), from its drawing primitives. */
+export function markAt(prims: Prim[], x: number, y: number): number | null {
+  for (let i = prims.length - 1; i >= 0; i--) {
+    const p = prims[i];
+    if (p.k === 'rect' && p.mark !== undefined) {
+      // thin bars stay clickable
+      const padX = Math.max(0, (8 - p.w) / 2);
+      const padY = Math.max(0, (8 - p.h) / 2);
+      if (x >= p.x - padX && x <= p.x + p.w + padX && y >= p.y - padY && y <= p.y + p.h + padY) return p.mark;
+    } else if (p.k === 'circle' && p.mark !== undefined) {
+      if (Math.hypot(x - p.cx, y - p.cy) <= Math.max(8, p.r + 3)) return p.mark;
+    }
+  }
+  return null;
 }
 
 // --- layout ---------------------------------------------------------------------------
@@ -165,6 +239,10 @@ export function chartLayout(chart: Chart, data: ChartData, W: number, H: number)
   if (chart.subtitle) {
     P.push({ k: 'text', x: PAD, y: y + 1, text: clip(chart.subtitle, 11, innerW), size: 11, color: PALETTE.grey, anchor: 'start', baseline: 'top' });
     y += 18;
+  }
+  for (const line of data.strip ?? []) {
+    P.push({ k: 'text', x: PAD, y: y + 1, text: clip(line.text, 10, innerW), size: 10, color: line.tone === 'filter' ? PALETTE.coral : line.tone === 'select' ? PALETTE.navy : PALETTE.grey, anchor: 'start', baseline: 'top', weight: line.tone === 'warn' ? 400 : 500 });
+    y += 15;
   }
   y += 6;
   // reserve the bottom: footnote and stat cards
@@ -227,12 +305,16 @@ function statCards(chart: Chart, data: ChartData): { label: string; value: strin
   const vals = s.values.filter((v): v is number => v !== null);
   if (!vals.length) return [];
   const total = vals.reduce((a, b) => a + b, 0);
+  // a ratio or an average is not summed across categories (docs/analytical-model.md)
+  const additive = !data.additive || data.additive[0];
   // "Amount" → "total amount", but acronyms such as "In AOA" keep their case
   const name = /[A-Z]/.test(s.name.slice(1)) ? s.name : s.name.charAt(0).toLowerCase() + s.name.slice(1);
-  const cards: { label: string; value: string; accent?: string }[] = [
-    { label: `Total ${name}`, value: fmtNum(total) },
-    { label: `Average per ${data.categories.length > 12 ? 'point' : 'category'}`, value: fmtNum(total / vals.length) },
-  ];
+  const cards: { label: string; value: string; accent?: string }[] = additive
+    ? [
+        { label: `Total ${name}`, value: fmtNum(total) },
+        { label: `Average per ${data.categories.length > 12 ? 'point' : 'category'}`, value: fmtNum(total / vals.length) },
+      ]
+    : [];
   const hi = chart.highlight ?? null;
   if (hi !== null && hi >= 0 && hi < s.values.length && s.values[hi] !== null) {
     cards.push({ label: `${data.categories[hi]} (highlighted)`, value: fmtNum(s.values[hi] as number), accent: PALETTE.coral });
@@ -291,6 +373,12 @@ function categoryLabels(P: Prim[], cats: string[], slot: (i: number) => number, 
     if (i === cats.length - 1 && i % every !== 0 && every > 1 && measure(c, size) > slotW * (every - 1)) return;
     P.push({ k: 'text', x: slot(i), y: y + 6, text: clip(c, size, Math.max(slotW * every - 4, 24)), size, color: PALETTE.grey, anchor: 'middle', baseline: 'top' });
   });
+}
+
+/** Mark identity of an analytical chart's bar, dimmed when another mark is selected. */
+function markStyle(data: ChartData, i: number): { mark?: number; alpha?: number } {
+  if (!data.keys) return {};
+  return data.selected && !data.selected[i] ? { mark: i, alpha: 0.3 } : { mark: i };
 }
 
 function drawBars(P: Prim[], chart: Chart, data: ChartData, plot: Plot, stacked: boolean) {
@@ -368,7 +456,7 @@ function drawBars(P: Prim[], chart: Chart, data: ChartData, plot: Plot, stacked:
         yBot = Math.max(map(v), zeroY);
       }
       const bx = stacked ? gx : gx + si * barW;
-      P.push({ k: 'rect', x: bx, y: yTop, w: Math.max(1, barW - (stacked ? 0 : 2)), h: Math.max(0.5, yBot - yTop), fill });
+      P.push({ k: 'rect', x: bx, y: yTop, w: Math.max(1, barW - (stacked ? 0 : 2)), h: Math.max(0.5, yBot - yTop), fill, ...markStyle(data, i) });
       if (chart.show_values && !stacked && barW >= 18) {
         P.push({ k: 'text', x: bx + barW / 2 - 1, y: v >= 0 ? yTop - 3 : yBot + 3, text: fmtNum(v), size: 10, color: chart.highlight === i ? PALETTE.coral : PALETTE.navy, anchor: 'middle', baseline: v >= 0 ? 'bottom' : 'top' });
       }
@@ -404,7 +492,7 @@ function drawHBars(P: Prim[], chart: Chart, data: ChartData, plot: Plot) {
     const fill = chart.highlight === i ? PALETTE.coral : PALETTE.lightNavy;
     const xa = Math.min(map(v), map(0));
     const xb = Math.max(map(v), map(0));
-    P.push({ k: 'rect', x: xa, y: cy - barH / 2, w: Math.max(0.5, xb - xa), h: barH, fill });
+    P.push({ k: 'rect', x: xa, y: cy - barH / 2, w: Math.max(0.5, xb - xa), h: barH, fill, ...markStyle(data, i) });
     if (chart.show_values) P.push({ k: 'text', x: v >= 0 ? xb + 5 : xa - 5, y: cy, text: fmtNum(v), size: 10, color: chart.highlight === i ? PALETTE.coral : PALETTE.navy, anchor: v >= 0 ? 'start' : 'end', baseline: 'middle' });
   }
   const ref = chart.reference;
@@ -442,6 +530,14 @@ function drawLines(P: Prim[], chart: Chart, data: ChartData, plot: Plot, area: b
       P.push({ k: 'area', pts: [[pts[0][0], base], ...pts, [pts[pts.length - 1][0], base]], fill: color, alpha: si === 0 ? 0.16 : 0.1 });
     }
     P.push({ k: 'line', pts, stroke: color, width: si === 0 ? 2 : 1.5 });
+    if (data.keys && si === 0) {
+      // an analytical line has a mark per point, so a point can be selected
+      s.values.forEach((v, i) => {
+        if (v === null) return;
+        const sel = data.selected?.[i];
+        P.push({ k: 'circle', cx: xAt(i), cy: map(v), r: sel ? 4.5 : 3, fill: sel ? PALETTE.coral : color, mark: i });
+      });
+    }
     const last = pts[pts.length - 1];
     P.push({ k: 'text', x: last[0] + 6, y: last[1], text: clip(s.name, 10, endLabelW - 4), size: 10, color, anchor: 'start', baseline: 'middle' });
     if (chart.highlight !== null && chart.highlight !== undefined && si === 0) {
@@ -490,7 +586,7 @@ function drawWaterfall(P: Prim[], chart: Chart, data: ChartData, plot: Plot) {
     const yA = Math.min(map(from), map(to));
     const yB = Math.max(map(from), map(to));
     const fill = isTotal ? PALETTE.navy : chart.highlight === i ? PALETTE.coral : to >= from ? PALETTE.lightNavy : PALETTE.grey;
-    P.push({ k: 'rect', x: bx, y: yA, w: barW, h: Math.max(0.5, yB - yA), fill });
+    P.push({ k: 'rect', x: bx, y: yA, w: barW, h: Math.max(0.5, yB - yA), fill, ...(isTotal ? {} : markStyle(data, i)) });
     if (i > 0 && !isTotal) P.push({ k: 'line', pts: [[bx - (slotW - barW), map(prev)], [bx, map(prev)]], stroke: PALETTE.grey, width: 0.8, dash: true });
     if (chart.show_values) {
       const v = isTotal ? run : deltas[i];

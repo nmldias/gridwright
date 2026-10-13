@@ -3,7 +3,7 @@
 
 import init, { Book } from './pkg/gridwright_core';
 import wasmUrl from './pkg/gridwright_core_bg.wasm?url';
-import type { CellRef, CellValue, CellView, Changes, Chart, CheckView, NamedRange, Op, SignoffStatus, TableId, TableMeta, Trace } from './types';
+import type { AnalyticAnswer, AnalyticQuery, AnalyticRecords, CellRef, CellValue, CellView, Changes, Chart, CheckView, NamedRange, Op, SignoffStatus, TableId, TableMeta, Trace } from './types';
 import { cellKey, isCodeKind } from './types';
 import { cellAt, readOnly, useStore } from '../state/store';
 import { setDecimalCommaDisplay } from '../grid/format';
@@ -372,4 +372,14 @@ export async function replayDocument(json: string | null, ops: Op[], name: strin
   const out = b.to_json();
   b.free();
   return out;
+}
+
+/** Analytical query (read-only; see docs/analytical-model.md). */
+export function analyze(q: AnalyticQuery): AnalyticAnswer {
+  return JSON.parse(getBook().analyze(JSON.stringify(q)));
+}
+
+/** The source records behind a selection, with the measures' totals over all of them. */
+export function analyzeRecords(q: AnalyticQuery & { fields?: string[]; limit?: number }): AnalyticRecords {
+  return JSON.parse(getBook().analyze_records(JSON.stringify(q)));
 }

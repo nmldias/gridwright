@@ -7,7 +7,7 @@ before and passes after, and is merged through CI (see [`AGENTS.md`](../AGENTS.m
 Status: `todo` · `partial` · `done` (merged; PR noted). Line numbers are from `a1f0a62`: locate the code again
 before editing.
 
-**Next item: 7.2** (Phase 7, the 13 Oct assessment, requested by the maintainer on 13 Oct). Then the rest of Phase 7; 2.9, 2.10 and Phase 3 follow in order.
+**Next item: 7.3** (Phase 7, the 13 Oct assessment, requested by the maintainer on 13 Oct). Then the rest of Phase 7; 2.9, 2.10 and Phase 3 follow in order.
 
 ## Done
 
@@ -190,7 +190,7 @@ never enters the log, so it does not depend on it, but shared analytical views w
 | id | Item | Status |
 |---|---|---|
 | 7.1 | **Analytical queries in the engine** (`core/src/analytic.rs`, `Book.analyze`, `Book.analyze_records`): canonical group keys with row membership; missing/text amounts counted, never 0; mixed currencies refused with the amount per currency; average and ratio from their parts, marked non-additive; excluded population (selection, table filters) aggregated; Σ groups = total reconciled for additive measures; duplicate/blank identifiers; read-only. `e2e/analytic.mjs` (25 checks, budgets). See [`docs/analytical-model.md`](analytical-model.md) | `done` (#17) |
-| 7.2 | **Analytical charts and cross-filtering.** A chart can be bound to a table (dimension + measures) instead of ranges; its marks carry canonical keys; mark-level hit testing; click / Ctrl-click selects marks; other analytical charts on the same table filter to the selection while the source chart highlights (a chart never filters itself, so links cannot loop); clearing shows all (explicit policy); a "Filtered by … · excluded N rows, value" strip; selection is per viewer, not an operation. Existing range charts keep working as exhibits | `todo` |
+| 7.2 | **Analytical charts and cross-filtering.** A chart can be bound to a table (dimension + measures) instead of ranges; its marks carry canonical keys; mark-level hit testing; click / Ctrl-click selects marks; other analytical charts on the same table filter to the selection while the source chart highlights (a chart never filters itself, so links cannot loop); clearing shows all (explicit policy); a "Filtered by … · excluded N rows, value" strip; selection is per viewer, not an operation. Existing range charts keep working as exhibits. `e2e/crossfilter_ui.py` (19 checks) | `done` (#18) |
 | 7.3 | **Drill-through and drill-down.** *See records* on a selected mark lists the source rows (row numbers, chosen fields, "rows add up to the figure ✓"), jumps to a row in the table; a chart with a dimension hierarchy drills down/up keeping the parent selection as context | `todo` |
 | 7.4 | **Decomposition tree.** Break a measure down by dimensions chosen per level; siblings sorted by value with a fixed tie-break, top N plus "Other (k)" and "(blank)" nodes; additive children reconcile to the parent at every level; ratios/averages recomputed per node and labelled "children do not sum"; deterministic suggested splits that say how they were chosen | `todo` |
 | 7.5 | **Governed metrics.** Workbook metric definitions (name, measure spec, currency, format, description) as document operations; charts, decomposition, the assistant and companion watches refer to a metric by name so one definition is used everywhere | `todo` |
@@ -203,5 +203,8 @@ never enters the log, so it does not depend on it, but shared analytical views w
 * Filters saved before #11 on formatted columns (`#,##0.00`, dates) stored display text. They keep their old
   (wrong) behaviour until re-applied, and reopening the popover shows those values unticked. Optional: migrate on
   load when the display → canonical mapping is unambiguous.
+* Undoing a table rename restores the table but not the chart ranges, analytical chart bindings and named ranges
+  that the rename rewrote (`RenameTable` returns only `Inverse::Tables`): after *rename → undo* a chart reads
+  `Facts::A1:A2` from a table called `Data` again. Found while doing 7.2; reproduced with a unit test, not yet fixed.
 * The companion's watch-threshold prompt (`client/src/ui/CompanionPanel.tsx`) reads decimal-comma input but has no
   browser test.

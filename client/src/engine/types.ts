@@ -151,6 +151,74 @@ export interface Chart {
   reference?: ChartReference | null;
   show_values: boolean;
   stat_cards: boolean;
+  /** bound to a table's fields (an analytical chart) instead of ranges */
+  analytic?: ChartAnalytic | null;
+}
+
+/** A measure of an analytical query (core/src/analytic.rs `MeasureSpec`). */
+export interface MeasureSpec {
+  name?: string;
+  field?: string;
+  /** sum | count | count_distinct | average | min | max | ratio */
+  agg: string;
+  numerator?: string;
+  denominator?: string;
+  /** header of a column holding each row's currency code */
+  currency?: string;
+}
+export interface ChartAnalytic {
+  table: string;
+  /** dimension hierarchy, outermost first */
+  dims: string[];
+  measures: MeasureSpec[];
+  sort?: '' | 'key' | 'value_desc' | 'value_asc';
+}
+/** A canonical cell value as the engine serialises it. */
+export type KeyValue = null | { n: number } | { s: string } | { b: boolean } | { e: string };
+export interface AnalyticSelection {
+  field: string;
+  values: KeyValue[];
+}
+export interface AnalyticQuery {
+  table: string;
+  dims?: string[];
+  measures?: MeasureSpec[];
+  selections?: AnalyticSelection[];
+  key?: string[];
+  members?: boolean;
+  respect_table_filters?: boolean;
+  sort?: string;
+}
+export interface MeasureValue {
+  value: number | null;
+  status: 'ok' | 'incomplete' | 'no_data' | 'mixed_currency' | 'div0';
+  n: number;
+  missing: number;
+  invalid: number;
+  currency?: string;
+  by_currency?: { currency: string; value: number; n: number }[];
+}
+export interface AnalyticAnswer {
+  error?: string;
+  table: string;
+  dims: string[];
+  measures: { name: string; agg: string; additive: boolean }[];
+  groups: { key: KeyValue[]; label: string[]; rows: number; members?: number[]; values: MeasureValue[] }[];
+  total: MeasureValue[];
+  excluded: { rows: number; by_selection: number; by_table_filter: number; values: MeasureValue[] };
+  population: { rows: number; included: number; excluded: number; blank: number };
+  reconciliation: { measure: string; status: 'ok' | 'differs' | 'not_assessable'; total: number | null; sum_of_groups: number | null }[];
+  issues: { kind: string; text: string; rows?: number[]; count: number }[];
+}
+export interface AnalyticRecords {
+  error?: string;
+  table: string;
+  fields: string[];
+  measures: { name: string; agg: string; additive: boolean }[];
+  total: MeasureValue[];
+  count: number;
+  truncated: boolean;
+  records: { row: number; values: KeyValue[] }[];
 }
 
 export interface Trace {

@@ -712,6 +712,25 @@ pub struct Chart {
     pub reference: Option<ChartReference>,
     pub show_values: bool,
     pub stat_cards: bool,
+    /// Bound to a table's fields instead of ranges: an analytical chart whose marks know
+    /// their canonical keys and source rows (cross-filtering, drill-through). `None` = an
+    /// exhibit drawn from `categories`/`series`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analytic: Option<ChartAnalytic>,
+}
+
+/// The fields an analytical chart reads (see `crate::analytic`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ChartAnalytic {
+    /// table name
+    pub table: String,
+    /// dimension hierarchy (headers), outermost first; the chart shows one level at a time
+    pub dims: Vec<String>,
+    pub measures: Vec<crate::analytic::MeasureSpec>,
+    /// "key" (default) | "value_desc" | "value_asc"
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub sort: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]

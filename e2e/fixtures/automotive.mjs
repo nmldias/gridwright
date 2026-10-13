@@ -71,7 +71,7 @@ export function rows(n = 10000, seed = 20261013) {
     });
   }
   // 25 vehicles exported twice
-  for (let k = 0; k < 25; k++) out.push({ ...out[k * 397] });
+  for (let k = 0; k < 25; k++) out.push({ ...out[(k * 397) % n] });
   return out;
 }
 

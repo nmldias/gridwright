@@ -14,6 +14,7 @@ import { condStyle } from './grid/condfmt';
 import * as book from './engine/book';
 import * as review from './ui/review';
 import * as charts from './grid/charts';
+import * as crossfilter from './grid/crossfilter';
 import { printDocumentHtml } from './ui/print';
 import { applyTemplate } from './ui/templates';
 import { transformOp } from './api/ws';
@@ -28,6 +29,7 @@ applyThemeCss();
   book,
   review,
   charts,
+  crossfilter,
   printDocumentHtml,
   applyTemplate,
   transformOp,
