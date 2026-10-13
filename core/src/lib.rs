@@ -3,6 +3,7 @@
 //! code-cell spill handling and undo/redo. Exposed to JavaScript through
 //! wasm-bindgen as the `Book` class; all payloads cross the boundary as JSON.
 
+pub mod analytic;
 pub mod depindex;
 pub mod engine;
 pub mod formula;
@@ -241,6 +242,32 @@ impl Book {
     /// Evaluate a formula body for a specific cell position (conditional-format formulas); JSON value.
     pub fn eval_at(&self, table: u32, row: u32, col: u32, formula: &str) -> String {
         js(&formula::evaluate(&self.engine.wb, table, Some(model::CellKey::new(row, col)), formula::formula_body(formula)))
+    }
+
+    /// Analytical query (JSON `analytic::Query`): groups with canonical keys and row membership,
+    /// measures that report missing values and mixed currencies instead of hiding them, excluded
+    /// populations and a reconciliation of the groups to the total. Reads only; `{"error":..}` on
+    /// a bad query.
+    pub fn analyze(&self, query_json: &str) -> String {
+        match serde_json::from_str::<analytic::Query>(query_json) {
+            Ok(q) => match analytic::analyze(&self.engine.wb, &q) {
+                Ok(a) => js(&a),
+                Err(e) => js(&serde_json::json!({ "error": e })),
+            },
+            Err(e) => js(&serde_json::json!({ "error": format!("bad query: {}", e) })),
+        }
+    }
+
+    /// The source records behind a selection (JSON `analytic::RecordsQuery`): row indexes, the
+    /// requested fields and the measures' totals over every matching record.
+    pub fn analyze_records(&self, query_json: &str) -> String {
+        match serde_json::from_str::<analytic::RecordsQuery>(query_json) {
+            Ok(q) => match analytic::records(&self.engine.wb, &q) {
+                Ok(a) => js(&a),
+                Err(e) => js(&serde_json::json!({ "error": e })),
+            },
+            Err(e) => js(&serde_json::json!({ "error": format!("bad query: {}", e) })),
+        }
     }
 
     /// JSON array of chart objects.

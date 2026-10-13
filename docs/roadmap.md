@@ -7,7 +7,7 @@ before and passes after, and is merged through CI (see [`AGENTS.md`](../AGENTS.m
 Status: `todo` · `partial` · `done` (merged; PR noted). Line numbers are from `a1f0a62`: locate the code again
 before editing.
 
-**Next item: 2.9.** Then the rest of Phase 2 in order, then Phase 3.
+**Next item: 7.2** (Phase 7, the 13 Oct assessment, requested by the maintainer on 13 Oct). Then the rest of Phase 7; 2.9, 2.10 and Phase 3 follow in order.
 
 ## Done
 
@@ -167,6 +167,36 @@ Behaviour on existing installs must not change.
   import, tenancy, exec, companion) without behaviour change.
 * **Don't:** repackage features. The companion and investigations, guided import and tenancy stay as they are
   (6.1, 6.2 and the "optional" part of 6.3 were declined).
+
+## Phase 7 — Financial analytical model (13 Oct 2026 assessment)
+
+The assessment of 13 Oct 2026 proposed reverse-engineering visual analytics (Tableau cross-filtering, Power BI
+decomposition and drill-through, Qlik excluded values, Lightdash metrics, Grist linked views) and then warned that
+visual interaction must be built **on financial meaning, not the other way round**: a chart that renders perfectly
+can still use the wrong grain, currency or aggregation. So this phase builds a narrow analytical contract first and
+the interactions on top of it.
+
+*Method.* Reference behaviour comes from official documentation and open-source code only
+([`docs/research/interaction-behaviour.md`](research/interaction-behaviour.md), every claim cited); no proprietary
+application is inspected. Where the references are silent or wrong for finance (join fan-out, mixed currency,
+non-additive totals, nulls, permissions through aggregates) Gridwright specifies the behaviour itself and tests it
+against an independent reference. The common benchmark is the synthetic 10,000-vehicle inventory in
+`e2e/fixtures/automotive.mjs` (duplicate VINs, blank/text costs, three currencies, reserved stock older than
+average, margins whose plain average misleads).
+
+Phase 3 (multiplayer convergence) stays a parallel prerequisite: interaction state in this phase is per viewer and
+never enters the log, so it does not depend on it, but shared analytical views will.
+
+| id | Item | Status |
+|---|---|---|
+| 7.1 | **Analytical queries in the engine** (`core/src/analytic.rs`, `Book.analyze`, `Book.analyze_records`): canonical group keys with row membership; missing/text amounts counted, never 0; mixed currencies refused with the amount per currency; average and ratio from their parts, marked non-additive; excluded population (selection, table filters) aggregated; Σ groups = total reconciled for additive measures; duplicate/blank identifiers; read-only. `e2e/analytic.mjs` (25 checks, budgets). See [`docs/analytical-model.md`](analytical-model.md) | `done` (#17) |
+| 7.2 | **Analytical charts and cross-filtering.** A chart can be bound to a table (dimension + measures) instead of ranges; its marks carry canonical keys; mark-level hit testing; click / Ctrl-click selects marks; other analytical charts on the same table filter to the selection while the source chart highlights (a chart never filters itself, so links cannot loop); clearing shows all (explicit policy); a "Filtered by … · excluded N rows, value" strip; selection is per viewer, not an operation. Existing range charts keep working as exhibits | `todo` |
+| 7.3 | **Drill-through and drill-down.** *See records* on a selected mark lists the source rows (row numbers, chosen fields, "rows add up to the figure ✓"), jumps to a row in the table; a chart with a dimension hierarchy drills down/up keeping the parent selection as context | `todo` |
+| 7.4 | **Decomposition tree.** Break a measure down by dimensions chosen per level; siblings sorted by value with a fixed tie-break, top N plus "Other (k)" and "(blank)" nodes; additive children reconcile to the parent at every level; ratios/averages recomputed per node and labelled "children do not sum"; deterministic suggested splits that say how they were chosen | `todo` |
+| 7.5 | **Governed metrics.** Workbook metric definitions (name, measure spec, currency, format, description) as document operations; charts, decomposition, the assistant and companion watches refer to a metric by name so one definition is used everywhere | `todo` |
+| 7.6 | **Relationships with cardinality.** Declared links between tables (1:1, 1:many) with a fan-out guard: a measure is aggregated at its own grain before joining, and a breakdown that would repeat a row's amount is refused or de-duplicated, with a test that reconciles before and after the join | `todo` |
+| 7.7 | **Reproducible analytical state for review.** Signing off an analysis records its query, metric definitions and a fingerprint of the source rows; reopening shows whether the data or definitions changed since | `todo` |
+| 7.8 | **Evidence for agents.** An MCP tool exposing analytical queries and records, so every number an agent states cites a query and rows; text from imported cells is passed as data, never as instructions (prompt-injection test) | `todo` |
 
 ## Small follow-ups found along the way
 
