@@ -144,7 +144,7 @@ try:
             page.mouse.click(pt["x"], pt["y"])
             if modifiers:
                 page.keyboard.up(modifiers)
-            page.wait_for_timeout(250)
+            page.wait_for_timeout(450)  # the next plain click on this chart is not a double-click
             return True
 
         before_json = page.evaluate("() => window.__gw.book.toJson()")
@@ -174,6 +174,21 @@ try:
         check("7. Ctrl-click adds Huambo: the other chart counts Luanda + Huambo",
               ok and counts(dB) == ref_count("Manufacturer", lambda o: o["Branch"] in ("Luanda", "Huambo")), counts(dB))
 
+        # a Ctrl-click straight after a click (inside the double-click window) still adds a bar
+        for label, mod in (("Benguela", None), ("Cabinda", "Control")):
+            pt = page.evaluate(POINT_JS, [A, label])
+            if mod:
+                page.keyboard.down(mod)
+            page.mouse.click(pt["x"], pt["y"])
+            if mod:
+                page.keyboard.up(mod)
+        page.wait_for_timeout(300)
+        sel = page.evaluate("(id) => window.__gw.getState().markSelections[id]?.labels ?? []", A)
+        check("7a. a quick Ctrl-click is not taken for a double-click: it adds the bar", sel == ["Benguela", "Cabinda"] and page.evaluate("() => window.__gw.getState().panel") != "chart", sel)
+        page.mouse.click(10, 990)  # away from the charts
+        click_bar(A, "Luanda")
+        click_bar(A, "Huambo", "Control")
+        page.wait_for_timeout(200)
         ok = click_bar(B, "Toyota")
         dA, dB = data(A), data(B)
         check("8. a selection in the second chart filters the first (Toyota by branch)…",
