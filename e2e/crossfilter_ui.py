@@ -185,7 +185,8 @@ try:
         page.wait_for_timeout(300)
         sel = page.evaluate("(id) => window.__gw.getState().markSelections[id]?.labels ?? []", A)
         check("7a. a quick Ctrl-click is not taken for a double-click: it adds the bar", sel == ["Benguela", "Cabinda"] and page.evaluate("() => window.__gw.getState().panel") != "chart", sel)
-        page.mouse.click(10, 990)  # away from the charts
+        page.keyboard.press("Escape")
+        # …and a plain click straight after a Ctrl-click is a click, not a double-click
         click_bar(A, "Luanda")
         click_bar(A, "Huambo", "Control")
         page.wait_for_timeout(200)

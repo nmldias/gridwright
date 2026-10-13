@@ -182,9 +182,10 @@ export class GridController {
         const id = h.id;
         const chart = st.charts.find((c) => c.id === id)!;
         const now = performance.now();
-        // a Ctrl/⌘/Shift-click adds a mark: never half of a double-click
-        const dbl = now - this.lastClick.t < 400 && this.lastClick.table === -2 && this.lastClick.r === id && !(e.ctrlKey || e.metaKey || e.shiftKey);
-        this.lastClick = { t: now, table: -2, r: id, c: 0 };
+        // a Ctrl/⌘/Shift-click adds a mark: never either half of a double-click
+        const adds = e.ctrlKey || e.metaKey || e.shiftKey;
+        const dbl = !adds && now - this.lastClick.t < 400 && this.lastClick.table === -2 && this.lastClick.r === id;
+        this.lastClick = { t: adds ? 0 : now, table: -2, r: id, c: 0 };
         useStore.setState({ selectedChart: id, selectedTable: null });
         this.renderer.markDirty();
         if (dbl) {
