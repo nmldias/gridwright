@@ -65,6 +65,23 @@ matching records (`row`, `values`) and the measures' totals over all of them. Fo
 selections are the chart's own selections plus the mark's key. The records then add up to the number the
 mark shows, and `e2e/analytic.mjs` checks this.
 
+## Analytical charts and cross-filtering
+
+A chart with an `analytic` binding (`{ table, dims, measures, sort }`, saved with the chart) draws one
+engine query. Each mark carries its group's canonical key. The cross-filtering policies are
+stated, not assumed (`client/src/grid/crossfilter.ts`; research §1):
+
+* A selection in chart A filters every other analytical chart on the same table (selections from
+  several charts are ANDed). A is not filtered by its own selection. It dims the other marks, so links
+  cannot loop and a chart's population never disappears from under its own selection.
+* Click selects one mark. Ctrl/⌘/Shift-click adds or removes one.
+* Clearing shows all values: click the only selected mark again, click empty plot area, or press Esc.
+* The filtered chart says what it leaves out: the selection, the number of rows and the value of its
+  first measure.
+* A selection is per viewer (`store.markSelections`). It is not an operation and is not saved, and
+  other editors do not see it.
+* A ratio or an average gets no *Total* stat card: it is not summed across bars.
+
 ## What it does not do yet
 
 One table per query. There are no relationships, so there is no fan-out across a join (7.6). Currencies

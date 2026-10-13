@@ -208,6 +208,75 @@ export function insertChart(kind: ChartKind = 'bar'): number | null {
   return id;
 }
 
+/** Header names of a table (its first row), for binding an analytical chart. */
+export function tableHeaders(table: TableId): string[] {
+  const meta = getState().tables.get(table);
+  if (!meta || meta.header_rows < 1) return [];
+  return book.rangeValues(table, 0, 0, 0, meta.cols - 1)[0]?.map((v) => (v === null || typeof v === 'object' ? '' : String(v))) ?? [];
+}
+
+/** A first guess at an analytical chart over a table: the text column with the fewest distinct
+ * values (2–60) as the dimension, the first numeric column summed. */
+export function analyticFromTable(table: TableId, kind: ChartKind = 'bar'): Chart | null {
+  const meta = getState().tables.get(table);
+  if (!meta || meta.header_rows < 1) return null;
+  const heads = tableHeaders(table);
+  const last = Math.min(meta.rows - 1, meta.header_rows + 400);
+  let dim: { c: number; n: number } | null = null;
+  let measure: number | null = null;
+  heads.forEach((h, c) => {
+    if (!h) return;
+    const seen = new Set<string>();
+    let nums = 0;
+    let texts = 0;
+    for (let r = meta.header_rows; r <= last; r++) {
+      const v = cellAt(table, r, c)?.v;
+      if (!v) continue;
+      if ('n' in v) nums++;
+      else if ('s' in v) {
+        texts++;
+        seen.add(v.s.toLowerCase());
+      }
+    }
+    if (texts > nums && seen.size >= 2 && seen.size <= 60 && (!dim || seen.size < dim.n)) dim = { c, n: seen.size };
+    if (nums > texts && measure === null) measure = c;
+  });
+  const d = dim as { c: number; n: number } | null;
+  if (!d || measure === null) return null;
+  const m = heads[measure];
+  return {
+    ...EMPTY_CHART,
+    kind,
+    x: Math.round(meta.x + meta.col_widths.reduce((a, b) => a + b, 0) + 60),
+    y: Math.round(meta.y),
+    title: `${m} by ${heads[d.c]}`,
+    subtitle: `${meta.name}, sum of ${m}`,
+    source: meta.name,
+    categories: '',
+    series: [],
+    analytic: { table: meta.name, dims: [heads[d.c]], measures: [{ field: m, agg: 'sum' }], sort: 'value_desc' },
+  };
+}
+
+/** Insert an analytical chart over the selected table (or the table of the selected cell). */
+export function insertAnalyticChart(kind: ChartKind = 'bar'): number | null {
+  const st = getState();
+  const table = st.selectedTable ?? st.selection?.table ?? null;
+  const chart = table === null ? null : analyticFromTable(table, kind);
+  if (!chart) {
+    setStatus('Select a table with a header row, a text column to group by and a numeric column', 5000);
+    return null;
+  }
+  const ch = book.apply({ type: 'add_chart', chart }, { note: `chart: ${chart.title}` });
+  if (ch.error) {
+    setStatus(ch.error, 5000);
+    return null;
+  }
+  const id = ch.created_chart ?? null;
+  useStore.setState({ selectedChart: id, selectedTable: null, panel: 'chart' });
+  return id;
+}
+
 export function updateChart(chart: Chart, note = 'chart changed') {
   const ch = book.apply({ type: 'update_chart', chart }, { note });
   if (ch.error) setStatus(ch.error, 5000);

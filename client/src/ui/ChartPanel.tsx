@@ -1,10 +1,99 @@
 import { useEffect, useMemo, useState } from 'react';
 import { PanelHeader } from './PanelHeader';
 import * as book from '../engine/book';
-import { refText, type Chart, type ChartKind } from '../engine/types';
+import { refText, type Chart, type ChartAnalytic, type ChartKind, type MeasureSpec } from '../engine/types';
 import { chartData, chartPng, chartSvg, downloadBlob } from '../grid/charts';
 import { getState, useStore } from '../state/store';
-import { chartFromSelection, insertChart, updateChart } from './review';
+import { analyticFromTable, chartFromSelection, insertAnalyticChart, insertChart, tableHeaders, updateChart } from './review';
+import { clearMarks } from '../grid/crossfilter';
+
+const AGGS: { value: string; label: string }[] = [
+  { value: 'sum', label: 'Sum' },
+  { value: 'count', label: 'Count rows' },
+  { value: 'count_distinct', label: 'Count distinct' },
+  { value: 'average', label: 'Average (Σ ÷ n)' },
+  { value: 'min', label: 'Min' },
+  { value: 'max', label: 'Max' },
+  { value: 'ratio', label: 'Ratio (Σ a ÷ Σ b)' },
+];
+
+/** The fields an analytical chart reads: table, dimension, measures (docs/analytical-model.md). */
+function AnalyticFields({ an, commit }: { an: ChartAnalytic; commit: (an: ChartAnalytic, note: string) => void }) {
+  const tables = useStore((s) => s.tables);
+  useStore((s) => s.cellsVersion);
+  const tableId = [...tables.values()].find((t) => t.name.toLowerCase() === an.table.toLowerCase())?.id ?? null;
+  const heads = tableId === null ? [] : tableHeaders(tableId).filter(Boolean);
+  const setMeasure = (i: number, patch: Partial<MeasureSpec>) => commit({ ...an, measures: an.measures.map((m, j) => (j === i ? { ...m, ...patch } : m)) }, 'chart measure changed');
+  const fieldSelect = (value: string | undefined, onChange: (v: string) => void, label: string, optional = false) => (
+    <select aria-label={label} value={value ?? ''} onChange={(e) => onChange(e.target.value)}>
+      {optional ? <option value="">{label}: none</option> : <option value="">{label}…</option>}
+      {heads.map((h) => (
+        <option key={h} value={h}>
+          {h}
+        </option>
+      ))}
+    </select>
+  );
+  return (
+    <>
+      <label>
+        Table
+        <select value={an.table} onChange={(e) => commit({ ...an, table: e.target.value, dims: [], measures: [{ agg: 'count' }] }, 'chart table changed')}>
+          {tableId === null && <option value={an.table}>{an.table || 'choose…'}</option>}
+          {[...tables.values()].map((t) => (
+            <option key={t.id} value={t.name}>
+              {t.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        Group by
+        {fieldSelect(an.dims[0], (v) => commit({ ...an, dims: v ? [v, ...an.dims.slice(1).filter((d) => d !== v)] : [] }, 'chart dimension changed'), 'Dimension')}
+      </label>
+      {an.measures.map((m, i) => (
+        <div key={i} className="row series-row wrap">
+          <select aria-label="Aggregation" value={m.agg} onChange={(e) => setMeasure(i, { agg: e.target.value })}>
+            {AGGS.map((a) => (
+              <option key={a.value} value={a.value}>
+                {a.label}
+              </option>
+            ))}
+          </select>
+          {m.agg === 'ratio' ? (
+            <>
+              {fieldSelect(m.numerator, (v) => setMeasure(i, { numerator: v }), 'Numerator')}
+              {fieldSelect(m.denominator, (v) => setMeasure(i, { denominator: v }), 'Denominator')}
+            </>
+          ) : (
+            fieldSelect(m.field, (v) => setMeasure(i, { field: v }), m.agg === 'count' ? 'Non-blank in' : 'Field', m.agg === 'count')
+          )}
+          {m.agg !== 'count' && m.agg !== 'count_distinct' && fieldSelect(m.currency, (v) => setMeasure(i, { currency: v }), 'Currency column', true)}
+          {an.measures.length > 1 && (
+            <button title="Remove measure" onClick={() => commit({ ...an, measures: an.measures.filter((_, j) => j !== i) }, 'chart measure removed')}>
+              ×
+            </button>
+          )}
+        </div>
+      ))}
+      <div className="row wrap">
+        <button onClick={() => commit({ ...an, measures: [...an.measures, { agg: 'sum' }] }, 'chart measure added')}>+ Measure</button>
+        <label className="grow">
+          Order
+          <select value={an.sort || 'key'} onChange={(e) => commit({ ...an, sort: e.target.value as ChartAnalytic['sort'] }, 'chart order changed')}>
+            <option value="key">by {an.dims[0] || 'dimension'}</option>
+            <option value="value_desc">largest first</option>
+            <option value="value_asc">smallest first</option>
+          </select>
+        </label>
+      </div>
+      <p className="muted small">
+        Click a bar to filter the other charts on this table; Ctrl/⌘-click adds bars; click it again, click empty space or press Esc to show all. Selecting never changes the workbook. Blank or text amounts are left out and said so, different currencies are not added, and averages and ratios are computed from their parts.
+      </p>
+    </>
+  );
+}
+
 import { openPrintView } from './print';
 
 const KINDS: { value: ChartKind; label: string }[] = [
@@ -36,6 +125,10 @@ export function ChartPanel() {
               + {k.label}
             </button>
           ))}
+        </div>
+        <p className="muted small">Or an analytical chart, bound to a table's fields: its bars filter the other analytical charts on the same table and lead to the records behind them.</p>
+        <div className="row wrap">
+          <button onClick={() => insertAnalyticChart('bar')}>+ Analytical chart from table</button>
         </div>
         {charts.length > 0 && (
           <>
@@ -116,6 +209,13 @@ export function ChartPanel() {
         <input value={draft.source} placeholder="Primavera ERP, extracted 9 Oct 2026" onChange={(e) => edit({ source: e.target.value })} onBlur={blur} />
       </label>
       <h4>Data</h4>
+      {draft.analytic ? (
+        <>
+          <AnalyticFields an={draft.analytic} commit={(an, note) => { clearMarks(draft.id); commit({ analytic: an }, note); }} />
+          <button onClick={() => { clearMarks(draft.id); commit({ analytic: null }, 'chart reads ranges'); }}>Use ranges instead</button>
+        </>
+      ) : (
+        <>
       <label>
         Categories
         <input value={draft.categories} placeholder="Sales::A2:A13" onChange={(e) => edit({ categories: e.target.value })} onBlur={blur} />
@@ -132,9 +232,22 @@ export function ChartPanel() {
       <div className="row wrap">
         <button onClick={addSeriesFromSelection}>+ Series from selection</button>
         <button onClick={useSelection}>Use selection</button>
+        <button
+          onClick={() => {
+            const st = getState();
+            const t = st.selection?.table ?? st.tables.keys().next().value;
+            const guess = t === undefined ? null : analyticFromTable(t, draft.kind);
+            if (guess) commit({ analytic: guess.analytic }, 'chart bound to table fields');
+          }}
+        >
+          Bind to table fields
+        </button>
       </div>
+        </>
+      )}
       {data.error && <div className="muted small">{data.error}</div>}
       <h4>Emphasis</h4>
+      {!draft.analytic && (
       <label>
         Highlight
         <select value={draft.highlight ?? ''} onChange={(e) => commit({ highlight: e.target.value === '' ? null : Number(e.target.value) })}>
@@ -146,6 +259,7 @@ export function ChartPanel() {
           ))}
         </select>
       </label>
+      )}
       <div className="row">
         <label className="grow">
           Reference line
@@ -186,6 +300,7 @@ export function ChartPanel() {
         <button
           className="danger"
           onClick={() => {
+            clearMarks(draft.id);
             book.apply({ type: 'delete_chart', id: draft.id }, { note: 'chart deleted' });
             useStore.setState({ selectedChart: null });
           }}

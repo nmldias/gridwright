@@ -224,6 +224,9 @@ interface ChartCacheEntry {
   h: number;
   data: ChartData;
   prims: Prim[];
+  /** analytical charts also depend on the other charts and this viewer's mark selections */
+  charts: Chart[];
+  sels: object;
 }
 
 export interface ChartPreview {
@@ -465,14 +468,19 @@ export class GridRenderer {
       // keep selected table on top
       if (isSel) this.tablesLayer.setChildIndex(view.container, this.tablesLayer.children.length - 1);
     }
-    this.drawCharts(st.charts, st.selectedChart, w0, w1, zoom);
+    this.drawCharts(st.charts, st.selectedChart, w0, w1, zoom, st.markSelections);
     this.drawOverlay(selection, selectedTable, tables, zoom, st.presence);
     this.drawStickyHeader(selection, tables, cells, w0, w1, zoom);
     this.drawTrace(st.trace, tables, zoom);
   }
 
   // ---- charts ------------------------------------------------------------------
-  private drawCharts(charts: Chart[], selected: number | null, w0: { x: number; y: number }, w1: { x: number; y: number }, zoom: number) {
+  /** The drawing primitives of a chart as last drawn (mark hit testing). */
+  chartPrims(id: number): Prim[] | null {
+    return this.chartCache.get(id)?.prims ?? null;
+  }
+
+  private drawCharts(charts: Chart[], selected: number | null, w0: { x: number; y: number }, w1: { x: number; y: number }, zoom: number, sels: object) {
     const ids = new Set(charts.map((c) => c.id));
     for (const [id, v] of this.chartViews) {
       if (!ids.has(id)) {
@@ -500,9 +508,10 @@ export class GridRenderer {
       const isSel = selected === chart.id;
       if (isSel) this.chartsLayer.setChildIndex(view.container, this.chartsLayer.children.length - 1);
       let entry = this.chartCache.get(chart.id);
-      if (!entry || entry.chart !== chart || entry.version !== this.cellsVersion || entry.w !== w || entry.h !== h) {
-        const data = entry && entry.version === this.cellsVersion && entry.chart.categories === chart.categories && JSON.stringify(entry.chart.series) === JSON.stringify(chart.series) ? entry.data : chartData(chart);
-        entry = { chart, version: this.cellsVersion, w, h, data, prims: chartLayout(chart, data, w, h) };
+      const linked = !!chart.analytic && (!entry || entry.charts !== charts || entry.sels !== sels);
+      if (!entry || entry.chart !== chart || entry.version !== this.cellsVersion || entry.w !== w || entry.h !== h || linked) {
+        const data = entry && !linked && !chart.analytic && entry.version === this.cellsVersion && entry.chart.categories === chart.categories && JSON.stringify(entry.chart.series) === JSON.stringify(chart.series) ? entry.data : chartData(chart);
+        entry = { chart, version: this.cellsVersion, w, h, data, prims: chartLayout(chart, data, w, h), charts, sels };
         this.chartCache.set(chart.id, entry);
       }
       this.drawPrims(view, entry.prims, zoom);

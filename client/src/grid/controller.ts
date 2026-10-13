@@ -4,7 +4,9 @@
 // double-tap edits, two fingers pinch-zoom).
 
 import * as book from '../engine/book';
-import type { TableId } from '../engine/types';
+import type { Chart, TableId } from '../engine/types';
+import { analyticData, markAt } from './charts';
+import { clearMarks, toggleMark } from './crossfilter';
 import { getState, useStore } from '../state/store';
 import {
   autoFitColumn,
@@ -36,7 +38,7 @@ type Mode =
   | { kind: 'col-select'; table: TableId; c: number }
   | { kind: 'row-select'; table: TableId; r: number }
   | { kind: 'fill'; table: TableId; r0: number; c0: number; r1: number; c1: number }
-  | { kind: 'chart-move'; id: number; ox: number; oy: number; moved: boolean }
+  | { kind: 'chart-move'; id: number; ox: number; oy: number; moved: boolean; additive: boolean }
   | { kind: 'chart-resize'; id: number; dx: number; dy: number }
   /** touch: undecided between tap, pan and long-press selection */
   | { kind: 'touch-wait'; hit: Hit; sx: number; sy: number; px: number; py: number; timer: number }
@@ -149,6 +151,20 @@ export class GridController {
     this.beginHit(h, e, x, y, false);
   }
 
+  /** Select or toggle the mark under a chart-local point; empty plot area clears the chart's selection. */
+  private clickMarks(chart: Chart, lx: number, ly: number, additive: boolean) {
+    const prims = this.renderer.chartPrims(chart.id);
+    const i = prims ? markAt(prims, lx, ly) : null;
+    if (i === null) {
+      if (!additive) clearMarks(chart.id);
+    } else {
+      const data = analyticData(chart);
+      const key = data.keys?.[i];
+      if (key !== undefined) toggleMark(chart, key, data.categories[i] ?? '', additive);
+    }
+    this.renderer.markDirty();
+  }
+
   private capture(e: PointerEvent) {
     try {
       this.host.setPointerCapture(e.pointerId);
@@ -175,7 +191,7 @@ export class GridController {
           this.mode = { kind: 'idle' };
           return;
         }
-        this.mode = { kind: 'chart-move', id, ox: x - chart.x, oy: y - chart.y, moved: false };
+        this.mode = { kind: 'chart-move', id, ox: x - chart.x, oy: y - chart.y, moved: false, additive: e.ctrlKey || e.metaKey || e.shiftKey };
         break;
       }
       case 'chart-resize': {
@@ -509,6 +525,11 @@ export class GridController {
         const p = this.renderer.chartPreview;
         this.renderer.chartPreview = null;
         const chart = getState().charts.find((c) => c.id === mode.id);
+        if (mode.kind === 'chart-move' && !mode.moved && chart?.analytic) {
+          // a click (not a drag) on an analytical chart selects marks: interaction state, not an edit
+          this.clickMarks(chart, mode.ox, mode.oy, mode.additive);
+          return;
+        }
         if (p && chart && (p.x !== chart.x || p.y !== chart.y || p.w !== chart.w || p.h !== chart.h)) book.apply({ type: 'update_chart', chart: { ...chart, x: p.x, y: p.y, w: p.w, h: p.h } }, { note: 'chart moved' });
         else this.renderer.markDirty();
         return;
@@ -572,9 +593,15 @@ export class GridController {
       book.redo();
       return;
     }
+    // Esc first clears selected chart marks (cross-filtering), then deselects
+    if (e.key === 'Escape' && clearMarks()) {
+      this.renderer.markDirty();
+      return;
+    }
     if (st.selectedChart !== null) {
       if (e.key === 'Delete' || e.key === 'Backspace') {
         e.preventDefault();
+        clearMarks(st.selectedChart);
         book.apply({ type: 'delete_chart', id: st.selectedChart }, { note: 'chart deleted' });
         useStore.setState({ selectedChart: null });
         return;

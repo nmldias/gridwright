@@ -1,6 +1,6 @@
 import type { Proposal, ServerPython } from '../api/client';
 import { create } from 'zustand';
-import type { CellRef, CellView, Chart, NamedRange, TableId, TableMeta, Trace } from '../engine/types';
+import type { CellRef, CellView, Chart, KeyValue, NamedRange, TableId, TableMeta, Trace } from '../engine/types';
 
 export interface Selection {
   table: TableId;
@@ -81,6 +81,15 @@ export interface FilterPopover {
   y: number;
 }
 
+export interface MarkSelection {
+  table: string;
+  field: string;
+  /** canonical keys of the selected marks */
+  keys: KeyValue[];
+  /** their labels, for the "Filtered by" strip */
+  labels: string[];
+}
+
 interface State {
   ready: boolean;
   fileId: string | null;
@@ -119,6 +128,9 @@ interface State {
   touch: boolean;
   charts: Chart[];
   selectedChart: number | null;
+  /** marks selected in analytical charts, per chart: this viewer's interaction state, never an
+   * operation (cross-filtering, docs/analytical-model.md) */
+  markSelections: Record<number, MarkSelection>;
   /** precedents/dependents overlay of a cell (Review panel) */
   trace: TraceState | null;
   /** sharing level of the open document */
@@ -188,6 +200,7 @@ export const useStore = create<State>((set) => ({
   filterPopover: null,
   charts: [],
   selectedChart: null,
+  markSelections: {},
   trace: null,
   permission: 'own',
   fileFolder: '',

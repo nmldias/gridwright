@@ -1121,6 +1121,11 @@ impl Engine {
                     for s in c.series.iter_mut() {
                         s.range = formula::rename_table(&s.range, &old, &name);
                     }
+                    if let Some(an) = c.analytic.as_mut() {
+                        if an.table.trim().eq_ignore_ascii_case(old.trim()) {
+                            an.table = name.clone();
+                        }
+                    }
                 }
                 if charts_before != self.wb.charts {
                     ch.charts = Some(self.wb.charts.clone());
@@ -3329,6 +3334,34 @@ mod tests {
         assert_eq!(e.wb.charts[0].series[0].range, "Facts[Units]");
         e.apply(Op::DeleteRows { table: 1, at: 0, count: 1 });
         assert_eq!(e.wb.charts[0].categories, "Facts::A3:A6");
+    }
+
+    #[test]
+    fn analytical_chart_binding_round_trips_and_follows_a_rename() {
+        let mut e = engine();
+        let chart = Chart {
+            analytic: Some(crate::model::ChartAnalytic {
+                table: "Data".into(),
+                dims: vec!["Branch".into()],
+                measures: vec![crate::analytic::MeasureSpec {
+                    field: "Units".into(),
+                    agg: "sum".into(),
+                    ..Default::default()
+                }],
+                sort: "value_desc".into(),
+            }),
+            ..Chart::default()
+        };
+        e.apply(Op::AddChart { chart });
+        let json = serde_json::to_string(&e.wb).unwrap();
+        assert!(json.contains(r#""analytic":{"table":"Data","dims":["Branch"]"#));
+        let wb: Workbook = serde_json::from_str(&json).unwrap();
+        assert_eq!(wb.charts[0].analytic, e.wb.charts[0].analytic);
+        // a range chart has no binding and serialises as before
+        assert!(!serde_json::to_string(&Chart::default()).unwrap().contains("analytic"));
+        let ch = e.apply(Op::RenameTable { table: 1, name: "Facts".into() });
+        assert!(ch.charts.is_some());
+        assert_eq!(e.wb.charts[0].analytic.as_ref().unwrap().table, "Facts");
     }
 
     #[test]
