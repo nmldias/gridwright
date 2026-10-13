@@ -5,7 +5,7 @@ import { refText, type Chart, type ChartAnalytic, type ChartKind, type MeasureSp
 import { chartData, chartPng, chartSvg, downloadBlob } from '../grid/charts';
 import { getState, useStore } from '../state/store';
 import { analyticFromTable, chartFromSelection, insertAnalyticChart, insertChart, tableHeaders, updateChart } from './review';
-import { clearMarks } from '../grid/crossfilter';
+import { forgetChart } from '../grid/crossfilter';
 
 const AGGS: { value: string; label: string }[] = [
   { value: 'sum', label: 'Sum' },
@@ -51,6 +51,14 @@ function AnalyticFields({ an, commit }: { an: ChartAnalytic; commit: (an: ChartA
         Group by
         {fieldSelect(an.dims[0], (v) => commit({ ...an, dims: v ? [v, ...an.dims.slice(1).filter((d) => d !== v)] : [] }, 'chart dimension changed'), 'Dimension')}
       </label>
+      {[1, 2].map((lvl) =>
+        an.dims.length >= lvl ? (
+          <label key={lvl}>
+            {lvl === 1 ? 'Drill down to' : 'Then to'}
+            {fieldSelect(an.dims[lvl], (v) => commit({ ...an, dims: v ? [...an.dims.slice(0, lvl), v] : an.dims.slice(0, lvl) }, 'chart hierarchy changed'), 'Level', true)}
+          </label>
+        ) : null,
+      )}
       {an.measures.map((m, i) => (
         <div key={i} className="row series-row wrap">
           <select aria-label="Aggregation" value={m.agg} onChange={(e) => setMeasure(i, { agg: e.target.value })}>
@@ -88,7 +96,7 @@ function AnalyticFields({ an, commit }: { an: ChartAnalytic; commit: (an: ChartA
         </label>
       </div>
       <p className="muted small">
-        Click a bar to filter the other charts on this table; Ctrl/⌘-click adds bars; click it again, click empty space or press Esc to show all. Selecting never changes the workbook. Blank or text amounts are left out and said so, different currencies are not added, and averages and ratios are computed from their parts.
+        Click a bar to filter the other charts on this table; Ctrl/⌘-click adds bars; click it again, click empty space or press Esc to show all. Double-click a bar for the records behind it; with a drill-down level, ↓ drills into the selected bar and ↑ goes back. Selecting never changes the workbook. Blank or text amounts are left out and said so, different currencies are not added, and averages and ratios are computed from their parts.
       </p>
     </>
   );
@@ -211,8 +219,11 @@ export function ChartPanel() {
       <h4>Data</h4>
       {draft.analytic ? (
         <>
-          <AnalyticFields an={draft.analytic} commit={(an, note) => { clearMarks(draft.id); commit({ analytic: an }, note); }} />
-          <button onClick={() => { clearMarks(draft.id); commit({ analytic: null }, 'chart reads ranges'); }}>Use ranges instead</button>
+          <AnalyticFields an={draft.analytic} commit={(an, note) => { forgetChart(draft.id); commit({ analytic: an }, note); }} />
+          <div className="row wrap">
+            <button onClick={() => useStore.setState({ recordsChart: draft.id, panel: 'records' })}>See records</button>
+            <button onClick={() => { forgetChart(draft.id); commit({ analytic: null }, 'chart reads ranges'); }}>Use ranges instead</button>
+          </div>
         </>
       ) : (
         <>
@@ -300,7 +311,7 @@ export function ChartPanel() {
         <button
           className="danger"
           onClick={() => {
-            clearMarks(draft.id);
+            forgetChart(draft.id);
             book.apply({ type: 'delete_chart', id: draft.id }, { note: 'chart deleted' });
             useStore.setState({ selectedChart: null });
           }}

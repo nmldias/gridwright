@@ -3057,3 +3057,51 @@ a.button:hover {
 .lineage-merge ul { margin: 4px 0 0 18px; padding: 0; }
 .lineage-merge li { margin: 3px 0; line-height: 1.45; }
 .merge-card .place-card { margin-top: 12px; }
+/* drill-through: the records behind an analytical chart */
+.records-panel .row.wrap button {
+  flex: 0 0 auto;
+}
+.records-panel button.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+.records-panel .ok {
+  color: #2e7d32;
+}
+.records-panel .error {
+  color: #b42318;
+}
+.records-table {
+  overflow: auto;
+  max-height: 55vh;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.records-table table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12px;
+}
+.records-table th,
+.records-table td {
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  white-space: nowrap;
+}
+.records-table th {
+  position: sticky;
+  top: 0;
+  background: var(--accent-soft);
+  font-weight: 500;
+}
+.records-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.records-table tbody tr {
+  cursor: pointer;
+}
+.records-table tbody tr:hover {
+  background: var(--accent-soft);
+}

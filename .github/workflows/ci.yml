@@ -182,6 +182,8 @@ jobs:
         run: python3 e2e/numeric_equality_ui.py --port 8808
       - name: Analytical charts cross-filter in the browser without changing the workbook
         run: python3 e2e/crossfilter_ui.py --port 8809
+      - name: Drill-through and drill-down on analytical charts
+        run: python3 e2e/drill_ui.py --port 8810
       - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4

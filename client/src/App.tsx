@@ -7,6 +7,7 @@ import { useStore } from './state/store';
 import { AiPanel } from './ui/AiPanel';
 import { AdminPanel } from './ui/AdminPanel';
 import { ChartPanel } from './ui/ChartPanel';
+import { RecordsPanel } from './ui/RecordsPanel';
 import { CodePanel } from './ui/CodePanel';
 import { ReviewPanel } from './ui/ReviewPanel';
 import { FilesPanel } from './ui/FilesPanel';
@@ -183,6 +184,7 @@ export function App() {
             {panel === 'format' && <FormatPanel />}
             {panel === 'history' && <HistoryPanel />}
             {panel === 'chart' && <ChartPanel />}
+            {panel === 'records' && <RecordsPanel />}
             {panel === 'review' && <ReviewPanel />}
             {panel === 'settings' && <SettingsPanel />}
             {panel === 'admin' && <AdminPanel />}

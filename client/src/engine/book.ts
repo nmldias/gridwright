@@ -380,6 +380,6 @@ export function analyze(q: AnalyticQuery): AnalyticAnswer {
 }
 
 /** The source records behind a selection, with the measures' totals over all of them. */
-export function analyzeRecords(q: AnalyticQuery & { fields?: string[]; limit?: number }): AnalyticRecords {
+export function analyzeRecords(q: AnalyticQuery & { fields?: string[]; limit?: number; complement?: boolean }): AnalyticRecords {
   return JSON.parse(getBook().analyze_records(JSON.stringify(q)));
 }
