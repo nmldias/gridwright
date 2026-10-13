@@ -68,6 +68,10 @@ const recSum = recs.records.reduce((s, r) => s + (r.values[1]?.n ?? 0), 0);
 const refHilux = data.filter((o) => o.Branch === 'Luanda' && o.Model === 'Hilux');
 check('drill-through lists exactly the vehicles behind the mark', recs.count === mark.rows && recs.count === refHilux.length && !recs.truncated);
 check('drill-through records add up to the displayed number', close(recSum, mark.values[0].value) && close(recs.total[0].value, mark.values[0].value), `${recSum} vs ${mark.values[0].value}`);
+const excl = JSON.parse(b.analyze_records(JSON.stringify({ table: 'Inventory', measures: [{ field: 'Inventory value AOA' }], selections: [{ field: 'Branch', values: [{ s: 'Luanda' }] }], fields: ['Branch'], complement: true })));
+check('the records a view leaves out can be listed, and add up to its excluded value', excl.count === lu.excluded.by_selection && close(excl.total[0].value, lu.excluded.values[0].value) && excl.records.every((r) => r.values[0]?.s !== 'Luanda'), `${excl.count} vs ${lu.excluded.by_selection}`);
+const onlyMeasure = JSON.parse(b.analyze_records(JSON.stringify({ table: 'Inventory', measures: [{ agg: 'count' }, { field: 'Inventory value AOA' }], limit: 1 })));
+check('a query reading only a measure counts the same rows as one grouped by branch (blank = whole row empty)', onlyMeasure.count === data.length && onlyMeasure.total[0].value === data.length, `${onlyMeasure.count} vs ${data.length}`);
 const withMembers = run({ table: 'Inventory', dims: ['Branch'], measures: [{ agg: 'count' }], members: true });
 check('group membership partitions the rows (no row twice, none lost)', new Set(withMembers.groups.flatMap((g) => g.members)).size === data.length && withMembers.groups.reduce((s, g) => s + g.members.length, 0) === data.length);
 

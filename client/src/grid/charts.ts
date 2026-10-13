@@ -12,7 +12,7 @@
 import type { Chart, KeyValue } from '../engine/types';
 import * as book from '../engine/book';
 import { getState, type MarkSelection } from '../state/store';
-import { incoming, keyId, ownSelection } from './crossfilter';
+import { currentField, drillLevel, incoming, keyId, ownSelection, pathLabels, pathSelections } from './crossfilter';
 
 export const PALETTE = {
   navy: '#0C447C',
@@ -168,7 +168,8 @@ export function analyticData(chart: Chart, sels?: Record<number, MarkSelection>)
   const selections = sels ?? st.markSelections;
   if (!an.table || !an.dims.length || !an.measures.length) return { categories: [], series: [], error: 'choose a table, a dimension and a measure' };
   const inc = incoming(chart, st.charts, selections);
-  const a = book.analyze({ table: an.table, dims: an.dims.slice(0, 1), measures: an.measures, selections: inc.selections, sort: an.sort || 'key' });
+  const field = currentField(chart);
+  const a = book.analyze({ table: an.table, dims: [field], measures: an.measures, selections: [...inc.selections, ...pathSelections(chart)], sort: an.sort || 'key' });
   if (a.error) return { categories: [], series: [], error: a.error };
   const categories = a.groups.map((g) => (g.label[0] === '' ? '(blank)' : g.label[0]));
   const keys = a.groups.map((g) => g.key[0]);
@@ -178,6 +179,13 @@ export function analyticData(chart: Chart, sels?: Record<number, MarkSelection>)
     color: SERIES_COLORS[i % SERIES_COLORS.length],
   }));
   const strip: NonNullable<ChartData['strip']> = [];
+  const lvl = drillLevel(chart);
+  if (lvl > 0) {
+    const crumbs = pathLabels(chart).map((l, i) => `${an.dims[i]}: ${l || '(blank)'}`).join(' › ');
+    strip.push({ text: `${crumbs} › by ${field} — ↑ goes back up`, tone: 'select' });
+  } else if (an.dims.length > 1) {
+    strip.push({ text: `By ${field} — select a bar and press ↓ to see it by ${an.dims[1]}`, tone: 'warn' });
+  }
   if (inc.from.length) {
     const by = inc.from.map((f) => `${f.field}: ${listLabels(f.labels)}`).join(' · ');
     // the value left out, unless the first measure only counts rows (the row count says it)

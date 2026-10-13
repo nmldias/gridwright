@@ -6,7 +6,7 @@ import './styles.css';
 import { applyThemeCss } from './theme';
 import { lastRecord, statusOf } from './workers/runs';
 import { isTrusted } from './workers/trust';
-import { getState } from './state/store';
+import { getState, useStore } from './state/store';
 import { getRenderer, selectCell } from './grid/actions';
 import { displayOf } from './grid/format';
 import { numberOverflows } from './grid/renderer';
@@ -69,6 +69,8 @@ applyThemeCss();
     const cell = getState().cells.get(ref.table)?.get(ref.row * 65536 + ref.col);
     return statusOf(ref, cell?.i ?? '').status;
   },
+  /** open the Records panel (drill-through) for an analytical chart (tests) */
+  openRecords: (id: number) => useStore.setState({ recordsChart: id, panel: 'records' }),
   viewport: () => {
     const r = getRenderer();
     return r ? { x: r.pan.x, y: r.pan.y, zoom: r.zoom } : { x: 0, y: 0, zoom: 1 };

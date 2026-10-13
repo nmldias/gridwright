@@ -6,7 +6,7 @@
 import * as book from '../engine/book';
 import type { Chart, TableId } from '../engine/types';
 import { analyticData, markAt } from './charts';
-import { clearMarks, toggleMark } from './crossfilter';
+import { clearMarks, drillDown, drillUp, forgetChart, ownSelection, toggleMark } from './crossfilter';
 import { getState, useStore } from '../state/store';
 import {
   autoFitColumn,
@@ -188,6 +188,19 @@ export class GridController {
         this.lastClick = { t: adds ? 0 : now, table: -2, r: id, c: 0 };
         useStore.setState({ selectedChart: id, selectedTable: null });
         this.renderer.markDirty();
+        if (dbl && chart.analytic) {
+          // double-click on a bar: the records behind it (drill-through); elsewhere: the chart panel
+          const prims = this.renderer.chartPrims(id);
+          const i = prims ? markAt(prims, x - chart.x, y - chart.y) : null;
+          const data = i === null ? null : analyticData(chart);
+          const key = i === null ? undefined : data?.keys?.[i];
+          if (i !== null && key !== undefined) {
+            toggleMark(chart, key, data!.categories[i] ?? '', 'only');
+            useStore.setState({ recordsChart: id, panel: 'records' });
+            this.mode = { kind: 'idle' };
+            return;
+          }
+        }
         if (dbl) {
           useStore.setState({ panel: 'chart' });
           this.mode = { kind: 'idle' };
@@ -603,13 +616,23 @@ export class GridController {
     if (st.selectedChart !== null) {
       if (e.key === 'Delete' || e.key === 'Backspace') {
         e.preventDefault();
-        clearMarks(st.selectedChart);
+        forgetChart(st.selectedChart);
         book.apply({ type: 'delete_chart', id: st.selectedChart }, { note: 'chart deleted' });
         useStore.setState({ selectedChart: null });
         return;
       }
       if (e.key === 'Escape') {
         useStore.setState({ selectedChart: null });
+        this.renderer.markDirty();
+        return;
+      }
+      const chart = st.charts.find((c) => c.id === st.selectedChart);
+      if (chart?.analytic && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+        // drill down into the one selected bar, or back up a level
+        e.preventDefault();
+        const own = ownSelection(chart);
+        if (e.key === 'ArrowUp') drillUp(chart);
+        else if (own && own.keys.length === 1) drillDown(chart, own.keys[0], own.labels[0]);
         this.renderer.markDirty();
         return;
       }

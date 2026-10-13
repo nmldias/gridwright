@@ -46,7 +46,8 @@ Background: the 13 Oct 2026 assessment (roadmap Phase 7) and the cited behaviour
 | Additivity | `sum` and `count` are additive. `average` is Σ/n of the group's values. `ratio` is Σ numerator / Σ denominator over rows with both (never an average of row ratios). `count_distinct`, `min` and `max` are not additive either. Each measure says `additive`. |
 | Reconciliation | For each additive measure, the sum of the groups is compared with the total of the included rows at 15 digits: `ok`, `differs`, or `not_assessable` when a group has no number (mixed currency). |
 | Excluded population | Rows left out by a selection or by the table's filters are aggregated with the same measures (`excluded.values`), with counts by reason. A view can always say what it does not show, e.g. how many reserved vehicles a "available stock" view leaves out, their value and their average age. |
-| Blank rows | Rows with nothing in any field the query reads (the trailing empty rows of a table) are counted as `population.blank` and otherwise ignored. |
+| Blank rows | Rows with nothing in any cell (the trailing empty rows of a table) are counted as `population.blank` and otherwise ignored. Whether a row is blank never depends on the fields a query reads, so a chart and its drill-through count the same rows. |
+| Drill-through | `Book.analyze_records` takes the same table, measures and selections and returns the rows behind the number (`row`, the requested `fields`) with their `total`, which equals the chart's value. `complement: true` lists the rows the selections leave out instead; its count and totals equal `excluded.by_selection` and `excluded.values`. Rows hidden by the table's filters are listed by neither. |
 | Bounds | At most 10,000 groups per query; at most 5,000 listed records per drill-through (the totals still cover all records; `truncated` says so). |
 
 ## Answer

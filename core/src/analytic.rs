@@ -88,6 +88,9 @@ pub struct RecordsQuery {
     /// Headers of the columns to return for each record (default: every column).
     pub fields: Vec<String>,
     pub limit: Option<usize>,
+    /// The records the selections leave out instead (the excluded population; rows hidden by
+    /// the table's filters are not included either way).
+    pub complement: bool,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -142,11 +145,12 @@ pub struct Excluded {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Population {
-    /// Data rows with something in a field the query reads.
+    /// Data rows with something in at least one cell.
     pub rows: u64,
     pub included: u64,
     pub excluded: u64,
-    /// Data rows with nothing in any field the query reads (trailing empty rows).
+    /// Data rows with nothing in any cell (trailing empty rows). Whether a row is blank never
+    /// depends on which fields a query reads, so a chart and its drill-through count the same rows.
     pub blank: u64,
 }
 
@@ -494,8 +498,8 @@ struct Plan<'a> {
     measures: Vec<Measure>,
     sels: Vec<(u32, HashSet<Key>)>,
     respect_filters: bool,
-    /// every column the query reads: a row with nothing in any of them is blank
-    read: Vec<u32>,
+    /// rows with something in at least one cell (by row index); the others are blank
+    filled: Vec<bool>,
 }
 
 enum RowFate {
@@ -529,33 +533,34 @@ fn plan<'a>(wb: &'a Workbook, q: &Query) -> Result<Plan<'a>, String> {
             None => sels.push((c, keys)),
         }
     }
-    let mut read: Vec<u32> = dims.clone();
-    for m in &measures {
-        read.extend(m.col.iter().chain(m.den.iter()));
-    }
-    read.extend(sels.iter().map(|(c, _)| *c));
     for k in &q.key {
-        read.push(col(k)?);
+        col(k)?;
     }
-    if read.is_empty() {
-        read = (0..t.cols).collect();
+    let mut filled = vec![false; t.rows as usize];
+    for (k, cell) in t.cells.iter() {
+        let blank = match &cell.value {
+            Value::Empty => true,
+            Value::Text(x) => x.trim().is_empty(),
+            _ => false,
+        };
+        if k.row < t.rows && !blank {
+            filled[k.row as usize] = true;
+        }
     }
-    read.sort_unstable();
-    read.dedup();
     Ok(Plan {
         t,
         dims,
         measures,
         sels,
         respect_filters: q.respect_table_filters.unwrap_or(true),
-        read,
+        filled,
     })
 }
 
 impl Plan<'_> {
     fn fate(&self, r: u32) -> RowFate {
         let t = self.t;
-        if self.read.iter().all(|c| key_of(&t.value_at(CellKey::new(r, *c))) == Key::Empty) {
+        if !self.filled.get(r as usize).copied().unwrap_or(false) {
             return RowFate::Blank;
         }
         if self.respect_filters && t.is_row_hidden(r) {
@@ -875,7 +880,8 @@ pub fn records(wb: &Workbook, rq: &RecordsQuery) -> Result<Records, String> {
     let mut out = vec![];
     let mut count = 0u64;
     for r in t.header_rows..t.rows {
-        if !matches!(p.fate(r), RowFate::Included) {
+        let wanted = if rq.complement { RowFate::BySelection } else { RowFate::Included };
+        if std::mem::discriminant(&p.fate(r)) != std::mem::discriminant(&wanted) {
             continue;
         }
         count += 1;
@@ -1062,6 +1068,32 @@ mod tests {
         assert_eq!(Some(s), r.total[0].value);
         let lim = records(&e.wb, &serde_json::from_str(r#"{"table":"Stock","limit":1}"#).unwrap()).unwrap();
         assert!(lim.truncated && lim.records.len() == 1 && lim.count == 7);
+    }
+
+    #[test]
+    fn a_row_is_blank_only_when_every_cell_is_empty() {
+        // VIN-005 has no landed cost: a query reading only that column must still count the row,
+        // or a chart grouped by branch and its drill-through would count different rows
+        let e = book();
+        let a = analyze(&e.wb, &q(r#"{"table":"Stock","measures":[{"agg":"count"},{"field":"Landed cost"}]}"#)).unwrap();
+        assert_eq!(a.population.rows, 7);
+        assert_eq!(a.population.blank, 1);
+        assert_eq!(a.total[0].value, Some(7.0));
+        let r = records(&e.wb, &serde_json::from_str(r#"{"table":"Stock","measures":[{"agg":"count"}]}"#).unwrap()).unwrap();
+        assert_eq!(r.count, 7);
+    }
+
+    #[test]
+    fn the_excluded_records_can_be_listed() {
+        let e = book();
+        let sel = r#""selections":[{"field":"Branch","values":[{"s":"Luanda"}]}]"#;
+        let inc = records(&e.wb, &serde_json::from_str(&format!(r#"{{"table":"Stock","measures":[{{"field":"Price"}}],{}}}"#, sel)).unwrap()).unwrap();
+        let exc = records(&e.wb, &serde_json::from_str(&format!(r#"{{"table":"Stock","measures":[{{"field":"Price"}}],{},"complement":true}}"#, sel)).unwrap()).unwrap();
+        let a = analyze(&e.wb, &q(&format!(r#"{{"table":"Stock","measures":[{{"field":"Price"}}],{}}}"#, sel))).unwrap();
+        assert_eq!(exc.count, a.excluded.by_selection);
+        assert_eq!(exc.total[0].value, a.excluded.values[0].value);
+        assert_eq!(inc.count + exc.count, a.population.rows);
+        assert!(exc.records.iter().all(|r| !inc.records.iter().any(|i| i.row == r.row)));
     }
 
     #[test]

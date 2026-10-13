@@ -25,7 +25,7 @@ export interface Editing {
   source?: 'cell' | 'bar';
 }
 
-export type Panel = 'none' | 'code' | 'ai' | 'sql' | 'files' | 'share' | 'table' | 'settings' | 'history' | 'format' | 'chart' | 'review' | 'navigate' | 'admin';
+export type Panel = 'none' | 'code' | 'ai' | 'sql' | 'files' | 'share' | 'table' | 'settings' | 'history' | 'format' | 'chart' | 'review' | 'navigate' | 'admin' | 'records';
 
 export interface Presence {
   id: string;
@@ -131,6 +131,10 @@ interface State {
   /** marks selected in analytical charts, per chart: this viewer's interaction state, never an
    * operation (cross-filtering, docs/analytical-model.md) */
   markSelections: Record<number, MarkSelection>;
+  /** drill-down path of analytical charts with a dimension hierarchy, per chart (also per viewer) */
+  drillPaths: Record<number, { keys: KeyValue[]; labels: string[] }>;
+  /** the chart whose records the Records panel shows (drill-through) */
+  recordsChart: number | null;
   /** precedents/dependents overlay of a cell (Review panel) */
   trace: TraceState | null;
   /** sharing level of the open document */
@@ -201,6 +205,8 @@ export const useStore = create<State>((set) => ({
   charts: [],
   selectedChart: null,
   markSelections: {},
+  drillPaths: {},
+  recordsChart: null,
   trace: null,
   permission: 'own',
   fileFolder: '',
