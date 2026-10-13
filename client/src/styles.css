@@ -170,6 +170,17 @@ code {
 .logo.big {
   font-size: 48px;
 }
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  white-space: nowrap;
+}
+.brand-version {
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
 
 .app {
   height: 100%;
@@ -1016,6 +1027,20 @@ table.diff .arrow {
   }
   .topbar .filename {
     max-width: 96px;
+  }
+  /* the version sits under the logo so the bar keeps its width */
+  .brand {
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+    line-height: 1;
+  }
+  .brand-version {
+    font-size: 8.5px;
+    letter-spacing: -0.03em;
+  }
+  .brand-v {
+    display: none;
   }
   .topbar button {
     padding-left: 10px;
