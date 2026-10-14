@@ -384,6 +384,9 @@ function opRect(op: Op): { table: number; r0: number; c0: number; r1: number; c1
     case 'set_name':
     case 'restore_names':
     case 'restore_charts':
+    case 'set_metric':
+    case 'rename_metric':
+    case 'restore_metrics':
       return { table: -1, r0: -1, c0: -1, r1: -1, c1: -1 }; // workbook-level: never overlaps cells
     default:
       return null;

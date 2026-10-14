@@ -43,7 +43,7 @@ function visibleDoc(id: string, who: Identity, need: 'view' | 'edit' = 'view') {
 
 const ActionSchema = z
   .object({
-    action: z.enum(['set_cells', 'set_cell', 'code_cell', 'add_table', 'resize_table', 'rename_table', 'clear_range', 'set_format', 'add_chart']),
+    action: z.enum(['set_cells', 'set_cell', 'code_cell', 'add_table', 'resize_table', 'rename_table', 'clear_range', 'set_format', 'add_chart', 'define_metric']),
     table: z.string().optional().describe('table name (default: the first table)'),
     ref: z.string().optional().describe('A1 reference of the top-left cell, or a range for set_format / clear_range'),
     values: z.array(z.array(z.union([z.string(), z.number(), z.boolean(), z.null()]))).optional().describe('2-D block of literals or "=formulas"'),
@@ -52,10 +52,19 @@ const ActionSchema = z
     code: z.string().optional(),
     runtime: z.enum(['server', 'browser']).optional().describe('code_cell (python): where it runs; default = the server when it has a Python runtime'),
     gpu: z.boolean().optional().describe('code_cell (python, server): ask for cuDF GPU acceleration'),
-    name: z.string().optional().describe('add_table / rename_table: table name'),
+    name: z.string().optional().describe('add_table / rename_table: table name; define_metric: metric name'),
     rows: z.number().int().optional(),
     cols: z.number().int().optional(),
-    format: z.record(z.unknown()).optional().describe('set_format: {bold, italic, align, number_format, fill, color, wrap}'),
+    format: z.union([z.record(z.unknown()), z.string()]).optional().describe('set_format: {bold, italic, align, number_format, fill, color, wrap}; define_metric: a number-format pattern such as "#,##0.00"'),
+    agg: z.string().optional().describe('define_metric: sum | count | count_distinct | average | min | max | ratio'),
+    field: z.string().optional().describe('define_metric: header of the column aggregated'),
+    numerator: z.string().optional().describe('define_metric (ratio): numerator column header'),
+    denominator: z.string().optional().describe('define_metric (ratio): denominator column header'),
+    currency_column: z.string().optional().describe("define_metric: header of a column holding each row's currency code"),
+    currency: z.string().optional().describe('define_metric: reporting currency (three-letter code); never converted'),
+    description: z.string().optional().describe('define_metric: what the metric means'),
+    dims: z.array(z.string()).optional().describe('add_chart bound to a table: dimension headers, outermost first'),
+    metrics: z.array(z.string()).optional().describe('add_chart bound to a table: governed metric names (refer to a metric by name; never restate it)'),
     kind: z.string().optional().describe('add_chart: bar | hbar | line | area | stacked | waterfall'),
     title: z.string().optional(),
     subtitle: z.string().optional(),
@@ -90,14 +99,14 @@ export function buildServer(who: Identity): McpServer {
 
   server.registerTool(
     'read_document',
-    { title: 'Read a document', description: 'Tables (name, size, header rows, sign-offs), workbook names, charts and the CHECK() results of a document.', inputSchema: { id: z.string() } },
+    { title: 'Read a document', description: 'Tables (name, size, header rows, sign-offs), workbook names, governed metrics, charts (with their table bindings) and the CHECK() results of a document.', inputSchema: { id: z.string() } },
     async ({ id }) => {
       try {
         visibleDoc(id, who);
         const { book, name } = openDocument(id);
         try {
           const tables = tableMetas(book).map((t) => ({ id: t.id, name: t.name, rows: t.rows, cols: t.cols, header_rows: t.header_rows, signoffs: (t.signoffs ?? []).map((s) => ({ range: `${a1(s.r0, s.c0)}:${a1(s.r1, s.c1)}`, by: s.by, at: s.at, note: s.note, locked: s.locked })) }));
-          return text({ id, name, seq: currentSeq(id), tables, names: JSON.parse(book.names()), charts: (JSON.parse(book.charts()) as { id: number; kind: string; title: string; categories: string; series: unknown[] }[]).map((c) => ({ id: c.id, kind: c.kind, title: c.title, categories: c.categories, series: c.series })), checks: JSON.parse(book.checks()) });
+          return text({ id, name, seq: currentSeq(id), tables, names: JSON.parse(book.names()), metrics: JSON.parse(book.metrics()), charts: (JSON.parse(book.charts()) as { id: number; kind: string; title: string; categories: string; series: unknown[]; analytic?: unknown }[]).map((c) => ({ id: c.id, kind: c.kind, title: c.title, categories: c.categories, series: c.series, ...(c.analytic ? { analytic: c.analytic } : {}) })), checks: JSON.parse(book.checks()) });
         } finally {
           book.free();
         }
@@ -277,7 +286,7 @@ export function buildServer(who: Identity): McpServer {
   );
   server.registerTool(
     'propose_watch',
-    { title: 'Propose a watch', description: 'Propose a watch: a Gridwright formula evaluated against the live document with a threshold (kind threshold, op, value), a check that must stay TRUE (kind check), or a change detector (kind change); sustain = consecutive comparable observations before it is reported; sources + freshnessHours = tables that must be fresh. Proposed watches wait for approval; thresholds are the person\'s to set.', inputSchema: { id: z.string(), ...WatchDefSchema.omit({ client: true }).extend({ purpose: z.string().min(1).max(200), formula: z.string().min(1).max(2000) }).shape } },
+    { title: 'Propose a watch', description: 'Propose a watch: a Gridwright formula (or a governed metric of the document by name: metric instead of formula) evaluated against the live document with a threshold (kind threshold, op, value), a check that must stay TRUE (kind check), or a change detector (kind change); sustain = consecutive comparable observations before it is reported; sources + freshnessHours = tables that must be fresh. Proposed watches wait for approval; thresholds are the person\'s to set.', inputSchema: { id: z.string(), ...WatchDefSchema.omit({ client: true }).extend({ purpose: z.string().min(1).max(200) }).shape } },
     async ({ id, ...def }) => {
       try {
         visibleDoc(id, who);

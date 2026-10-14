@@ -8,6 +8,7 @@ import { cellAt, getState, loadDecompPrefs, useStore, type Decomp } from '../sta
 import { currentField, keyId, recordSelections } from './crossfilter';
 import { formatNumber } from './format';
 import { analyticFromTable, tableHeaders } from '../ui/review';
+import { resolveSpec } from './metrics';
 
 const lower = (s: string) => s.trim().toLowerCase();
 
@@ -123,7 +124,8 @@ function numericColumns(table: string): Set<string> {
   return out;
 }
 
-function measureFields(m: MeasureSpec): string[] {
+function measureFields(spec: MeasureSpec): string[] {
+  const m = resolveSpec(spec).spec;
   return [m.field, m.numerator, m.denominator].filter((f): f is string => !!f);
 }
 

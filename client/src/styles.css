@@ -3316,3 +3316,30 @@ a.button:hover {
 .decomp-records p {
   margin: 0;
 }
+
+/* governed metrics (7.5) */
+.metric-list li {
+  align-items: flex-start;
+}
+.metric-problem,
+.metric-error {
+  color: var(--danger);
+  margin: 2px 0 0;
+}
+.metric-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+.metric-form textarea {
+  width: 100%;
+  resize: vertical;
+}
+.metric-new {
+  white-space: nowrap;
+}
+.metric-def {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}

@@ -4,8 +4,14 @@
 // With a system prompt that carries "companion investigation" (the DeepAgents stack) it plays
 // the investigation: read_context → run_python → remember (a proposed hypothesis) → findings.
 // Non-streaming requests (stream: false, what LangChain's ChatOpenAI sends) get a JSON body.
+// A user message mentioning "revenue metric" gets a governed metric (7.5): define_metric "Gross sales"
+// on the table Sales, and an analytical chart that refers to it by name.
+// The port is MOCK_LLM_PORT (default 8899), so a self-starting suite can run its own.
 import { createServer } from 'node:http';
 const reply = `Here is a summary table.\n\n\`\`\`gridwright-actions\n[{"action":"add_table","name":"AI summary","values":[["Metric","Value"],["Total units","=SUM('Table 1'::B2:B5)"],["Note","from mock"]]},{"action":"set_cell","table":"Table 1","ref":"F8","input":"=1+1"}]\n\`\`\`\nDone.`;
+
+const metricReply = `I defined the metric once and charted it by name.\n\n\`\`\`gridwright-actions\n[{"action":"define_metric","name":"Gross sales","table":"Sales","agg":"sum","field":"Amount","currency":"EUR","format":"#,##0.00","description":"Invoiced amount before returns"},{"action":"add_chart","kind":"bar","title":"Gross sales by region","dims":["Region"],"metrics":["Gross sales"]}]\n\`\`\`\nDone.`;
+const PORT = Number(process.env.MOCK_LLM_PORT || 8899);
 
 function streamText(res, text, extra = {}) {
   res.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -122,7 +128,11 @@ createServer((req, res) => {
       streamText(res, `The orders table holds ${n} rows (checked with run_sql).`);
       return;
     }
+    if (/revenue metric/i.test(String(lastUser?.content ?? ''))) {
+      streamText(res, metricReply);
+      return;
+    }
     if (parsed.stream === false) return jsonReply(res, parsed.model, { text: 'Mock answer.' });
     streamText(res, reply);
   });
-}).listen(8899, () => console.log('mock llm on 8899'));
+}).listen(PORT, () => console.log(`mock llm on ${PORT}`));

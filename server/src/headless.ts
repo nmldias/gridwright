@@ -24,6 +24,10 @@ interface BookApi {
   table_id(name: string): number;
   names(): string;
   charts(): string;
+  /** governed metric definitions (7.5): JSON [{name, table, measure, currency?, format?, description?}] */
+  metrics(): string;
+  /** read-only analytical query (JSON `analytic::Query`), `{"error":..}` on a bad one */
+  analyze(queryJson: string): string;
   checks(): string;
   signoff_status(table: number): string;
   resolve_values(table: number, reference: string): string;

@@ -9,6 +9,7 @@ import { AdminPanel } from './ui/AdminPanel';
 import { ChartPanel } from './ui/ChartPanel';
 import { RecordsPanel } from './ui/RecordsPanel';
 import { DecompositionPanel } from './ui/DecompositionPanel';
+import { MetricsPanel } from './ui/MetricsPanel';
 import { CodePanel } from './ui/CodePanel';
 import { ReviewPanel } from './ui/ReviewPanel';
 import { FilesPanel } from './ui/FilesPanel';
@@ -187,6 +188,7 @@ export function App() {
             {panel === 'chart' && <ChartPanel />}
             {panel === 'records' && <RecordsPanel />}
             {panel === 'decompose' && <DecompositionPanel />}
+            {panel === 'metrics' && <MetricsPanel />}
             {panel === 'review' && <ReviewPanel />}
             {panel === 'settings' && <SettingsPanel />}
             {panel === 'admin' && <AdminPanel />}

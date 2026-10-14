@@ -223,6 +223,21 @@ pub enum Op {
     SetDecimalComma {
         on: bool,
     },
+    /// Define, replace (same name ignoring case) or remove (metric = None) a governed metric (7.5).
+    SetMetric {
+        name: String,
+        #[serde(default)]
+        metric: Option<Metric>,
+    },
+    /// Rename a metric; analytical charts referring to it follow.
+    RenameMetric {
+        name: String,
+        to: String,
+    },
+    /// Undo/redo relayed from another client: restore the metric list.
+    RestoreMetrics {
+        metrics: Vec<Metric>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -411,6 +426,9 @@ pub struct Changes {
     /// The workbook's decimal-comma setting, when it changed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decimal_comma: Option<bool>,
+    /// Governed metrics after the op (sent when they changed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<Vec<Metric>>,
     /// Undo/redo: the restore ops that reproduce this change on another client.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ops: Vec<Op>,
@@ -450,6 +468,39 @@ enum Inverse {
     Charts(Vec<Chart>),
     /// Restore the decimal-comma setting.
     DecimalComma(bool),
+    /// Restore the metric list.
+    Metrics(Vec<Metric>),
+    /// Several of the above, restored in order (an op that changed more than one kind of state,
+    /// e.g. a table rename that rewrote names, chart bindings and metrics).
+    Many(Vec<Inverse>),
+}
+
+impl Inverse {
+    /// Restoring this changes no formula input, so the tracked recalculation state stays valid.
+    fn incremental(&self) -> bool {
+        match self {
+            Inverse::Cells(_) | Inverse::Charts(_) | Inverse::Metrics(_) => true,
+            Inverse::Many(parts) => parts.iter().all(|p| p.incremental()),
+            _ => false,
+        }
+    }
+    /// Holds a snapshot of cells or of the whole of `table`.
+    fn holds_table(&self, table: TableId) -> bool {
+        match self {
+            Inverse::Cells(cells) => cells.iter().any(|(r, _)| r.table == table),
+            Inverse::Tables(tables) => tables.iter().any(|(id, _)| *id == table),
+            Inverse::Many(parts) => parts.iter().any(|p| p.holds_table(table)),
+            _ => false,
+        }
+    }
+    /// One inverse from several parts (none: no inverse needed beyond the first).
+    fn many(mut parts: Vec<Inverse>) -> Inverse {
+        if parts.len() == 1 {
+            parts.remove(0)
+        } else {
+            Inverse::Many(parts)
+        }
+    }
 }
 
 pub struct Engine {
@@ -782,6 +833,7 @@ impl Engine {
                 }
                 // whole-table snapshots of that table are stale now
                 Inverse::Tables(tables) => !tables.iter().any(|(id, _)| *id == table),
+                Inverse::Many(_) => !inv.holds_table(table),
                 _ => true,
             });
         }
@@ -789,11 +841,7 @@ impl Engine {
 
     fn forget_table_undo(&mut self, table: TableId) {
         for stack in [&mut self.undo, &mut self.redo] {
-            stack.retain(|inv| match inv {
-                Inverse::Cells(cells) => !cells.iter().any(|(r, _)| r.table == table),
-                Inverse::Tables(tables) => !tables.iter().any(|(id, _)| *id == table),
-                _ => true,
-            });
+            stack.retain(|inv| !inv.holds_table(table));
         }
     }
 
@@ -857,6 +905,9 @@ impl Engine {
                 | Op::MoveTable { .. }
                 | Op::SetColWidth { .. }
                 | Op::SetRowHeight { .. }
+                | Op::SetMetric { .. }
+                | Op::RenameMetric { .. }
+                | Op::RestoreMetrics { .. }
         );
         let result = self.apply_inner(op, ch);
         if !incremental {
@@ -1122,23 +1173,37 @@ impl Engine {
                         s.range = formula::rename_table(&s.range, &old, &name);
                     }
                     if let Some(an) = c.analytic.as_mut() {
-                        if an.table.trim().eq_ignore_ascii_case(old.trim()) {
+                        if an.table.trim().to_lowercase() == old.trim().to_lowercase() {
                             an.table = name.clone();
                         }
                     }
                 }
-                if charts_before != self.wb.charts {
-                    ch.charts = Some(self.wb.charts.clone());
+                let metrics_before = self.wb.metrics.clone();
+                for m in self.wb.metrics.iter_mut() {
+                    if m.table.trim().to_lowercase() == old.trim().to_lowercase() {
+                        m.table = name.clone();
+                    }
                 }
                 ch.push_table(&self.wb, table);
                 for (id, _) in &inv {
                     ch.reload.push(*id);
                 }
                 self.recalc_all_into(ch);
+                // undo puts back everything the rename rewrote, not only the tables
+                let mut parts = vec![Inverse::Tables(inv)];
                 if names_before != self.wb.names {
                     ch.names = Some(self.wb.names.clone());
+                    parts.push(Inverse::Names(names_before));
                 }
-                Ok(Some(Inverse::Tables(inv)))
+                if charts_before != self.wb.charts {
+                    ch.charts = Some(self.wb.charts.clone());
+                    parts.push(Inverse::Charts(charts_before));
+                }
+                if metrics_before != self.wb.metrics {
+                    ch.metrics = Some(self.wb.metrics.clone());
+                    parts.push(Inverse::Metrics(metrics_before));
+                }
+                Ok(Some(Inverse::many(parts)))
             }
             Op::SetColWidth { table, col, width } => {
                 let t = self.wb.table_mut(table).ok_or("no such table")?;
@@ -1216,16 +1281,14 @@ impl Engine {
                 shift_rules(t, is_rows, at, count as i64);
                 t.normalise_geometry();
                 let charts_before = self.wb.charts.clone();
+                let names_before = self.wb.names.clone();
                 self.rewrite_formulas(table, &name, is_rows, at, count as i64);
-                if charts_before != self.wb.charts {
-                    ch.charts = Some(self.wb.charts.clone());
-                }
                 ch.push_table(&self.wb, table);
                 ch.reload.push(table);
                 self.recalc_all_into(ch);
                 let mut inv = vec![(table, Some(snapshot))];
                 inv.extend(others);
-                Ok(Some(Inverse::Tables(inv)))
+                Ok(Some(self.with_rewrites(Inverse::Tables(inv), names_before, charts_before, ch)))
             }
             Op::DeleteRows { table, at, count } | Op::DeleteCols { table, at, count } if count > 0 => {
                 let is_rows = matches!(op_kind(&op), 'r');
@@ -1287,16 +1350,14 @@ impl Engine {
                 shift_rules(t, is_rows, at, -(count as i64));
                 t.normalise_geometry();
                 let charts_before = self.wb.charts.clone();
+                let names_before = self.wb.names.clone();
                 self.rewrite_formulas(table, &name, is_rows, at, -(count as i64));
-                if charts_before != self.wb.charts {
-                    ch.charts = Some(self.wb.charts.clone());
-                }
                 ch.push_table(&self.wb, table);
                 ch.reload.push(table);
                 self.recalc_all_into(ch);
                 let mut inv = vec![(table, Some(snapshot))];
                 inv.extend(others);
-                Ok(Some(Inverse::Tables(inv)))
+                Ok(Some(self.with_rewrites(Inverse::Tables(inv), names_before, charts_before, ch)))
             }
             Op::InsertRows { .. } | Op::InsertCols { .. } | Op::DeleteRows { .. } | Op::DeleteCols { .. } => Ok(None),
             Op::AddTable {
@@ -1478,6 +1539,71 @@ impl Engine {
                     self.recalc_all_into(ch);
                 }
                 Ok(Some(Inverse::DecimalComma(prev)))
+            }
+            Op::SetMetric { name, metric } => {
+                let key = name.trim().to_lowercase();
+                let prev = self.wb.metrics.clone();
+                match metric {
+                    None => {
+                        let pos = self
+                            .wb
+                            .metrics
+                            .iter()
+                            .position(|m| m.name.trim().to_lowercase() == key)
+                            .ok_or_else(|| format!("no metric named \"{}\"", name.trim()))?;
+                        self.wb.metrics.remove(pos);
+                    }
+                    Some(mut m) => {
+                        if m.name.trim().is_empty() {
+                            m.name = name.clone();
+                        }
+                        let m = crate::metrics::canonical(&self.wb, m)?;
+                        if m.name.to_lowercase() != key {
+                            return Err("use rename_metric to change a metric's name".into());
+                        }
+                        match self.wb.metrics.iter().position(|x| x.name.trim().to_lowercase() == key) {
+                            Some(pos) => self.wb.metrics[pos] = m,
+                            None => {
+                                if self.wb.metrics.len() >= crate::metrics::MAX_METRICS {
+                                    return Err(format!("at most {} metrics per workbook", crate::metrics::MAX_METRICS));
+                                }
+                                self.wb.metrics.push(m);
+                            }
+                        }
+                        self.wb.metrics.sort_by_key(|m| m.name.to_lowercase());
+                    }
+                }
+                ch.metrics = Some(self.wb.metrics.clone());
+                Ok(Some(Inverse::Metrics(prev)))
+            }
+            Op::RenameMetric { name, to } => {
+                let from = self.wb.metric_by_name(&name).ok_or_else(|| format!("no metric named \"{}\"", name.trim()))?.name.clone();
+                let to = crate::metrics::check_name(&to)?;
+                if let Some(other) = self.wb.metric_by_name(&to) {
+                    if other.name.to_lowercase() != from.to_lowercase() {
+                        return Err(format!("a metric named \"{}\" already exists", other.name));
+                    }
+                }
+                let prev_metrics = self.wb.metrics.clone();
+                let prev_charts = self.wb.charts.clone();
+                let lower = from.to_lowercase();
+                for m in self.wb.metrics.iter_mut() {
+                    if m.name.to_lowercase() == lower {
+                        m.name = to.clone();
+                    }
+                }
+                self.wb.metrics.sort_by_key(|m| m.name.to_lowercase());
+                ch.metrics = Some(self.wb.metrics.clone());
+                let mut parts = vec![Inverse::Metrics(prev_metrics)];
+                if crate::metrics::rename_references(&mut self.wb.charts, &from, &to) {
+                    ch.charts = Some(self.wb.charts.clone());
+                    parts.push(Inverse::Charts(prev_charts));
+                }
+                Ok(Some(Inverse::many(parts)))
+            }
+            Op::RestoreMetrics { metrics } => {
+                let (inv, _) = self.restore_metrics(metrics, ch);
+                Ok(Some(inv))
             }
             Op::AddSignoff {
                 table,
@@ -1882,31 +2008,57 @@ impl Engine {
 
     fn restore(&mut self, inv: Inverse) -> (Inverse, Changes) {
         let mut ch = Changes::default();
-        // restoring cells updates the tracked state for them (`recalc_from`); anything else rebuilds it
-        let incremental = matches!(inv, Inverse::Cells(_) | Inverse::Charts(_));
+        // restoring cells updates the tracked state for them (`recalc_from`); anything that may
+        // change formulas rebuilds it
+        let incremental = inv.incremental();
+        let counter = self.restore_into(inv, &mut ch);
+        if !incremental {
+            self.resync();
+        }
+        #[cfg(test)]
+        self.check_tracked();
+        (counter, ch)
+    }
+
+    /// Restore one inverse (a `Many` part by part), pushing the relay op of each part.
+    fn restore_into(&mut self, inv: Inverse, ch: &mut Changes) -> Inverse {
         let (counter, op) = match inv {
-            Inverse::Cells(cells) => self.restore_cells(cells, &mut ch),
-            Inverse::Tables(tables) => self.restore_tables(tables, &mut ch),
-            Inverse::Names(names) => self.restore_names(names, &mut ch),
-            Inverse::Charts(charts) => self.restore_charts(charts, &mut ch),
+            Inverse::Cells(cells) => self.restore_cells(cells, ch),
+            Inverse::Tables(tables) => self.restore_tables(tables, ch),
+            Inverse::Names(names) => self.restore_names(names, ch),
+            Inverse::Charts(charts) => self.restore_charts(charts, ch),
+            Inverse::Metrics(metrics) => self.restore_metrics(metrics, ch),
             Inverse::DecimalComma(on) => {
                 let counter = Inverse::DecimalComma(self.wb.decimal_comma);
                 let changed = self.wb.decimal_comma != on;
                 self.wb.decimal_comma = on;
                 ch.decimal_comma = Some(on);
                 if changed {
-                    self.recalc_all_into(&mut ch);
+                    self.recalc_all_into(ch);
                 }
                 (counter, Op::SetDecimalComma { on })
             }
+            Inverse::Many(parts) => {
+                let counters = parts.into_iter().map(|p| self.restore_into(p, ch)).collect();
+                return Inverse::Many(counters);
+            }
         };
-        if !incremental {
-            self.resync();
-        }
-        #[cfg(test)]
-        self.check_tracked();
         ch.ops.push(op);
-        (counter, ch)
+        counter
+    }
+
+    /// The inverse of an op that rewrote names and chart references besides `inv`.
+    fn with_rewrites(&self, inv: Inverse, names_before: Vec<NamedRange>, charts_before: Vec<Chart>, ch: &mut Changes) -> Inverse {
+        let mut parts = vec![inv];
+        if names_before != self.wb.names {
+            ch.names = Some(self.wb.names.clone());
+            parts.push(Inverse::Names(names_before));
+        }
+        if charts_before != self.wb.charts {
+            ch.charts = Some(self.wb.charts.clone());
+            parts.push(Inverse::Charts(charts_before));
+        }
+        Inverse::many(parts)
     }
 
     fn restore_cells(&mut self, cells: Vec<(CellRef, Option<Cell>)>, ch: &mut Changes) -> (Inverse, Op) {
@@ -2010,6 +2162,13 @@ impl Engine {
         }
         ch.charts = Some(self.wb.charts.clone());
         (Inverse::Charts(counter), op)
+    }
+
+    fn restore_metrics(&mut self, metrics: Vec<Metric>, ch: &mut Changes) -> (Inverse, Op) {
+        let op = Op::RestoreMetrics { metrics: metrics.clone() };
+        let counter = std::mem::replace(&mut self.wb.metrics, metrics);
+        ch.metrics = Some(self.wb.metrics.clone());
+        (Inverse::Metrics(counter), op)
     }
 
     // ------------------------------------------------------------------
@@ -3652,5 +3811,43 @@ mod tests {
         let e = Engine::new(serde_json::from_str(&json).unwrap());
         assert_eq!(val(&e, 1, 0, 1), Value::Number(14.0));
         assert_eq!(val(&e, 1, 0, 0), Value::Number(14.0), "INDIRECT is fresh in a loaded workbook");
+    }
+    /// Roadmap follow-up found in 7.2: undoing an insert/delete or a table rename restored the
+    /// tables but not the chart ranges and names the op had rewritten.
+    #[test]
+    fn undo_restores_the_chart_ranges_and_names_a_structural_op_rewrote() {
+        let mut e = engine();
+        e.apply(Op::AddChart {
+            chart: Chart {
+                categories: "Data::A2:A5".into(),
+                series: vec![ChartSeries {
+                    name: "v".into(),
+                    range: "Data::B2:B5".into(),
+                    color: None,
+                }],
+                ..Default::default()
+            },
+        });
+        e.apply(Op::SetName {
+            name: "Units".into(),
+            reference: Some("Data::B2:B5".into()),
+        });
+        let ch = e.apply(Op::InsertRows { table: 1, at: 0, count: 2 });
+        assert!(ch.names.is_some() && ch.charts.is_some());
+        assert_eq!((e.wb.charts[0].categories.as_str(), e.wb.names[0].reference.as_str()), ("Data::A4:A7", "Data::B4:B7"));
+        let ch = e.undo();
+        assert_eq!((e.wb.charts[0].categories.as_str(), e.wb.names[0].reference.as_str()), ("Data::A2:A5", "Data::B2:B5"));
+        assert!(ch.ops.iter().any(|o| matches!(o, Op::RestoreCharts { .. })));
+        assert!(ch.ops.iter().any(|o| matches!(o, Op::RestoreNames { .. })));
+        e.redo();
+        assert_eq!(e.wb.charts[0].categories, "Data::A4:A7");
+        e.apply(Op::RenameTable { table: 1, name: "Facts".into() });
+        assert_eq!(e.wb.charts[0].series[0].range, "Facts::B4:B7");
+        e.undo();
+        assert_eq!(e.wb.table(1).unwrap().name, "Data");
+        assert_eq!((e.wb.charts[0].series[0].range.as_str(), e.wb.names[0].reference.as_str()), ("Data::B4:B7", "Data::B4:B7"));
+        e.apply(Op::DeleteRows { table: 1, at: 0, count: 2 });
+        e.undo();
+        assert_eq!(e.wb.charts[0].categories, "Data::A4:A7");
     }
 }

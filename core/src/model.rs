@@ -733,6 +733,31 @@ pub struct ChartAnalytic {
     pub sort: String,
 }
 
+/// A governed metric (13 Oct assessment, 7.5): one definition of a measure, saved with the
+/// workbook and changed only by operations, that charts, decompositions, drill-through, the
+/// assistant and companion watches refer to by name (`MeasureSpec.metric`). See
+/// `crate::metrics` for the rules.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Metric {
+    /// Unique in the workbook, ignoring case.
+    pub name: String,
+    /// The table the measure reads (follows a table rename).
+    pub table: String,
+    /// field / agg / numerator / denominator / currency column; never itself a reference, and
+    /// stored without a label (the metric's name is the label).
+    pub measure: crate::analytic::MeasureSpec,
+    /// Reporting currency (ISO code, upper case): labels the value, and with a currency column
+    /// every contributing row must be in it. Never converted.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub currency: String,
+    /// Number-format pattern for display (`#,##0.00`, `0%`, `currency:EUR`), canonical.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub format: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct NamedRange {
@@ -1023,6 +1048,9 @@ pub struct Workbook {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub charts: Vec<Chart>,
     pub next_chart_id: u32,
+    /// Governed metric definitions, sorted by name ignoring case (7.5).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub metrics: Vec<Metric>,
     /// Serial date-time (days since 1899-12-30) injected by the host for NOW()/TODAY().
     #[serde(skip)]
     pub now_serial: f64,
@@ -1043,6 +1071,7 @@ impl Workbook {
             names: vec![],
             charts: vec![],
             next_chart_id: 1,
+            metrics: vec![],
             now_serial: 45000.0,
             decimal_comma: false,
         }
@@ -1060,6 +1089,12 @@ impl Workbook {
     pub fn named_range(&self, name: &str) -> Option<&NamedRange> {
         let needle = name.trim().to_lowercase();
         self.names.iter().find(|n| n.name.trim().to_lowercase() == needle)
+    }
+
+    /// A metric by name (trimmed, ignoring case).
+    pub fn metric_by_name(&self, name: &str) -> Option<&Metric> {
+        let needle = name.trim().to_lowercase();
+        self.metrics.iter().find(|m| m.name.trim().to_lowercase() == needle)
     }
 
     pub fn table(&self, id: TableId) -> Option<&Table> {

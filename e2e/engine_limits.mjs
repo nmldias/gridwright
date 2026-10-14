@@ -274,7 +274,50 @@ const CASES = [
     const ok = decompose(b, { table: 'Dt', measure: { agg: 'count' }, splits: [{ path: [], field: 'C1' }] });
     return { refused: refused.filter((r) => typeof r.error === 'string').length, total: ok.root?.value.value, check: ok.root?.split?.check.status };
   }, (v) => v.refused === 3 && v.total === 50 && v.check === 'ok', ''],
+  // governed metrics (7.5): definitions are bounded in number and size, and resolving references is linear
+  ['metrics: the 501st metric is refused', (b) => {
+    metricTable(b, 10);
+    const t0 = Date.now();
+    for (let i = 0; i < 500; i++) {
+      const e = defineMetric(b, { name: `M${i}x`, table: 'Mt', measure: { agg: 'count' } }).error;
+      if (e) return { error: `metric ${i}: ${e}` };
+    }
+    const out = defineMetric(b, { name: 'One more', table: 'Mt', measure: { agg: 'count' } });
+    return { error: out.error, count: JSON.parse(b.metrics()).length, ms: Date.now() - t0 };
+  }, (v) => v.error === 'at most 500 metrics per workbook' && v.count === 500 && v.ms < 5000, ''],
+  ['metrics: a 65-character name is refused', (b) => {
+    metricTable(b, 10);
+    return defineMetric(b, { name: 'M'.repeat(65), table: 'Mt', measure: { field: 'Amount' } });
+  }, (v) => v.error === 'a metric name has at most 64 characters', ''],
+  ['metrics: a 2,001-character description is refused', (b) => {
+    metricTable(b, 10);
+    return defineMetric(b, { name: 'Long', table: 'Mt', measure: { field: 'Amount' }, description: 'x'.repeat(2001) });
+  }, (v) => v.error === 'a metric description has at most 2000 characters', ''],
+  ['metrics: a 65-character format is refused', (b) => {
+    metricTable(b, 10);
+    return defineMetric(b, { name: 'Fmt', table: 'Mt', measure: { field: 'Amount' }, format: '0'.repeat(65) });
+  }, (v) => v.error === 'a metric format has at most 64 characters', ''],
+  ['metrics: a metric defined as another metric is refused (no chains to follow)', (b) => {
+    metricTable(b, 10);
+    defineMetric(b, { name: 'Base', table: 'Mt', measure: { field: 'Amount' } });
+    return defineMetric(b, { name: 'Chained', table: 'Mt', measure: { metric: 'Base' } });
+  }, (v) => v.error === 'a metric cannot refer to another metric', ''],
+  ['metrics: 200 references to one metric on 10,000 rows', (b) => {
+    metricTable(b, 10000);
+    defineMetric(b, { name: 'Total', table: 'Mt', measure: { field: 'Amount' } });
+    const t0 = Date.now();
+    const a = JSON.parse(b.analyze(JSON.stringify({ dims: ['Group'], measures: Array.from({ length: 200 }, () => ({ metric: 'Total' })) })));
+    return { error: a.error, n: a.measures?.length, total: a.total?.[199]?.value, ms: Date.now() - t0 };
+  }, (v) => !v.error && v.n === 200 && v.total === 50005000 && v.ms < 5000, ''],
 ];
+
+/** Table "Mt": `rows` data rows, Group (10 values) and Amount (1..rows). */
+function metricTable(b, rows) {
+  const values = [['Group', 'Amount']];
+  for (let r = 1; r <= rows; r++) values.push([`g${r % 10}`, String(r)]);
+  b.apply(JSON.stringify({ type: 'add_table', name: 'Mt', x: 0, y: 0, rows: rows + 1, cols: 2, values }));
+}
+const defineMetric = (b, metric) => JSON.parse(b.apply(JSON.stringify({ type: 'set_metric', name: metric.name, metric })));
 
 /** A table `name` of `rows` data rows and `cols` text columns C1..Cn; column c has c+1 values. */
 function decompTable(b, name, rows, cols) {

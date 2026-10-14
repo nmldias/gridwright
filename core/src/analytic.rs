@@ -52,6 +52,10 @@ pub struct MeasureSpec {
     /// Header of a column holding each row's currency code: amounts in different
     /// currencies are never added together.
     pub currency: String,
+    /// A reference to a governed metric by name (7.5): the workbook's definition is used and
+    /// the fields above stay empty (`name` may still relabel it). See `crate::metrics`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub metric: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -96,7 +100,7 @@ pub struct RecordsQuery {
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct MeasureValue {
     pub value: Option<f64>,
-    /// ok | incomplete | no_data | mixed_currency | div0
+    /// ok | incomplete | no_data | mixed_currency | currency_mismatch | div0
     pub status: &'static str,
     /// Values used.
     pub n: u64,
@@ -128,11 +132,21 @@ pub struct Group {
     pub values: Vec<MeasureValue>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct MeasureInfo {
     pub name: String,
     pub agg: String,
     pub additive: bool,
+    /// Set when the measure is a governed metric: its name as defined, and the definition's
+    /// display format, reporting currency and description, so every view shows one definition.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub metric: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub format: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub currency: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub description: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -165,7 +179,8 @@ pub struct Reconciliation {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Issue {
-    /// duplicate_key | blank_key | missing_values | invalid_values | mixed_currency | currency_missing
+    /// duplicate_key | blank_key | missing_values | invalid_values | mixed_currency | currency_mismatch |
+    /// currency_missing
     pub kind: &'static str,
     pub text: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -311,6 +326,9 @@ pub(crate) struct Measure {
     pub(crate) col: Option<u32>,
     pub(crate) den: Option<u32>,
     pub(crate) currency: Option<u32>,
+    /// A metric's reporting currency: labels the value; with a currency column, rows in any other
+    /// code (or none) give `currency_mismatch` instead of a number.
+    pub(crate) fixed_currency: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -414,9 +432,27 @@ impl Measure {
                 return out;
             }
             let code = acc.by_currency.keys().next().cloned().unwrap_or_default();
+            if let Some(fixed) = &self.fixed_currency {
+                if code != *fixed {
+                    out.status = "currency_mismatch";
+                    out.by_currency = acc
+                        .by_currency
+                        .iter()
+                        .map(|(k, (s, n))| CurrencyAmount {
+                            currency: k.clone(),
+                            value: s.get(),
+                            n: *n,
+                        })
+                        .collect();
+                    return out;
+                }
+            }
             if !code.is_empty() {
                 out.currency = Some(code);
             }
+        }
+        if out.currency.is_none() {
+            out.currency = self.fixed_currency.clone();
         }
         let counted = matches!(self.agg, Agg::Count | Agg::CountDistinct);
         out.value = match self.agg {
@@ -501,11 +537,13 @@ pub(crate) fn resolve_measures(t: &Table, specs: &[MeasureSpec]) -> Result<Vec<M
                 name,
                 agg: agg_name.into(),
                 additive: matches!(agg, Agg::Sum | Agg::Count),
+                ..Default::default()
             },
             agg,
             col: c,
             den,
             currency,
+            fixed_currency: None,
         });
     }
     Ok(out)
@@ -540,11 +578,15 @@ pub(crate) enum RowFate {
     ByFilter,
 }
 
+/// A table by name, or by id written as a number.
+pub(crate) fn find_table<'a>(wb: &'a Workbook, name: &str) -> Option<&'a Table> {
+    wb.table_by_name(name).or_else(|| name.trim().parse::<u32>().ok().and_then(|id| wb.table(id)))
+}
+
 pub(crate) fn plan<'a>(wb: &'a Workbook, q: &Query) -> Result<Plan<'a>, String> {
-    let t = wb
-        .table_by_name(&q.table)
-        .or_else(|| q.table.trim().parse::<u32>().ok().and_then(|id| wb.table(id)))
-        .ok_or_else(|| format!("no table named \"{}\"", q.table))?;
+    // metric references become their workbook definitions first (one definition everywhere)
+    let resolved = crate::metrics::resolve(wb, &q.table, &q.measures)?;
+    let t = find_table(wb, &resolved.table).ok_or_else(|| format!("no table named \"{}\"", resolved.table))?;
     if t.header_rows == 0 {
         return Err(format!("table \"{}\" has no header row to name its fields", t.name));
     }
@@ -553,7 +595,25 @@ pub(crate) fn plan<'a>(wb: &'a Workbook, q: &Query) -> Result<Plan<'a>, String> 
             .ok_or_else(|| format!("\"{}\" is not a header of table \"{}\"", name, t.name))
     };
     let dims = q.dims.iter().map(|d| col(d)).collect::<Result<Vec<_>, _>>()?;
-    let measures = resolve_measures(t, &q.measures)?;
+    let mut measures = Vec::with_capacity(resolved.specs.len());
+    for (spec, metric) in resolved.specs.iter().zip(resolved.metrics.iter()) {
+        let mut m = resolve_measures(t, std::slice::from_ref(spec))
+            .map_err(|e| match metric {
+                Some(mt) => format!("metric \"{}\": {}", mt.name, e),
+                None => e,
+            })?
+            .remove(0);
+        if let Some(mt) = metric {
+            m.info.metric = mt.name.clone();
+            m.info.format = mt.format.clone();
+            m.info.currency = mt.currency.clone();
+            m.info.description = mt.description.clone();
+            if !mt.currency.is_empty() {
+                m.fixed_currency = Some(mt.currency.clone());
+            }
+        }
+        measures.push(m);
+    }
     let mut sels: Vec<(u32, HashSet<Key>)> = vec![];
     for s in &q.selections {
         let c = col(&s.field)?;
@@ -815,6 +875,23 @@ pub(crate) fn measure_issues(p: &Plan, totals: &[MeasureValue]) -> Vec<Issue> {
                 text: format!("{}: amounts in {} are not added together; convert them to one currency first", m.info.name, list.join(", ")),
                 rows: vec![],
                 count: mv.by_currency.len() as u64,
+            });
+        } else if mv.status == "currency_mismatch" {
+            let list: Vec<String> = mv
+                .by_currency
+                .iter()
+                .map(|c| if c.currency.is_empty() { "(no currency)".to_string() } else { c.currency.clone() })
+                .collect();
+            issues.push(Issue {
+                kind: "currency_mismatch",
+                text: format!(
+                    "{}: the metric reports in {} but these amounts are in {}; they are not converted or added",
+                    m.info.name,
+                    m.fixed_currency.as_deref().unwrap_or(""),
+                    list.join(", ")
+                ),
+                rows: vec![],
+                count: mv.n,
             });
         } else if m.currency.is_some() && mv.n > 0 && mv.currency.is_none() {
             issues.push(Issue {

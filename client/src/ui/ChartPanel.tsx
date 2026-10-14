@@ -7,8 +7,9 @@ import { getState, useStore } from '../state/store';
 import { analyticFromTable, chartFromSelection, insertAnalyticChart, insertChart, tableHeaders, updateChart } from './review';
 import { forgetChart } from '../grid/crossfilter';
 import { openDecomposition } from '../grid/decomp';
+import { draftFromMeasure, metricByName, metricRef, metricsOn, metricText, openMetrics } from '../grid/metrics';
 
-const AGGS: { value: string; label: string }[] = [
+export const AGGS: { value: string; label: string }[] = [
   { value: 'sum', label: 'Sum' },
   { value: 'count', label: 'Count rows' },
   { value: 'count_distinct', label: 'Count distinct' },
@@ -19,8 +20,10 @@ const AGGS: { value: string; label: string }[] = [
 ];
 
 /** The fields an analytical chart reads: table, dimension, measures (docs/analytical-model.md). */
-function AnalyticFields({ an, commit }: { an: ChartAnalytic; commit: (an: ChartAnalytic, note: string) => void }) {
+function AnalyticFields({ an, chartId, commit }: { an: ChartAnalytic; chartId: number; commit: (an: ChartAnalytic, note: string) => void }) {
   const tables = useStore((s) => s.tables);
+  const allMetrics = useStore((s) => s.metrics);
+  const metrics = metricsOn(an.table, allMetrics);
   useStore((s) => s.cellsVersion);
   const tableId = [...tables.values()].find((t) => t.name.toLowerCase() === an.table.toLowerCase())?.id ?? null;
   const heads = tableId === null ? [] : tableHeaders(tableId).filter(Boolean);
@@ -62,6 +65,38 @@ function AnalyticFields({ an, commit }: { an: ChartAnalytic; commit: (an: ChartA
       )}
       {an.measures.map((m, i) => (
         <div key={i} className="row series-row wrap">
+          {/* governed metrics first (7.5): a reference holds only the name, so one definition is used everywhere */}
+          <select
+            aria-label="Metric"
+            value={m.metric ? (metricByName(m.metric, allMetrics)?.name ?? m.metric) : ''}
+            onChange={(e) => {
+              const v = e.target.value;
+              if (v) commit({ ...an, measures: an.measures.map((x, j) => (j === i ? metricRef(v) : x)) }, `chart measure: metric ${v}`);
+              else {
+                const def = metricByName(m.metric, allMetrics);
+                commit({ ...an, measures: an.measures.map((x, j) => (j === i ? (def ? { ...def.measure } : { agg: 'sum' }) : x)) }, 'chart measure: custom');
+              }
+            }}
+          >
+            <option value="">Custom…</option>
+            {m.metric && !metricByName(m.metric, allMetrics) && <option value={m.metric}>{m.metric} (not defined)</option>}
+            {metrics.map((x) => (
+              <option key={x.name} value={x.name}>
+                Metric: {x.name}
+              </option>
+            ))}
+          </select>
+          {m.metric ? (
+            <>
+              <span className="grow small muted metric-def">{metricByName(m.metric, allMetrics) ? metricText(metricByName(m.metric, allMetrics)!) : `no metric named "${m.metric}"`}</span>
+              {metricByName(m.metric, allMetrics) && (
+                <button title="Change the definition: every chart, tree and watch using it follows" onClick={() => openMetrics({ metric: metricByName(m.metric, allMetrics)!, isNew: false })}>
+                  Edit metric
+                </button>
+              )}
+            </>
+          ) : (
+            <>
           <select aria-label="Aggregation" value={m.agg} onChange={(e) => setMeasure(i, { agg: e.target.value })}>
             {AGGS.map((a) => (
               <option key={a.value} value={a.value}>
@@ -78,6 +113,11 @@ function AnalyticFields({ an, commit }: { an: ChartAnalytic; commit: (an: ChartA
             fieldSelect(m.field, (v) => setMeasure(i, { field: v }), m.agg === 'count' ? 'Non-blank in' : 'Field', m.agg === 'count')
           )}
           {m.agg !== 'count' && m.agg !== 'count_distinct' && fieldSelect(m.currency, (v) => setMeasure(i, { currency: v }), 'Currency column', true)}
+          <button title="Define this measure once for the workbook, then refer to it by name" onClick={() => openMetrics({ metric: draftFromMeasure(an.table, m), isNew: true, fromChart: chartId, measureIndex: i })}>
+            Save as metric…
+          </button>
+            </>
+          )}
           {an.measures.length > 1 && (
             <button title="Remove measure" onClick={() => commit({ ...an, measures: an.measures.filter((_, j) => j !== i) }, 'chart measure removed')}>
               ×
@@ -220,7 +260,7 @@ export function ChartPanel() {
       <h4>Data</h4>
       {draft.analytic ? (
         <>
-          <AnalyticFields an={draft.analytic} commit={(an, note) => { forgetChart(draft.id); commit({ analytic: an }, note); }} />
+          <AnalyticFields an={draft.analytic} chartId={draft.id} commit={(an, note) => { forgetChart(draft.id); commit({ analytic: an }, note); }} />
           <div className="row wrap">
             <button onClick={() => useStore.setState({ recordsChart: draft.id, panel: 'records' })}>See records</button>
             <button title="Break the first measure down level by level, a field per node (read-only)" onClick={() => openDecomposition(draft.id)}>
