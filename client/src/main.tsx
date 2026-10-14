@@ -15,6 +15,7 @@ import * as book from './engine/book';
 import * as review from './ui/review';
 import * as charts from './grid/charts';
 import * as crossfilter from './grid/crossfilter';
+import * as decomp from './grid/decomp';
 import { printDocumentHtml } from './ui/print';
 import { applyTemplate } from './ui/templates';
 import { transformOp } from './api/ws';
@@ -71,6 +72,10 @@ applyThemeCss();
   },
   /** open the Records panel (drill-through) for an analytical chart (tests) */
   openRecords: (id: number) => useStore.setState({ recordsChart: id, panel: 'records' }),
+  /** the decomposition tree (roadmap 7.4): open it on a chart id, a table name or a tree state; the last tree shown */
+  decomp,
+  openDecomposition: decomp.openDecomposition,
+  decompTree: decomp.decompTree,
   viewport: () => {
     const r = getRenderer();
     return r ? { x: r.pan.x, y: r.pan.y, zoom: r.zoom } : { x: 0, y: 0, zoom: 1 };

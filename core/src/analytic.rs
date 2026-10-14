@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// chart axis; the engine's limits hold for new code).
 pub const MAX_GROUPS: usize = 10_000;
 /// Rows listed per issue and per drill-through answer unless the query asks for fewer.
-const ISSUE_ROWS: usize = 10;
+pub(crate) const ISSUE_ROWS: usize = 10;
 const MAX_ISSUES: usize = 50;
 pub const MAX_RECORDS: usize = 5_000;
 
@@ -211,7 +211,7 @@ pub struct Records {
 /// compare them equal and they have the same type (numbers at 15 significant digits,
 /// text ignoring case). NaN never occurs in stored values; it gets its own key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum Key {
+pub(crate) enum Key {
     Empty,
     Number(String),
     Text(String),
@@ -219,7 +219,7 @@ enum Key {
     Error(String),
 }
 
-fn key_of(v: &Value) -> Key {
+pub(crate) fn key_of(v: &Value) -> Key {
     match v {
         Value::Empty => Key::Empty,
         Value::Number(x) => Key::Number(number_key(*x)),
@@ -239,13 +239,13 @@ fn key_of(v: &Value) -> Key {
 // accumulation
 
 #[derive(Clone, Copy, Default)]
-struct Sum {
-    s: f64,
-    c: f64,
+pub(crate) struct Sum {
+    pub(crate) s: f64,
+    pub(crate) c: f64,
 }
 impl Sum {
     /// Neumaier's compensated sum: long columns of amounts do not drift.
-    fn add(&mut self, x: f64) {
+    pub(crate) fn add(&mut self, x: f64) {
         let t = self.s + x;
         if self.s.abs() >= x.abs() {
             self.c += (self.s - t) + x;
@@ -254,36 +254,67 @@ impl Sum {
         }
         self.s = t;
     }
-    fn get(&self) -> f64 {
+    pub(crate) fn get(&self) -> f64 {
         self.s + self.c
     }
 }
 
 #[derive(Clone, Default)]
-struct Acc {
-    sum: Sum,
-    den: Sum,
-    n: u64,
-    rows: u64,
-    missing: u64,
-    invalid: u64,
-    min: Option<f64>,
-    max: Option<f64>,
-    distinct: HashSet<Key>,
-    by_currency: BTreeMap<String, (Sum, u64)>,
+pub(crate) struct Acc {
+    pub(crate) sum: Sum,
+    pub(crate) den: Sum,
+    pub(crate) n: u64,
+    pub(crate) rows: u64,
+    pub(crate) missing: u64,
+    pub(crate) invalid: u64,
+    pub(crate) min: Option<f64>,
+    pub(crate) max: Option<f64>,
+    pub(crate) distinct: HashSet<Key>,
+    pub(crate) by_currency: BTreeMap<String, (Sum, u64)>,
+}
+
+impl Acc {
+    /// Combine two accumulations as if their rows had been added to one (a decomposition
+    /// tree's "Other" node): sums keep their compensation, counts add, extremes and distinct
+    /// values combine. A ratio or an average is then computed from the combined parts.
+    pub(crate) fn merge(&mut self, o: &Acc) {
+        self.sum.add(o.sum.s);
+        self.sum.add(o.sum.c);
+        self.den.add(o.den.s);
+        self.den.add(o.den.c);
+        self.n += o.n;
+        self.rows += o.rows;
+        self.missing += o.missing;
+        self.invalid += o.invalid;
+        self.min = match (self.min, o.min) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.max = match (self.max, o.max) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        self.distinct.extend(o.distinct.iter().cloned());
+        for (code, (s, n)) in &o.by_currency {
+            let e = self.by_currency.entry(code.clone()).or_default();
+            e.0.add(s.s);
+            e.0.add(s.c);
+            e.1 += n;
+        }
+    }
 }
 
 #[derive(Clone)]
-struct Measure {
-    info: MeasureInfo,
-    agg: Agg,
-    col: Option<u32>,
-    den: Option<u32>,
-    currency: Option<u32>,
+pub(crate) struct Measure {
+    pub(crate) info: MeasureInfo,
+    pub(crate) agg: Agg,
+    pub(crate) col: Option<u32>,
+    pub(crate) den: Option<u32>,
+    pub(crate) currency: Option<u32>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Agg {
+pub(crate) enum Agg {
     Sum,
     Count,
     CountDistinct,
@@ -303,7 +334,7 @@ fn number_of(v: &Value) -> Result<Option<f64>, ()> {
 }
 
 impl Measure {
-    fn add(&self, acc: &mut Acc, t: &Table, r: u32) {
+    pub(crate) fn add(&self, acc: &mut Acc, t: &Table, r: u32) {
         acc.rows += 1;
         let at = |c: u32| t.value_at(CellKey::new(r, c));
         match self.agg {
@@ -358,7 +389,7 @@ impl Measure {
         }
     }
 
-    fn result(&self, acc: &Acc) -> MeasureValue {
+    pub(crate) fn result(&self, acc: &Acc) -> MeasureValue {
         let mut out = MeasureValue {
             value: None,
             status: "ok",
@@ -414,7 +445,7 @@ impl Measure {
     }
 }
 
-fn resolve_measures(t: &Table, specs: &[MeasureSpec]) -> Result<Vec<Measure>, String> {
+pub(crate) fn resolve_measures(t: &Table, specs: &[MeasureSpec]) -> Result<Vec<Measure>, String> {
     let col = |name: &str, what: &str| -> Result<u32, String> {
         t.column_by_header(name)
             .ok_or_else(|| format!("{} \"{}\" is not a header of table \"{}\"", what, name, t.name))
@@ -481,7 +512,7 @@ fn resolve_measures(t: &Table, specs: &[MeasureSpec]) -> Result<Vec<Measure>, St
 }
 
 /// A dimension value as a label: dates and formatted numbers as their cells show them.
-fn label_of(t: &Table, r: u32, c: u32, v: &Value) -> String {
+pub(crate) fn label_of(t: &Table, r: u32, c: u32, v: &Value) -> String {
     if let Value::Number(_) = v {
         if let Some(fmt) = t.get(CellKey::new(r, c)).and_then(|cell| cell.format.number_format.clone()) {
             if !fmt.starts_with("currency:") {
@@ -492,24 +523,24 @@ fn label_of(t: &Table, r: u32, c: u32, v: &Value) -> String {
     v.to_display()
 }
 
-struct Plan<'a> {
-    t: &'a Table,
-    dims: Vec<u32>,
-    measures: Vec<Measure>,
-    sels: Vec<(u32, HashSet<Key>)>,
-    respect_filters: bool,
+pub(crate) struct Plan<'a> {
+    pub(crate) t: &'a Table,
+    pub(crate) dims: Vec<u32>,
+    pub(crate) measures: Vec<Measure>,
+    pub(crate) sels: Vec<(u32, HashSet<Key>)>,
+    pub(crate) respect_filters: bool,
     /// rows with something in at least one cell (by row index); the others are blank
-    filled: Vec<bool>,
+    pub(crate) filled: Vec<bool>,
 }
 
-enum RowFate {
+pub(crate) enum RowFate {
     Blank,
     Included,
     BySelection,
     ByFilter,
 }
 
-fn plan<'a>(wb: &'a Workbook, q: &Query) -> Result<Plan<'a>, String> {
+pub(crate) fn plan<'a>(wb: &'a Workbook, q: &Query) -> Result<Plan<'a>, String> {
     let t = wb
         .table_by_name(&q.table)
         .or_else(|| q.table.trim().parse::<u32>().ok().and_then(|id| wb.table(id)))
@@ -558,7 +589,7 @@ fn plan<'a>(wb: &'a Workbook, q: &Query) -> Result<Plan<'a>, String> {
 }
 
 impl Plan<'_> {
-    fn fate(&self, r: u32) -> RowFate {
+    pub(crate) fn fate(&self, r: u32) -> RowFate {
         let t = self.t;
         if !self.filled.get(r as usize).copied().unwrap_or(false) {
             return RowFate::Blank;
@@ -573,15 +604,15 @@ impl Plan<'_> {
         }
         RowFate::Included
     }
-    fn fresh(&self) -> Vec<Acc> {
+    pub(crate) fn fresh(&self) -> Vec<Acc> {
         vec![Acc::default(); self.measures.len()]
     }
-    fn add(&self, accs: &mut [Acc], r: u32) {
+    pub(crate) fn add(&self, accs: &mut [Acc], r: u32) {
         for (m, a) in self.measures.iter().zip(accs.iter_mut()) {
             m.add(a, self.t, r);
         }
     }
-    fn results(&self, accs: &[Acc]) -> Vec<MeasureValue> {
+    pub(crate) fn results(&self, accs: &[Acc]) -> Vec<MeasureValue> {
         self.measures.iter().zip(accs.iter()).map(|(m, a)| m.result(a)).collect()
     }
 }
@@ -727,6 +758,34 @@ pub fn analyze(wb: &Workbook, q: &Query) -> Result<Answer, String> {
     }
 
     let mut issues = identity_issues(&p, q)?;
+    issues.extend(measure_issues(&p, &totals));
+
+    Ok(Answer {
+        table: t.name.clone(),
+        dims: p.dims.iter().map(|c| t.header_text(*c)).collect(),
+        measures: p.measures.iter().map(|m| m.info.clone()).collect(),
+        groups: out_groups,
+        total: totals,
+        excluded: Excluded {
+            rows: by_sel + by_filter,
+            by_selection: by_sel,
+            by_table_filter: by_filter,
+            values: p.results(&excl),
+        },
+        population: Population {
+            rows: n_rows,
+            included: n_rows - by_sel - by_filter,
+            excluded: by_sel + by_filter,
+            blank,
+        },
+        reconciliation,
+        issues,
+    })
+}
+
+/// Missing, invalid and currency issues of the measures' totals over the included rows.
+pub(crate) fn measure_issues(p: &Plan, totals: &[MeasureValue]) -> Vec<Issue> {
+    let mut issues = vec![];
     for (i, m) in p.measures.iter().enumerate() {
         let mv = &totals[i];
         if mv.missing > 0 && !matches!(m.agg, Agg::Count | Agg::CountDistinct) {
@@ -766,33 +825,12 @@ pub fn analyze(wb: &Workbook, q: &Query) -> Result<Answer, String> {
             });
         }
     }
-
-    Ok(Answer {
-        table: t.name.clone(),
-        dims: p.dims.iter().map(|c| t.header_text(*c)).collect(),
-        measures: p.measures.iter().map(|m| m.info.clone()).collect(),
-        groups: out_groups,
-        total: totals,
-        excluded: Excluded {
-            rows: by_sel + by_filter,
-            by_selection: by_sel,
-            by_table_filter: by_filter,
-            values: p.results(&excl),
-        },
-        population: Population {
-            rows: n_rows,
-            included: n_rows - by_sel - by_filter,
-            excluded: by_sel + by_filter,
-            blank,
-        },
-        reconciliation,
-        issues,
-    })
+    issues
 }
 
 /// Duplicate and blank identifiers over every non-blank data row (not only the
 /// selected ones: a duplicate VIN is a data problem whatever the view).
-fn identity_issues(p: &Plan, q: &Query) -> Result<Vec<Issue>, String> {
+pub(crate) fn identity_issues(p: &Plan, q: &Query) -> Result<Vec<Issue>, String> {
     let t = p.t;
     if q.key.is_empty() {
         return Ok(vec![]);
@@ -905,13 +943,13 @@ pub fn records(wb: &Workbook, rq: &RecordsQuery) -> Result<Records, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::engine::{Engine, Op};
 
     /// A small inventory: VIN-003 is duplicated, VIN-005 has no landed cost, one row is in
     /// EUR, one value is text.
-    fn book() -> Engine {
+    pub(crate) fn book() -> Engine {
         let mut e = Engine::new(Workbook::new("t"));
         let rows: Vec<Vec<&str>> = vec![
             vec!["VIN", "Branch", "Brand", "Currency", "Landed cost", "Price", "Reserved"],

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Overlay } from '../ui/overlay';
 import * as book from '../engine/book';
-import { getState, useStore } from '../state/store';
+import { getState, setStatus, useStore } from '../state/store';
 import { autoFitColumns, clearSelection, copySelection, deleteSelectedTable, makeCodeCell, pasteFromClipboard, selectionToTsv, sortTableByColumn } from './actions';
 import { colToLetters, refText } from '../engine/types';
 import type { Hit } from './geometry';
@@ -9,6 +9,7 @@ import { exportTableXlsx } from '../ui/xlsx';
 import { openLineage } from '../ui/studio/Lineage';
 import { insertChart, traceActiveCell } from '../ui/review';
 import { openPrintView } from '../ui/print';
+import { openDecomposition } from './decomp';
 
 interface MenuState {
   x: number;
@@ -119,6 +120,10 @@ export function ContextMenu({ host }: { host: HTMLElement | null }) {
           {item('Cell history', () => useStore.setState({ panel: 'history', historyCell: { table: sel.table, row: sel.ar, col: sel.ac } }), !getState().fileId)}
           {sep}
           {item('Insert chart from selection', () => insertChart())}
+          {item('Break down a measure…', () => {
+            const meta = getState().tables.get(sel.table);
+            if (!meta || !openDecomposition(meta.name)) setStatus('Break down needs a header row, a text column to split by and a numeric column', 5000);
+          })}
           {item(rows > 1 || cols > 1 ? 'Merge cells' : 'Unmerge cells', () => {
             const meta = getState().tables.get(sel.table);
             const hasMerge = meta?.merges?.some((m) => m.r0 <= sel.r1 && sel.r0 <= m.r1 && m.c0 <= sel.c1 && sel.c0 <= m.c1);

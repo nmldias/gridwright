@@ -3130,3 +3130,189 @@ a.button:hover {
 .records-table tbody tr:hover {
   background: var(--accent-soft);
 }
+/* Decomposition tree (7.4): an outline that wraps instead of scrolling sideways (phones, 320px) */
+.decomp-panel {
+  overflow-x: hidden;
+}
+.decomp-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: flex-end;
+}
+.decomp-controls label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  min-width: 0;
+}
+.decomp-controls label.check {
+  flex-direction: row;
+  align-items: center;
+}
+.decomp-controls select {
+  max-width: 100%;
+}
+.decomp-controls input[type='number'] {
+  width: 4.5em;
+}
+.decomp-scope {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.decomp-panel .warning {
+  color: var(--amber);
+  background: var(--amber-soft);
+  border-radius: 6px;
+  padding: 4px 8px;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.decomp-panel .ok {
+  color: var(--green);
+}
+.decomp-panel .error {
+  color: var(--danger);
+}
+.decomp-tree,
+.decomp-tree ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+.decomp-tree {
+  outline: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px;
+}
+.decomp-tree:focus-visible {
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+.decomp-node {
+  min-width: 0;
+}
+.decomp-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+  padding-block: 3px;
+  border-radius: 4px;
+  cursor: default;
+  min-width: 0;
+}
+.decomp-row.selected {
+  background: var(--accent-soft);
+}
+.decomp-caret {
+  width: 18px;
+  flex: 0 0 18px;
+  padding: 0;
+  border: 0;
+  background: none;
+}
+.decomp-label {
+  font-weight: 500;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.decomp-label.em {
+  font-style: italic;
+}
+.decomp-value {
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.decomp-track {
+  flex: 1 1 60px;
+  min-width: 40px;
+  max-width: 100%;
+  height: 6px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.decomp-bar {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+.decomp-bar.other {
+  background: var(--amber);
+}
+.decomp-bar.blank {
+  background: var(--muted);
+}
+.decomp-parts {
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.decomp-badge {
+  border-radius: 4px;
+  padding: 0 4px;
+  background: var(--amber-soft);
+  color: var(--amber);
+  overflow-wrap: anywhere;
+}
+.decomp-badge.pinned {
+  background: var(--accent-soft);
+  color: inherit;
+}
+.decomp-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-left: auto;
+  min-width: 0;
+}
+.decomp-actions select {
+  max-width: 11em;
+  padding: 2px 4px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+}
+.decomp-level {
+  margin: 2px 0;
+  padding: 2px 6px;
+  border-left: 3px solid var(--border);
+  overflow-wrap: anywhere;
+}
+.decomp-level[data-check='ok'] {
+  border-left-color: var(--green);
+}
+.decomp-level[data-check='differs'] {
+  border-left-color: var(--danger);
+  color: var(--danger);
+}
+.decomp-level[data-check='not_assessable'],
+.decomp-level[data-check='recomputed'] {
+  border-left-color: var(--amber);
+}
+.decomp-suggest {
+  margin: 4px 0;
+  padding: 6px 8px;
+  border: 1px dashed var(--accent);
+  border-radius: 6px;
+  background: var(--accent-soft);
+  overflow-wrap: anywhere;
+}
+.decomp-suggest p {
+  margin: 4px 0;
+}
+.decomp-why {
+  margin: 4px 0 0 16px;
+  padding: 0;
+}
+.decomp-records {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.decomp-records p {
+  margin: 0;
+}
