@@ -6,6 +6,7 @@ import { chartData, chartPng, chartSvg, downloadBlob } from '../grid/charts';
 import { getState, useStore } from '../state/store';
 import { analyticFromTable, chartFromSelection, insertAnalyticChart, insertChart, tableHeaders, updateChart } from './review';
 import { forgetChart } from '../grid/crossfilter';
+import { openDecomposition } from '../grid/decomp';
 
 const AGGS: { value: string; label: string }[] = [
   { value: 'sum', label: 'Sum' },
@@ -222,6 +223,9 @@ export function ChartPanel() {
           <AnalyticFields an={draft.analytic} commit={(an, note) => { forgetChart(draft.id); commit({ analytic: an }, note); }} />
           <div className="row wrap">
             <button onClick={() => useStore.setState({ recordsChart: draft.id, panel: 'records' })}>See records</button>
+            <button title="Break the first measure down level by level, a field per node (read-only)" onClick={() => openDecomposition(draft.id)}>
+              Break down
+            </button>
             <button onClick={() => { forgetChart(draft.id); commit({ analytic: null }, 'chart reads ranges'); }}>Use ranges instead</button>
           </div>
         </>

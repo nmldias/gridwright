@@ -1,6 +1,6 @@
 import type { Proposal, ServerPython } from '../api/client';
 import { create } from 'zustand';
-import type { CellRef, CellView, Chart, KeyValue, NamedRange, TableId, TableMeta, Trace } from '../engine/types';
+import type { AnalyticSelection, CellRef, CellView, Chart, DecompSplitSpec, DecompStep, KeyValue, MeasureSpec, NamedRange, TableId, TableMeta, Trace } from '../engine/types';
 
 export interface Selection {
   table: TableId;
@@ -25,7 +25,56 @@ export interface Editing {
   source?: 'cell' | 'bar';
 }
 
-export type Panel = 'none' | 'code' | 'ai' | 'sql' | 'files' | 'share' | 'table' | 'settings' | 'history' | 'format' | 'chart' | 'review' | 'navigate' | 'admin' | 'records';
+export type Panel = 'none' | 'code' | 'ai' | 'sql' | 'files' | 'share' | 'table' | 'settings' | 'history' | 'format' | 'chart' | 'review' | 'navigate' | 'admin' | 'records' | 'decompose';
+
+/** A decomposition tree as this viewer has built it (roadmap 7.4): never an operation. */
+export interface Decomp {
+  table: string;
+  measure: MeasureSpec;
+  /** the measures to choose from (the chart's) */
+  measures: MeasureSpec[];
+  /** the chart it was opened from: its filters (other charts' selections, drill path) apply live */
+  fromChart: number | null;
+  /** the starting filter when not opened from a chart */
+  base: AnalyticSelection[];
+  topN: number;
+  splits: DecompSplitSpec[];
+  suggest: boolean;
+  rule: 'high_value' | 'relative';
+  /** the selected node's id, and its path (what a suggestion is asked for) */
+  selected: string | null;
+  selectedPath: DecompStep[] | null;
+  /** node ids whose split is folded away in the outline */
+  collapsed: string[];
+  /** the node whose records are listed */
+  records: string | null;
+}
+
+/** Per-viewer preferences of the decomposition tree, remembered in this browser. */
+export interface DecompPrefs {
+  topN: number;
+  suggest: boolean;
+  rule: 'high_value' | 'relative';
+}
+export function loadDecompPrefs(): DecompPrefs {
+  const out: DecompPrefs = { topN: 10, suggest: true, rule: 'high_value' };
+  try {
+    const v = JSON.parse(localStorage.getItem('gridwright.decomp') ?? '{}');
+    if (Number.isInteger(v.topN) && v.topN >= 1 && v.topN <= 50) out.topN = v.topN;
+    if (typeof v.suggest === 'boolean') out.suggest = v.suggest;
+    if (v.rule === 'relative' || v.rule === 'high_value') out.rule = v.rule;
+  } catch {
+    /* ignore */
+  }
+  return out;
+}
+export function saveDecompPrefs(p: DecompPrefs) {
+  try {
+    localStorage.setItem('gridwright.decomp', JSON.stringify(p));
+  } catch {
+    /* ignore */
+  }
+}
 
 export interface Presence {
   id: string;
@@ -135,6 +184,8 @@ interface State {
   drillPaths: Record<number, { keys: KeyValue[]; labels: string[] }>;
   /** the chart whose records the Records panel shows (drill-through) */
   recordsChart: number | null;
+  /** the decomposition tree this viewer is building (roadmap 7.4), per viewer, never an operation */
+  decomp: Decomp | null;
   /** precedents/dependents overlay of a cell (Review panel) */
   trace: TraceState | null;
   /** sharing level of the open document */
@@ -207,6 +258,7 @@ export const useStore = create<State>((set) => ({
   markSelections: {},
   drillPaths: {},
   recordsChart: null,
+  decomp: null,
   trace: null,
   permission: 'own',
   fileFolder: '',

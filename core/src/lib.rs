@@ -4,6 +4,7 @@
 //! wasm-bindgen as the `Book` class; all payloads cross the boundary as JSON.
 
 pub mod analytic;
+pub mod decompose;
 pub mod depindex;
 pub mod engine;
 pub mod formula;
@@ -264,6 +265,19 @@ impl Book {
         match serde_json::from_str::<analytic::RecordsQuery>(query_json) {
             Ok(q) => match analytic::records(&self.engine.wb, &q) {
                 Ok(a) => js(&a),
+                Err(e) => js(&serde_json::json!({ "error": e })),
+            },
+            Err(e) => js(&serde_json::json!({ "error": format!("bad query: {}", e) })),
+        }
+    }
+
+    /// Decomposition tree (JSON `decompose::DecompQuery`): one measure broken down by a dimension chosen
+    /// per node; siblings by value, top N + "Other (k)" + "(blank)", each split reconciled; optional
+    /// deterministic suggested split. Reads only; `{"error":..}` on a bad query.
+    pub fn decompose(&self, query_json: &str) -> String {
+        match serde_json::from_str::<decompose::DecompQuery>(query_json) {
+            Ok(q) => match decompose::decompose(&self.engine.wb, &q) {
+                Ok(t) => js(&t),
                 Err(e) => js(&serde_json::json!({ "error": e })),
             },
             Err(e) => js(&serde_json::json!({ "error": format!("bad query: {}", e) })),

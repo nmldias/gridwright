@@ -155,6 +155,7 @@ export function TopBar() {
     { label: 'Table', title: 'Table inspector: name, size, header row, pivot', onClick: () => toggle('table'), active: panel === 'table' },
     { label: 'Rules', title: 'Conditional formatting, validation, names', onClick: () => toggle('format'), active: panel === 'format' },
     { label: 'Chart', title: 'Charts as exhibits: title, series, highlight, benchmark, export', onClick: () => toggle('chart'), active: panel === 'chart' },
+    { label: 'Decomposition', title: 'Break a measure down level by level, a field per node (read-only)', onClick: () => toggle('decompose'), active: panel === 'decompose' },
     { label: 'Database', title: 'Database connections and ad-hoc queries', onClick: () => toggle('sql'), active: panel === 'sql' },
     'sep',
     { label: 'History', title: 'Audit trail: every change, by whom, restore versions', onClick: () => toggle('history'), active: panel === 'history' },
@@ -332,7 +333,7 @@ export function TopBar() {
       )}
       {selectedChart !== null && btn('chart', 'Chart', 'The selected chart: title, series, highlight, benchmark, export')}
       {me.auth === 'accounts' && <Menu label={<span className="client-chip">{me.tenant?.name ?? 'No client'}</span>} title={`Client: ${me.tenant?.name ?? '—'} (your role: ${me.role}) — switch client, members, your account`} className="client-menu" items={clientItems} testId="client" active={panel === 'admin'} />}
-      <Menu label="More" title="Everything else: navigation, tables, rules, charts, database, history, files, print, settings" items={moreItems} testId="more" active={['navigate', 'table', 'format', 'sql', 'history', 'files', 'settings'].includes(panel)} />
+      <Menu label="More" title="Everything else: navigation, tables, rules, charts, database, history, files, print, settings" items={moreItems} testId="more" active={['navigate', 'table', 'format', 'sql', 'history', 'files', 'settings', 'decompose'].includes(panel)} />
     </header>
   );
 }

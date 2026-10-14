@@ -3,7 +3,7 @@
 
 import init, { Book } from './pkg/gridwright_core';
 import wasmUrl from './pkg/gridwright_core_bg.wasm?url';
-import type { AnalyticAnswer, AnalyticQuery, AnalyticRecords, CellRef, CellValue, CellView, Changes, Chart, CheckView, NamedRange, Op, SignoffStatus, TableId, TableMeta, Trace } from './types';
+import type { AnalyticAnswer, AnalyticQuery, AnalyticRecords, DecompQuery, DecompTree, CellRef, CellValue, CellView, Changes, Chart, CheckView, NamedRange, Op, SignoffStatus, TableId, TableMeta, Trace } from './types';
 import { cellKey, isCodeKind } from './types';
 import { cellAt, readOnly, useStore } from '../state/store';
 import { setDecimalCommaDisplay } from '../grid/format';
@@ -382,4 +382,12 @@ export function analyze(q: AnalyticQuery): AnalyticAnswer {
 /** The source records behind a selection, with the measures' totals over all of them. */
 export function analyzeRecords(q: AnalyticQuery & { fields?: string[]; limit?: number; complement?: boolean }): AnalyticRecords {
   return JSON.parse(getBook().analyze_records(JSON.stringify(q)));
+}
+
+/** Decomposition tree (roadmap 7.4; read-only, docs/analytical-model.md): one measure broken down
+ * by a field chosen per node. Throws the engine's reason on a bad query. */
+export function decompose(q: DecompQuery): DecompTree {
+  const t = JSON.parse(getBook().decompose(JSON.stringify(q)));
+  if (t.error) throw new Error(t.error);
+  return t as DecompTree;
 }

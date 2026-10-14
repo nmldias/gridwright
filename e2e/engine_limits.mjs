@@ -201,7 +201,114 @@ const CASES = [
   ['two-digit year 95 is 1995', '=DATEVALUE("15/06/95")', num(34865), 'gave 2095'],
   ['two-digit year 30 is 1930', '=DATEVALUE("15/06/30")', num(11124), 'gave 2030'],
   ['two-digit year 29 is 2029', '=DATEVALUE("15/06/29")', num(47284), ''],
+  // decomposition tree (7.4): every request size is bounded before any work, and each split or
+  // suggestion is charged to a row budget (core/src/decompose.rs)
+  ['decomposition: top_n of 1E9 is refused', (b) => {
+    decompTable(b, 'Dt', 50, 3);
+    return decompose(b, { table: 'Dt', measure: { agg: 'count' }, top_n: 1e9, splits: [{ path: [], field: 'C1' }] });
+  }, (v) => v.error === 'top_n must be between 1 and 50', ''],
+  ['decomposition: a 13-step path is refused', (b) => {
+    decompTable(b, 'Dt', 50, 3);
+    const step = { field: 'C1', key: { s: 'v0' } };
+    return decompose(b, { table: 'Dt', measure: { agg: 'count' }, splits: [{ path: Array(13).fill(step), field: 'C2' }] });
+  }, (v) => v.error === 'a breakdown path has at most 12 steps', ''],
+  ['decomposition: 201 splits are refused at once', (b) => {
+    decompTable(b, 'Dt', 50, 3);
+    const splits = Array.from({ length: 201 }, (_, i) => ({ path: [{ field: 'C1', key: { s: `v${i}` } }], field: 'C2' }));
+    const t0 = Date.now();
+    const out = decompose(b, { table: 'Dt', measure: { agg: 'count' }, splits });
+    return { ...out, ms: Date.now() - t0 };
+  }, (v) => v.error === 'at most 200 splits per breakdown' && v.ms < 500, ''],
+  ['decomposition: a split on a 20,000-value column', (b) => {
+    const values = [['Id', 'Amount']];
+    for (let r = 0; r < 20000; r++) values.push([`id-${r}`, String(r % 97)]);
+    b.apply(JSON.stringify({ type: 'add_table', name: 'Wide', x: 0, y: 0, rows: values.length, cols: 2, values }));
+    const t0 = Date.now();
+    const out = decompose(b, { table: 'Wide', measure: { field: 'Amount' }, splits: [{ path: [], field: 'Id' }] });
+    return { ...out, ms: Date.now() - t0 };
+  }, (v) => v.error === 'more than 10000 values under one node: choose a field with fewer values' && v.ms < 5000, ''],
+  ['decomposition: a suggestion over 40 columns × 100,000 rows stops at the first 32', (b) => {
+    bigTable(b, 100000, 2);
+    const t0 = Date.now();
+    const out = decompose(b, {
+      table: 'Big', measure: { agg: 'count' },
+      splits: [{ path: [], field: 'C1' }, { path: [{ field: 'C1', key: { s: 'v0' } }], field: 'C2' }],
+      suggest: { at: [] },
+    });
+    if (out.error) return out;
+    // then the engine still answers a small breakdown (3 values, top 2: the single leftover is named)
+    const small = decompose(b, { table: 'Big', measure: { agg: 'count' }, top_n: 2, splits: [{ path: [], field: 'C2' }] });
+    return { ms: Date.now() - t0, ...suggestionSummary(out), small: small.root?.split?.children.map((c) => c.label).join() };
+  }, (v) => v.rows === 100000 && v.field === 'C1' && v.beyond === 8 && v.budget === 0 && v.ranked === 32 && v.small === 'v0,v1,v2' && v.ms < 10000,
+  'unbounded: every column × every row'],
+  ['decomposition: a suggestion past the 5,000,000-row budget skips the rest, not an error', (b) => {
+    bigTable(b, 160000, 1);
+    const t0 = Date.now();
+    const out = decompose(b, { table: 'Big', measure: { agg: 'count' }, splits: [{ path: [], field: 'C1' }], suggest: { at: [] } });
+    if (out.error) return out;
+    return { ms: Date.now() - t0, ...suggestionSummary(out) };
+  // columns 33..40 are past the first 32 whether or not the budget ran out first (a column
+  // skipped for the budget still takes one of the 32 places)
+  }, (v) => v.rows === 160000 && typeof v.field === 'string' && v.budget > 0 && v.beyond === 8 && v.ranked + v.others + v.budget + v.beyond === 40 && v.ms < 10000,
+  'columns 33-40 were labelled "work budget" once the budget ran out'],
+  ['decomposition: 200 twelve-step splits on a 10,000-column table', (b) => {
+    // path fields that are not headers, paths that differ only in their last key: comparing
+    // every pair of paths used to scan every column per step (~30 minutes here)
+    const cols = 10000;
+    const values = [Array.from({ length: cols }, (_, c) => `C${c + 1}`), Array.from({ length: cols }, () => 'x'), Array.from({ length: cols }, () => 'y')];
+    b.apply(JSON.stringify({ type: 'add_table', name: 'Wide10k', x: 0, y: 0, rows: 3, cols, values }));
+    const splits = Array.from({ length: 200 }, (_, i) => ({
+      path: Array.from({ length: 12 }, (_, d) => ({ field: 'zzz', key: { s: d === 11 ? `k${i}` : 'k' } })), field: 'C1',
+    }));
+    const t0 = Date.now();
+    const out = decompose(b, { table: 'Wide10k', measure: { agg: 'count' }, splits, suggest: { at: splits[0].path } });
+    return { ms: Date.now() - t0, error: out.error, unresolved: out.unresolved?.length, suggestion: out.suggestion?.field ?? null };
+  }, (v) => !v.error && v.unresolved === 200 && v.suggestion === null && v.ms < 3000, 'quadratic header scans: 122 s for 50 such splits'],
+  ['decomposition: the engine still answers after refused breakdowns', (b) => {
+    decompTable(b, 'Dt', 50, 3);
+    const refused = [
+      decompose(b, { table: 'Dt', measure: { agg: 'count' }, top_n: 0 }),
+      decompose(b, { table: 'Dt', measure: { agg: 'count' }, splits: [{ path: [], field: 'Nope' }] }),
+      decompose(b, { table: 'Dt', measure: { agg: 'count' }, splits: [{ path: [], field: 'C1' }, { path: [], field: 'C2' }] }),
+    ];
+    const ok = decompose(b, { table: 'Dt', measure: { agg: 'count' }, splits: [{ path: [], field: 'C1' }] });
+    return { refused: refused.filter((r) => typeof r.error === 'string').length, total: ok.root?.value.value, check: ok.root?.split?.check.status };
+  }, (v) => v.refused === 3 && v.total === 50 && v.check === 'ok', ''],
 ];
+
+/** A table `name` of `rows` data rows and `cols` text columns C1..Cn; column c has c+1 values. */
+function decompTable(b, name, rows, cols) {
+  const values = [Array.from({ length: cols }, (_, c) => `C${c + 1}`)];
+  for (let r = 0; r < rows; r++) values.push(Array.from({ length: cols }, (_, c) => `v${r % (c + 2)}`));
+  b.apply(JSON.stringify({ type: 'add_table', name, x: 0, y: 0, rows: rows + 1, cols, values }));
+}
+const decompose = (b, q) => JSON.parse(b.decompose(JSON.stringify(q)));
+/** Table "Big": `rows` rows × 40 text columns C1..C40; the first `full` columns are filled
+ * (column c has c+1 values), the others only in the first 100 rows (loading 4 million cells
+ * would take longer than the case's time limit; an empty cell still costs the scan a row). */
+function bigTable(b, rows, full) {
+  const cols = 40;
+  b.apply(JSON.stringify({ type: 'add_table', name: 'Big', x: 0, y: 0, rows: rows + 1, cols }));
+  const id = JSON.parse(b.tables()).find((t) => t.name === 'Big').id;
+  b.apply(JSON.stringify({ type: 'set_cells', table: id, row: 0, col: 0, values: [Array.from({ length: cols }, (_, c) => `C${c + 1}`)] }));
+  for (let r0 = 0; r0 < rows; r0 += 5000) {
+    const values = [];
+    for (let r = r0; r < Math.min(rows, r0 + 5000); r++) values.push(Array.from({ length: full }, (_, c) => `v${r % (c + 2)}`));
+    b.apply(JSON.stringify({ type: 'set_cells', table: id, row: r0 + 1, col: 0, values }));
+  }
+  const sparse = Array.from({ length: 100 }, (_, r) => Array.from({ length: cols - full }, (_, i) => `w${r % (full + i + 2)}`));
+  b.apply(JSON.stringify({ type: 'set_cells', table: id, row: 1, col: full, values: sparse }));
+}
+const suggestionSummary = (out) => {
+  const cs = out.suggestion.candidates;
+  return {
+    rows: out.root.rows, field: out.suggestion.field,
+    ranked: cs.filter((c) => !c.skipped).length,
+    budget: cs.filter((c) => c.skipped === 'work budget').length,
+    beyond: cs.filter((c) => c.skipped === 'beyond the first 32 columns').length,
+    others: cs.filter((c) => c.skipped && c.skipped !== 'work budget' && c.skipped !== 'beyond the first 32 columns').length,
+  };
+};
 
 function runCase(engineDir, i) {
   const require = createRequire(import.meta.url);

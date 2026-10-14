@@ -210,6 +210,106 @@ export interface AnalyticAnswer {
   reconciliation: { measure: string; status: 'ok' | 'differs' | 'not_assessable'; total: number | null; sum_of_groups: number | null }[];
   issues: { kind: string; text: string; rows?: number[]; count: number }[];
 }
+/** Decomposition tree (roadmap 7.4, core/src/decompose.rs). A step on a node's path: one value of
+ * `field` (canonical key; null = (blank)), or the Other node of that level. */
+export interface DecompStep {
+  field: string;
+  key?: KeyValue;
+  other?: boolean;
+}
+export interface DecompSplitSpec {
+  path: DecompStep[];
+  field: string;
+}
+export interface DecompSuggestSpec {
+  at: DecompStep[];
+  /** '' | 'high_value' (default) | 'relative' */
+  rule?: string;
+  /** explicit candidates in this order; empty = automatic */
+  fields?: string[];
+  min_rows?: number | null;
+}
+export interface DecompQuery {
+  table: string;
+  measure: MeasureSpec;
+  selections?: AnalyticSelection[];
+  respect_table_filters?: boolean;
+  key?: string[];
+  top_n?: number;
+  splits: DecompSplitSpec[];
+  suggest?: DecompSuggestSpec | null;
+}
+export interface DecompParts {
+  numerator: number;
+  denominator: number;
+}
+export interface DecompCheck {
+  kind: 'sum' | 'children_do_not_sum';
+  status: 'ok' | 'differs' | 'not_assessable' | 'recomputed';
+  parent: number | null;
+  sum_of_children: number | null;
+  rows_ok: boolean;
+  parts_ok?: boolean;
+  by_currency?: { currency: string; parent: number; sum_of_children: number; status: string }[];
+  text: string;
+}
+export interface DecompSplit {
+  field: string;
+  items: number;
+  sort: 'value_desc' | 'key';
+  mixed_signs: boolean;
+  children: DecompNode[];
+  check: DecompCheck;
+}
+export interface DecompNode {
+  id: string;
+  kind: 'root' | 'value' | 'other' | 'blank';
+  label: string;
+  key: KeyValue;
+  k?: number;
+  folded?: KeyValue[];
+  rank: number | null;
+  pinned: boolean;
+  path: DecompStep[];
+  selections: AnalyticSelection[];
+  rows: number;
+  value: MeasureValue;
+  parts?: DecompParts;
+  share?: number;
+  split?: DecompSplit;
+}
+export interface DecompCandidate {
+  field: string;
+  score: number | null;
+  items: number;
+  node: string | null;
+  node_key: KeyValue;
+  value: number | null;
+  mean: number | null;
+  skipped: string | null;
+}
+export interface DecompSuggestion {
+  at: DecompStep[];
+  node_id: string;
+  rule: 'high_value' | 'relative';
+  rule_text: string;
+  field: string | null;
+  best: DecompCandidate | null;
+  runner_up: DecompCandidate | null;
+  candidates: DecompCandidate[];
+  text: string;
+}
+export interface DecompTree {
+  table: string;
+  measure: { name: string; agg: string; additive: boolean };
+  top_n: number;
+  root: DecompNode;
+  excluded: AnalyticAnswer['excluded'];
+  population: AnalyticAnswer['population'];
+  issues: AnalyticAnswer['issues'];
+  unresolved: { path: DecompStep[]; field: string; reason: string }[];
+  suggestion: DecompSuggestion | null;
+}
 export interface AnalyticRecords {
   error?: string;
   table: string;
