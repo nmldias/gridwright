@@ -1,0 +1,5 @@
+{"source": "freight desk", "items": [
+  {"VIN": "00012345ABC", "Landed cost (Kz)": "24,150,009.00", "Confirmed": "yes"},
+  {"VIN": "KMHJ381ABNU012347", "Landed cost (Kz)": "18,629,981.50", "Confirmed": "yes"},
+  {"VIN": "WVWZZZ1KZBW123456", "Landed cost (Kz)": "22,785,000.00", "Confirmed": "no"}
+]}

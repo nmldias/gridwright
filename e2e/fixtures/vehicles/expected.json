@@ -1,0 +1,80 @@
+{
+ "inventory-2026-10-06.csv": {
+  "vehicles": 5,
+  "total_landed_cost": "606929999.50",
+  "blank_landed_cost": 1,
+  "over90_available": 2,
+  "over90_reserved": 1,
+  "landed_cost_over90_available": "42779990.50",
+  "reserved": 1,
+  "vins": [
+   "00012345ABC",
+   "KMHJ381ABNU012346",
+   "KMHJ381ABNU012347",
+   "WVWZZZ1KZBW123456",
+   "AHTEB3CD700012345"
+  ]
+ },
+ "inventory-2026-10-13.csv": {
+  "vehicles": 6,
+  "total_landed_cost": "649214999.5",
+  "blank_landed_cost": 0,
+  "over90_available": 2,
+  "over90_reserved": 1,
+  "landed_cost_over90_available": "42779990.5",
+  "reserved": 1,
+  "vins": [
+   "00012345ABC",
+   "KMHJ381ABNU012346",
+   "KMHJ381ABNU012347",
+   "WVWZZZ1KZBW123456",
+   "AHTEB3CD700012345",
+   "JTDKN3DU0A0123456"
+  ]
+ },
+ "inventory-2026-10-13-corrected.csv": {
+  "vehicles": 6,
+  "total_landed_cost": "649414999.5",
+  "blank_landed_cost": 0,
+  "over90_available": 2,
+  "over90_reserved": 1,
+  "landed_cost_over90_available": "42979990.5",
+  "reserved": 1,
+  "vins": [
+   "00012345ABC",
+   "KMHJ381ABNU012346",
+   "KMHJ381ABNU012347",
+   "WVWZZZ1KZBW123456",
+   "AHTEB3CD700012345",
+   "JTDKN3DU0A0123456"
+  ]
+ },
+ "inventory-2026-09-29.csv": {
+  "vehicles": 4,
+  "total_landed_cost": "606929999.5",
+  "blank_landed_cost": 0,
+  "over90_available": 1,
+  "over90_reserved": 0,
+  "landed_cost_over90_available": "24150009",
+  "reserved": 0,
+  "vins": [
+   "00012345ABC",
+   "KMHJ381ABNU012346",
+   "KMHJ381ABNU012347",
+   "AHTEB3CD700012345"
+  ]
+ },
+ "inventory-2026-10-20-partial.csv": {
+  "vehicles": 2,
+  "total_landed_cost": "42979990.5",
+  "blank_landed_cost": 0,
+  "over90_available": 2,
+  "over90_reserved": 0,
+  "landed_cost_over90_available": "42979990.5",
+  "reserved": 0,
+  "vins": [
+   "00012345ABC",
+   "KMHJ381ABNU012347"
+  ]
+ }
+}

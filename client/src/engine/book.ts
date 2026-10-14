@@ -1,0 +1,395 @@
+// Wrapper around the WASM engine: owns the Book instance, applies ops, and
+// patches the zustand store from the engine's change sets.
+
+import init, { Book } from './pkg/gridwright_core';
+import wasmUrl from './pkg/gridwright_core_bg.wasm?url';
+import type { AnalyticAnswer, AnalyticQuery, AnalyticRecords, DecompQuery, DecompTree, CellRef, CellValue, CellView, Changes, Chart, CheckView, Metric, NamedRange, Op, SignoffStatus, TableId, TableMeta, Trace } from './types';
+import { cellKey, isCodeKind } from './types';
+import { cellAt, readOnly, useStore } from '../state/store';
+import { setDecimalCommaDisplay } from '../grid/format';
+import { clearRecords } from '../workers/runs';
+import { trust } from '../workers/trust';
+
+const SIGN_OPS = new Set<Op['type']>(['add_signoff', 'remove_signoff', 'set_signoff_locked']);
+
+/** Where a change came from (recorded in the document's audit log). */
+export type Origin = 'user' | 'ai' | 'agent' | 'code' | 'sql' | 'import' | 'remote' | 'system';
+
+export interface ApplyMeta {
+  origin: Origin;
+  /** short human-readable description for the history (optional) */
+  note?: string;
+}
+
+type Listener = (op: Op | null, changes: Changes, meta: ApplyMeta) => void;
+
+let book: Book | null = null;
+let ready: Promise<void> | null = null;
+const opListeners = new Set<Listener>();
+const rerunListeners = new Set<(refs: CellRef[]) => void>();
+let redrawCb: (() => void) | null = null;
+
+export function onOp(l: Listener) {
+  opListeners.add(l);
+  return () => opListeners.delete(l);
+}
+export function onRerun(l: (refs: CellRef[]) => void) {
+  rerunListeners.add(l);
+  return () => rerunListeners.delete(l);
+}
+export function setRedraw(cb: () => void) {
+  redrawCb = cb;
+}
+export function requestRedraw() {
+  redrawCb?.();
+}
+
+export async function ensureEngine(): Promise<void> {
+  if (!ready) ready = init({ module_or_path: wasmUrl }).then(() => undefined);
+  await ready;
+}
+
+export function getBook(): Book {
+  if (!book) throw new Error('engine not loaded');
+  return book;
+}
+
+/** The clock for TODAY() and NOW(): local time, as in Excel (an Excel serial date-time). */
+export function nowSerial(): number {
+  return (Date.now() - new Date().getTimezoneOffset() * 60000) / 86400000 + 25569;
+}
+
+/** Replace the current workbook with a fresh one or a loaded JSON document. */
+export async function loadBook(json: string | null, name = 'Untitled', fileId: string | null = null, opts: { keepView?: boolean } = {}) {
+  await ensureEngine();
+  if (book) book.free();
+  if (!opts.keepView) clearRecords();
+  book = json ? Book.from_json(json) : new Book(name);
+  if (!json) book.start_with_decimal_comma(localeUsesDecimalComma());
+  book.set_now(nowSerial());
+  setDecimalCommaDisplay(book.decimal_comma());
+  const metas: TableMeta[] = JSON.parse(book.tables());
+  const tables = new Map<TableId, TableMeta>();
+  const cells = new Map<TableId, Map<number, CellView>>();
+  for (const m of metas) {
+    tables.set(m.id, m);
+    cells.set(m.id, toCellMap(JSON.parse(book.cells(m.id))));
+  }
+  const prev = useStore.getState();
+  const keep = opts.keepView && prev.selection && tables.has(prev.selection.table);
+  useStore.setState({
+    ready: true,
+    tables,
+    cells,
+    names: JSON.parse(book.names()) as NamedRange[],
+    charts: JSON.parse(book.charts()) as Chart[],
+    metrics: JSON.parse(book.metrics()) as Metric[],
+    decimalComma: book.decimal_comma(),
+    selectedChart: null,
+    trace: null,
+    fileName: json ? book.name() : name,
+    fileId,
+    dirty: false,
+    selection: keep ? prev.selection : metas[0] ? { table: metas[0].id, r0: 0, c0: 0, r1: 0, c1: 0, ar: 0, ac: 0 } : null,
+    selectedTable: keep ? prev.selectedTable : null,
+    editing: null,
+    editorText: '',
+    canUndo: false,
+    canRedo: false,
+    runs: new Map(),
+    blockedCode: [],
+  });
+  requestRedraw();
+  // code cells need their outputs rebuilt after load
+  const refs: CellRef[] = [];
+  for (const m of metas) {
+    for (const c of cells.get(m.id)!.values()) {
+      if (isCodeKind(c.k) && !c.s) refs.push({ table: m.id, row: c.r, col: c.c });
+    }
+  }
+  if (refs.length) rerunListeners.forEach((l) => l(refs));
+}
+
+function toCellMap(list: CellView[]): Map<number, CellView> {
+  const m = new Map<number, CellView>();
+  for (const c of list) m.set(cellKey(c.r, c.c), c);
+  return m;
+}
+
+export function toJson(): string {
+  return getBook().to_json();
+}
+
+/**
+ * Apply an op locally (and notify listeners, e.g. the multiplayer link). `trustCode`: the op is code
+ * this person typed here (cell editor, formula bar, code and SQL panels, a code cell they inserted) —
+ * only then does it become theirs and run without review. Pastes, fills, imports and anything the AI
+ * or an agent wrote never grant trust: such code runs only if this exact code is already trusted.
+ */
+export function apply(op: Op, opts: { remote?: boolean; silent?: boolean; origin?: Origin; note?: string; trustCode?: boolean } = {}): Changes {
+  const b = getBook();
+  if (!opts.remote && readOnly() && op.type !== 'code_result' && !(useStore.getState().permission === 'sign' && SIGN_OPS.has(op.type))) {
+    const msg = useStore.getState().permission === 'sign' ? 'You may sign off on this document but not edit it' : 'This document is read-only for you';
+    if (!opts.silent) useStore.setState({ status: msg });
+    return { cells: {}, tables: [], reload: [], removed_tables: [], rerun_code: [], created: [], error: msg };
+  }
+  const changes: Changes = JSON.parse(b.apply(JSON.stringify(op)));
+  if (changes.error) {
+    if (!opts.silent) useStore.setState({ status: changes.error });
+    return changes;
+  }
+  applyChanges(changes);
+  if (!opts.remote) {
+    if (opts.trustCode && (opts.origin ?? 'user') === 'user') trustTypedCode(op);
+    useStore.setState({ dirty: true });
+    const meta: ApplyMeta = { origin: opts.origin ?? 'user', note: opts.note };
+    opListeners.forEach((l) => l(op, changes, meta));
+  }
+  return changes;
+}
+
+/** Code this person just typed or inserted in this browser is theirs: it may run. */
+function trustTypedCode(op: Op) {
+  const cells: CellView[] = [];
+  if (op.type === 'set_cell') {
+    const c = cellAt(op.table, op.row, op.col);
+    if (c && isCodeKind(c.k)) cells.push(c);
+  } else if (op.type === 'set_cells') {
+    op.values.forEach((row, dr) =>
+      row.forEach((_v, dc) => {
+        const c = cellAt(op.table, op.row + dr, op.col + dc);
+        if (c && isCodeKind(c.k)) cells.push(c);
+      }),
+    );
+  }
+  if (cells.length) trust(cells);
+}
+
+/** Apply an op authored elsewhere (multiplayer): not recorded for local undo. */
+export function applyRemote(op: Op): Changes {
+  const b = getBook();
+  const changes: Changes = JSON.parse(b.apply_remote(JSON.stringify(op)));
+  if (!changes.error) applyChanges(changes);
+  return changes;
+}
+
+export function undo() {
+  const changes: Changes = JSON.parse(getBook().undo());
+  applyChanges(changes);
+  if (!changes.ops?.length) return;
+  useStore.setState({ dirty: true });
+  // the restore ops travel like any other op, so the other clients replay them in order
+  for (const op of changes.ops) opListeners.forEach((l) => l(op, changes, { origin: 'user', note: 'undo' }));
+}
+
+export function redo() {
+  const changes: Changes = JSON.parse(getBook().redo());
+  applyChanges(changes);
+  if (!changes.ops?.length) return;
+  useStore.setState({ dirty: true });
+  for (const op of changes.ops) opListeners.forEach((l) => l(op, changes, { origin: 'user', note: 'redo' }));
+}
+
+/** Tell listeners the whole document changed (after a restore/import): multiplayer sends a snapshot. */
+export function announceSnapshot(note: string, origin: Origin = 'system') {
+  useStore.setState({ dirty: true });
+  const empty: Changes = { cells: {}, tables: [], reload: [], removed_tables: [], rerun_code: [], created: [] };
+  opListeners.forEach((l) => l(null, empty, { origin, note }));
+}
+
+export function applyChanges(changes: Changes) {
+  if (changes.decimal_comma !== undefined) setDecimalCommaDisplay(changes.decimal_comma);
+  const b = getBook();
+  const st = useStore.getState();
+  const tables = new Map(st.tables);
+  // the outer map gets a new identity (so subscribers notice); inner maps are patched in place
+  const cells = new Map(st.cells);
+  for (const id of changes.removed_tables) {
+    tables.delete(id);
+    cells.delete(id);
+  }
+  for (const m of changes.tables) tables.set(m.id, m);
+  for (const id of changes.created) {
+    if (!tables.has(id)) {
+      const metas: TableMeta[] = JSON.parse(b.tables());
+      const m = metas.find((t) => t.id === id);
+      if (m) tables.set(id, m);
+    }
+  }
+  for (const id of changes.reload) {
+    if (tables.has(id)) cells.set(id, toCellMap(JSON.parse(b.cells(id))));
+  }
+  for (const [tid, views] of Object.entries(changes.cells)) {
+    const id = Number(tid);
+    if (!tables.has(id)) continue;
+    let m = cells.get(id);
+    if (!m) {
+      m = new Map();
+      cells.set(id, m);
+    }
+    for (const v of views) {
+      const empty = v.i === '' && v.v === null && !v.f && !v.s && !v.err && !v.out;
+      if (empty) m.delete(cellKey(v.r, v.c));
+      else m.set(cellKey(v.r, v.c), v);
+    }
+  }
+  // keep selection valid
+  let selection = st.selection;
+  if (selection && !tables.has(selection.table)) {
+    const first = tables.values().next().value as TableMeta | undefined;
+    selection = first ? { table: first.id, r0: 0, c0: 0, r1: 0, c1: 0, ar: 0, ac: 0 } : null;
+  } else if (selection) {
+    const t = tables.get(selection.table)!;
+    selection = {
+      ...selection,
+      r0: Math.min(selection.r0, t.rows - 1),
+      r1: Math.min(selection.r1, t.rows - 1),
+      c0: Math.min(selection.c0, t.cols - 1),
+      c1: Math.min(selection.c1, t.cols - 1),
+      ar: Math.min(selection.ar, t.rows - 1),
+      ac: Math.min(selection.ac, t.cols - 1),
+    };
+  }
+  let selectedTable = st.selectedTable;
+  if (selectedTable !== null && !tables.has(selectedTable)) selectedTable = null;
+  useStore.setState({
+    tables,
+    cells,
+    selection,
+    selectedTable,
+    canUndo: b.can_undo(),
+    canRedo: b.can_redo(),
+    cellsVersion: st.cellsVersion + 1,
+    ...(changes.names ? { names: changes.names } : {}),
+    ...(changes.decimal_comma !== undefined ? { decimalComma: changes.decimal_comma } : {}),
+    ...(changes.charts ? { charts: changes.charts } : {}),
+    ...(changes.metrics ? { metrics: changes.metrics } : {}),
+    ...(changes.created_chart ? { selectedChart: changes.created_chart } : {}),
+  });
+  requestRedraw();
+  if (changes.rerun_code.length) rerunListeners.forEach((l) => l(changes.rerun_code));
+}
+
+/** Plain values: number | string | boolean | null | {e: "#ERR"} */
+export function rangeValues(table: TableId, r0: number, c0: number, r1: number, c1: number): (number | string | boolean | null | { e: string })[][] {
+  return JSON.parse(getBook().range_values(table, r0, c0, r1, c1));
+}
+
+export function preview(table: TableId, formula: string): CellValue {
+  return JSON.parse(getBook().preview(table, formula));
+}
+
+/** Evaluate a formula as if it sat in a given cell (conditional-format formulas). */
+export function evalAt(table: TableId, row: number, col: number, formula: string): CellValue {
+  return JSON.parse(getBook().eval_at(table, row, col, formula));
+}
+
+export function shiftFormula(src: string, dr: number, dc: number): string {
+  return Book.shift_formula(src, dr, dc);
+}
+
+export function shiftFormulaRow(src: string, srcRow: number, dr: number): string {
+  return Book.shift_formula_row(src, srcRow, dr);
+}
+
+export function tableIdByName(name: string): TableId {
+  return getBook().table_id(name);
+}
+
+export function engineVersion(): string {
+  return Book.version();
+}
+
+export function checkValidation(table: TableId, row: number, col: number, input: string): { ok: boolean; message?: string; strict: boolean } {
+  return JSON.parse(getBook().check_validation(table, row, col, input));
+}
+
+export function listEntries(table: TableId, row: number, col: number): string[] {
+  return JSON.parse(getBook().list_entries(table, row, col));
+}
+
+/** The browser's language writes "1,5" for one and a half (pt, most of Europe). */
+export function localeUsesDecimalComma(lang = typeof navigator !== 'undefined' ? navigator.language : 'en'): boolean {
+  try {
+    return new Intl.NumberFormat(lang).formatToParts(1.5).find((p) => p.type === 'decimal')?.value === ',';
+  } catch {
+    return false;
+  }
+}
+/** What a person typed or pasted from outside, as the input to store ("1.234,56" → "1,234.56" in
+ *  a decimal-comma workbook). Copies inside the workbook keep stored inputs as they are. */
+export function normalizeTyped(text: string): string {
+  return getBook().normalize_typed(text);
+}
+/** A stored input as the person editing it expects to see it (inverse of normalizeTyped). */
+export function editText(input: string): string {
+  return getBook().edit_text(input);
+}
+export function formatWithEngine(n: number, pattern: string): string {
+  return Book.format_number(n, pattern);
+}
+/** A stored (canonical) literal as a number, read as the engine reads input ("1,000", "12%",
+ *  a date); NaN when it is not a number. */
+export function parseNumber(text: string): number {
+  return Book.parse_number(text);
+}
+/** Order of two numbers as formulas compare them (15 significant digits): -1, 0 or 1, so
+ *  0.1+0.2 equals 0.3. Pairs further apart than any rounding can bridge are ordered here
+ *  without calling the engine (the same pre-check as core/src/formula/numerics.rs). */
+export function compareNumbers(a: number, b: number): number {
+  if (a === b) return 0;
+  if (Math.abs(a - b) > Math.max(Math.abs(a), Math.abs(b)) * 2e-14) return a < b ? -1 : 1;
+  return Book.compare_numbers(a, b);
+}
+
+export function trace(table: TableId, row: number, col: number): Trace {
+  return JSON.parse(getBook().trace(table, row, col));
+}
+
+export function checks(): CheckView[] {
+  return JSON.parse(getBook().checks());
+}
+
+export function signoffStatus(table: TableId): SignoffStatus[] {
+  return JSON.parse(getBook().signoff_status(table));
+}
+
+export function rangeHash(table: TableId, r0: number, c0: number, r1: number, c1: number): string {
+  return getBook().range_hash(table, r0, c0, r1, c1);
+}
+
+/** Values of a reference text (`Sales::B2:B13`, `Sales[Revenue]`, a name) as a 2-D array, or null when it does not resolve. */
+export function resolveValues(table: TableId, reference: string): (number | string | boolean | null | { e: string })[][] | null {
+  if (!book || !reference.trim()) return null;
+  const out = JSON.parse(book.resolve_values(table, reference));
+  return Array.isArray(out) ? out : null;
+}
+
+/** Build a throw-away Book from a checkpoint and a list of ops (history replay). */
+export async function replayDocument(json: string | null, ops: Op[], name: string): Promise<string> {
+  await ensureEngine();
+  const b = json ? Book.from_json(json) : new Book(name);
+  b.set_now(nowSerial());
+  for (const op of ops) b.apply(JSON.stringify(op));
+  const out = b.to_json();
+  b.free();
+  return out;
+}
+
+/** Analytical query (read-only; see docs/analytical-model.md). */
+export function analyze(q: AnalyticQuery): AnalyticAnswer {
+  return JSON.parse(getBook().analyze(JSON.stringify(q)));
+}
+
+/** The source records behind a selection, with the measures' totals over all of them. */
+export function analyzeRecords(q: AnalyticQuery & { fields?: string[]; limit?: number; complement?: boolean }): AnalyticRecords {
+  return JSON.parse(getBook().analyze_records(JSON.stringify(q)));
+}
+
+/** Decomposition tree (roadmap 7.4; read-only, docs/analytical-model.md): one measure broken down
+ * by a field chosen per node. Throws the engine's reason on a bad query. */
+export function decompose(q: DecompQuery): DecompTree {
+  const t = JSON.parse(getBook().decompose(JSON.stringify(q)));
+  if (t.error) throw new Error(t.error);
+  return t as DecompTree;
+}

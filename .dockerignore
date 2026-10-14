@@ -1,0 +1,9 @@
+**/node_modules
+**/dist
+**/target
+client/src/engine/pkg
+server/data
+data
+e2e
+.git
+*.log

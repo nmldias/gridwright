@@ -1,0 +1,323 @@
+import type { Proposal, ServerPython } from '../api/client';
+import { create } from 'zustand';
+import type { AnalyticSelection, CellRef, CellView, Chart, DecompSplitSpec, DecompStep, KeyValue, MeasureSpec, Metric, NamedRange, TableId, TableMeta, Trace } from '../engine/types';
+
+export interface Selection {
+  table: TableId;
+  r0: number;
+  c0: number;
+  r1: number;
+  c1: number;
+  /** active (focused) cell */
+  ar: number;
+  ac: number;
+}
+
+export interface Editing {
+  table: TableId;
+  r: number;
+  c: number;
+  /** text the editor started with */
+  initial: string;
+  /** true when the editor was opened by typing a character (replace mode) */
+  replace: boolean;
+  /** which widget owns the keyboard focus */
+  source?: 'cell' | 'bar';
+}
+
+export type Panel = 'none' | 'code' | 'ai' | 'sql' | 'files' | 'share' | 'table' | 'settings' | 'history' | 'format' | 'chart' | 'review' | 'navigate' | 'admin' | 'records' | 'decompose' | 'metrics';
+
+/** A decomposition tree as this viewer has built it (roadmap 7.4): never an operation. */
+export interface Decomp {
+  table: string;
+  measure: MeasureSpec;
+  /** the measures to choose from (the chart's) */
+  measures: MeasureSpec[];
+  /** the chart it was opened from: its filters (other charts' selections, drill path) apply live */
+  fromChart: number | null;
+  /** the starting filter when not opened from a chart */
+  base: AnalyticSelection[];
+  topN: number;
+  splits: DecompSplitSpec[];
+  suggest: boolean;
+  rule: 'high_value' | 'relative';
+  /** the selected node's id, and its path (what a suggestion is asked for) */
+  selected: string | null;
+  selectedPath: DecompStep[] | null;
+  /** node ids whose split is folded away in the outline */
+  collapsed: string[];
+  /** the node whose records are listed */
+  records: string | null;
+}
+
+/** Per-viewer preferences of the decomposition tree, remembered in this browser. */
+export interface DecompPrefs {
+  topN: number;
+  suggest: boolean;
+  rule: 'high_value' | 'relative';
+}
+export function loadDecompPrefs(): DecompPrefs {
+  const out: DecompPrefs = { topN: 10, suggest: true, rule: 'high_value' };
+  try {
+    const v = JSON.parse(localStorage.getItem('gridwright.decomp') ?? '{}');
+    if (Number.isInteger(v.topN) && v.topN >= 1 && v.topN <= 50) out.topN = v.topN;
+    if (typeof v.suggest === 'boolean') out.suggest = v.suggest;
+    if (v.rule === 'relative' || v.rule === 'high_value') out.rule = v.rule;
+  } catch {
+    /* ignore */
+  }
+  return out;
+}
+export function saveDecompPrefs(p: DecompPrefs) {
+  try {
+    localStorage.setItem('gridwright.decomp', JSON.stringify(p));
+  } catch {
+    /* ignore */
+  }
+}
+
+export interface Presence {
+  id: string;
+  name: string;
+  color: string;
+  login?: string;
+  table?: TableId;
+  r?: number;
+  c?: number;
+}
+
+export interface CodeRunState {
+  running: boolean;
+  startedAt: number;
+}
+
+export interface TenantRef {
+  id: string;
+  name: string;
+  slug: string;
+  role: 'admin' | 'editor' | 'viewer';
+  status?: 'active' | 'suspended';
+}
+export interface Me {
+  login: string;
+  name: string;
+  /** the role in the client this tab works in (accounts), or on the server */
+  role: 'admin' | 'editor' | 'viewer';
+  identity: boolean;
+  /** how people are told apart: accounts (multi-tenant sign-in), Tailscale, or not at all */
+  auth?: 'accounts' | 'tailscale' | 'none';
+  authenticated?: boolean;
+  platformAdmin?: boolean;
+  mustChangePassword?: boolean;
+  /** accounts: the client this tab works in, and every client the person belongs to */
+  tenant?: TenantRef | null;
+  tenants?: TenantRef[];
+  denied?: 'suspended' | 'not-a-member';
+  can?: { python: boolean; gpu: boolean };
+}
+
+/** What the current user may do with the open document (server-side sharing). */
+export type Permission = 'none' | 'view' | 'sign' | 'edit' | 'own';
+
+export interface TraceState extends Trace {
+  cell: CellRef;
+}
+
+export interface FilterPopover {
+  table: TableId;
+  col: number;
+  x: number;
+  y: number;
+}
+
+export interface MarkSelection {
+  table: string;
+  field: string;
+  /** canonical keys of the selected marks */
+  keys: KeyValue[];
+  /** their labels, for the "Filtered by" strip */
+  labels: string[];
+}
+
+interface State {
+  ready: boolean;
+  fileId: string | null;
+  fileName: string;
+  dirty: boolean;
+  tables: Map<TableId, TableMeta>;
+  cells: Map<TableId, Map<number, CellView>>;
+  /** bumped on every change to the cell maps (inner maps are patched in place) */
+  cellsVersion: number;
+  names: NamedRange[];
+  selection: Selection | null;
+  selectedTable: TableId | null;
+  editing: Editing | null;
+  editorText: string;
+  /** the open workbook types and shows numbers with a decimal comma ("1.234,56") */
+  decimalComma: boolean;
+  panel: Panel;
+  codeCell: CellRef | null;
+  canUndo: boolean;
+  canRedo: boolean;
+  status: string;
+  presence: Map<string, Presence>;
+  runs: Map<string, CodeRunState>;
+  /** code cells that wait for this person's approval before they run (see workers/trust.ts) */
+  blockedCode: CellRef[];
+  zoom: number;
+  pythonStatus: 'idle' | 'loading' | 'ready' | 'error';
+  /** server-side Python as reported by /api/health (null = not available) */
+  serverPython: ServerPython | null;
+  me: Me;
+  /** last log position applied from the server (0 = none) */
+  seq: number;
+  /** cell whose history the History panel shows */
+  historyCell: CellRef | null;
+  filterPopover: FilterPopover | null;
+  touch: boolean;
+  charts: Chart[];
+  /** governed metric definitions of the workbook (roadmap 7.5), from the engine */
+  metrics: Metric[];
+  /** what the Metrics panel opens with: a metric to edit, or a new one prefilled (e.g. from a
+   * chart's measure); per viewer, never an operation */
+  metricDraft: { metric: Metric; isNew: boolean; fromChart?: number; measureIndex?: number } | null;
+  selectedChart: number | null;
+  /** marks selected in analytical charts, per chart: this viewer's interaction state, never an
+   * operation (cross-filtering, docs/analytical-model.md) */
+  markSelections: Record<number, MarkSelection>;
+  /** drill-down path of analytical charts with a dimension hierarchy, per chart (also per viewer) */
+  drillPaths: Record<number, { keys: KeyValue[]; labels: string[] }>;
+  /** the chart whose records the Records panel shows (drill-through) */
+  recordsChart: number | null;
+  /** the decomposition tree this viewer is building (roadmap 7.4), per viewer, never an operation */
+  decomp: Decomp | null;
+  /** precedents/dependents overlay of a cell (Review panel) */
+  trace: TraceState | null;
+  /** sharing level of the open document */
+  permission: Permission;
+  fileFolder: string;
+  /** bumped when a code-cell run record is added (Review panel) */
+  runsVersion: number;
+  /** bumped when the server reports a proposal filed or decided */
+  proposalsVersion: number;
+  /** proposals of the open document, as last loaded from the server (see ui/proposals.ts) */
+  proposals: Proposal[];
+  /** a save is in flight */
+  saving: boolean;
+  /** when the open document was last saved to the server in this session (ms), null = never */
+  savedAt: number | null;
+  /** side panel width in px (desktop) */
+  panelWidth: number;
+  /** grid text density */
+  density: 'comfortable' | 'compact';
+  /** the start card (first use: import, template, blank, example) */
+  start: boolean;
+  /** what the Files panel shows */
+  filesView: 'documents' | 'templates';
+  /** the guided import studio: open on the library (no dataset) or on one dataset and tab */
+  studio: { dataset?: string; tab?: 'prepare' | 'results' | 'related' | 'audit'; run?: string } | null;
+  /** "How was this made?" for a placed table (and a row of it) */
+  lineage: { table: number; row?: number; source?: number } | null;
+  /** tables of this document placed by a guided import, by table id */
+  importedTables: Map<number, { dataset: string; run: string; output: string; name: string }>;
+  /** what the Clients & people panel shows (accounts mode) */
+  adminView: 'members' | 'activity' | 'account' | 'clients' | 'people';
+  /** open companion issues needing attention (the Ask badge) */
+  attention: number;
+  /** bumped when the server says the companion re-checked the document */
+  companionVersion: number;
+  set: (patch: Partial<State>) => void;
+}
+
+export const useStore = create<State>((set) => ({
+  ready: false,
+  fileId: null,
+  fileName: 'Untitled',
+  dirty: false,
+  tables: new Map(),
+  cells: new Map(),
+  cellsVersion: 0,
+  names: [],
+  selection: null,
+  selectedTable: null,
+  editing: null,
+  editorText: '',
+  decimalComma: false,
+  panel: 'none',
+  codeCell: null,
+  canUndo: false,
+  canRedo: false,
+  status: '',
+  presence: new Map(),
+  runs: new Map(),
+  zoom: 1,
+  pythonStatus: 'idle',
+  serverPython: null,
+  me: { login: '', name: '', role: 'admin', identity: false },
+  blockedCode: [],
+  seq: 0,
+  historyCell: null,
+  filterPopover: null,
+  charts: [],
+  metrics: [],
+  metricDraft: null,
+  selectedChart: null,
+  markSelections: {},
+  drillPaths: {},
+  recordsChart: null,
+  decomp: null,
+  trace: null,
+  permission: 'own',
+  fileFolder: '',
+  runsVersion: 0,
+  proposalsVersion: 0,
+  proposals: [],
+  saving: false,
+  savedAt: null,
+  panelWidth: (() => {
+    try {
+      const v = Number(localStorage.getItem('gridwright.panelWidth'));
+      return v >= 320 && v <= 900 ? v : 420;
+    } catch {
+      return 420;
+    }
+  })(),
+  density: (() => {
+    try {
+      return localStorage.getItem('gridwright.density') === 'compact' ? 'compact' : 'comfortable';
+    } catch {
+      return 'comfortable';
+    }
+  })(),
+  start: false,
+  filesView: 'documents',
+  studio: null,
+  lineage: null,
+  importedTables: new Map(),
+  adminView: 'members',
+  attention: 0,
+  companionVersion: 0,
+  touch: typeof window !== 'undefined' && (navigator.maxTouchPoints > 0 || 'ontouchstart' in window) && !matchMedia('(pointer: fine)').matches,
+  set: (patch) => set(patch),
+}));
+
+export const getState = () => useStore.getState();
+
+export function cellAt(table: TableId, r: number, c: number): CellView | undefined {
+  return getState().cells.get(table)?.get(r * 65536 + c);
+}
+
+/** True when the open document cannot be edited by this user. */
+export function readOnly(): boolean {
+  const st = getState();
+  return st.me.role === 'viewer' || st.permission === 'view' || st.permission === 'sign' || st.permission === 'none';
+}
+
+export function setStatus(msg: string, ms = 4000) {
+  useStore.setState({ status: msg });
+  if (ms > 0) {
+    window.setTimeout(() => {
+      if (useStore.getState().status === msg) useStore.setState({ status: '' });
+    }, ms);
+  }
+}

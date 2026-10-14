@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1.6
+# Runtime image built from the prebuilt tree (client/dist, server/dist present), so a
+# multi-arch build needs no Rust/Vite toolchain — only `npm ci` of the pure-JS server deps.
+FROM node:22-bookworm-slim
+# GRIDWRIGHT_PYTHON_SANDBOX=auto: bubblewrap when the container may create user namespaces (run with
+# --security-opt seccomp=unconfined --security-opt apparmor=unconfined on a host that allows them),
+# a user namespace alone when it may, else a plain process with the container as the only boundary —
+# /api/python and /api/health report which, and every run record carries it
+ENV NODE_ENV=production PORT=8787 HOST=0.0.0.0 GRIDWRIGHT_DATA=/data CLIENT_DIR=/app/client GRIDWRIGHT_PYTHON_SANDBOX=auto GRIDWRIGHT_AGENT_PYTHON=/opt/companion/bin/python
+# python3 + pandas for server-side Python cells; bubblewrap for the sandbox when the runtime allows it;
+# the companion's investigation stack (LangChain, DeepAgents, LangGraph) in its own venv at the tested versions
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv python3-pandas python3-matplotlib bubblewrap && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY integrations/companion ./integrations/companion
+RUN python3 -m venv --system-site-packages /opt/companion && /opt/companion/bin/pip install --no-cache-dir -q -r integrations/companion/requirements.lock.txt \
+ && /opt/companion/bin/python integrations/companion/investigate.py --probe
+COPY server/package.json server/package-lock.json ./server/
+RUN cd server && npm ci --omit=dev --no-audit --no-fund
+COPY server/dist ./server/dist
+COPY server/engine ./server/engine
+COPY server/runner ./server/runner
+COPY client/dist ./client
+RUN mkdir -p /data && chown -R node:node /data /app
+USER node
+VOLUME ["/data"]
+EXPOSE 8787
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD node -e "fetch('http://127.0.0.1:8787/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+CMD ["node", "server/dist/index.js"]
