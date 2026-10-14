@@ -6,7 +6,7 @@ services:
     container_name: gridwright
     restart: unless-stopped
     ports:
-      - "8787:8787"
+      - "127.0.0.1:8787:8787"
     environment:
       # Encrypts stored DB passwords / AI keys. Leave empty to have a random key generated into
       # /data/secret.key (keep the data volume with your backups), or set a long random string.

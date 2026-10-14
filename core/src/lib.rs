@@ -7,6 +7,7 @@ pub mod analytic;
 pub mod decompose;
 pub mod depindex;
 pub mod engine;
+pub mod metrics;
 pub mod formula;
 pub mod model;
 pub mod pivot;
@@ -287,6 +288,11 @@ impl Book {
     /// JSON array of chart objects.
     pub fn charts(&self) -> String {
         js(&self.engine.wb.charts)
+    }
+
+    /// JSON array of governed metric definitions (7.5): [{name, table, measure, currency?, format?, description?}].
+    pub fn metrics(&self) -> String {
+        js(&self.engine.wb.metrics)
     }
 
     /// Precedents and dependents of a cell: JSON {precedents: Rect[], dependents: CellRef[]}.

@@ -5,7 +5,8 @@
 import { useMemo, useState } from 'react';
 import { PanelHeader } from './PanelHeader';
 import * as book from '../engine/book';
-import { valueToString, type Chart, type KeyValue, type MeasureValue } from '../engine/types';
+import { valueToString, type Chart, type KeyValue, type MeasureInfo, type MeasureValue } from '../engine/types';
+import { formatMetricValue, measureColumns } from '../grid/metrics';
 import { analyticData, fmtNum } from '../grid/charts';
 import { currentField, drillDown, drillLevel, drillUp, incoming, ownSelection, pathLabels, pathSelections, recordSelections } from '../grid/crossfilter';
 import { selectCell } from '../grid/actions';
@@ -24,11 +25,17 @@ function show(v: KeyValue): string {
   return v === null ? '' : valueToString(v);
 }
 
-function measureText(m: MeasureValue): string {
-  if (m.status === 'mixed_currency') return (m.by_currency ?? []).map((c) => `${c.currency || '(none)'} ${fmtNum(c.value)}`).join(' · ');
+function measureText(m: MeasureValue, info?: MeasureInfo): string {
+  if (m.status === 'mixed_currency' || m.status === 'currency_mismatch') {
+    const list = (m.by_currency ?? []).map((c) => `${c.currency || '(none)'} ${fmtNum(c.value)}`).join(' · ');
+    return m.status === 'currency_mismatch' ? `not in ${info?.currency}: ${list}` : list;
+  }
   if (m.value === null) return m.status === 'div0' ? 'denominator is 0' : 'no values';
   const left = m.missing + m.invalid;
-  return `${fmtNum(m.value, false)}${m.currency ? ` ${m.currency}` : ''}${left ? ` (${left} blank or not a number, left out)` : ''}`;
+  // a governed metric's own format (and currency) when it has one
+  const formatted = formatMetricValue(m.value, info);
+  const text = formatted ?? `${fmtNum(m.value, false)}${m.currency ? ` ${m.currency}` : ''}`;
+  return `${text}${left ? ` (${left} blank or not a number, left out)` : ''}`;
 }
 
 export function RecordsPanel() {
@@ -94,7 +101,7 @@ export function RecordsPanel() {
             {r.measures.map((m, i) => (
               <span key={i}>
                 {' · '}
-                {m.name}: {measureText(r.total[i])}
+                {m.name}: {measureText(r.total[i], m)}
               </span>
             ))}
           </p>
@@ -146,7 +153,7 @@ function compute(chart: Chart, mode: 'behind' | 'excluded', limit: number) {
   const tableId = book.tableIdByName(an.table);
   const heads = tableId ? tableHeaders(tableId).filter(Boolean) : [];
   // the record's identity first (the table's first column), then what the chart reads
-  const want = [heads[0], ...an.dims, ...an.measures.flatMap((m) => [m.field, m.numerator, m.denominator, m.currency])];
+  const want = [heads[0], ...an.dims, ...an.measures.flatMap((m) => measureColumns(m))];
   const fields = [...new Set(want.filter((f): f is string => !!f && heads.some((h) => h.toLowerCase() === f.toLowerCase())))];
   const inc = incoming(chart);
   const own = ownSelection(chart);

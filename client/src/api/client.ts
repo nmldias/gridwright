@@ -176,6 +176,8 @@ export interface WatchDef {
   purpose: string;
   scope: string;
   formula: string;
+  /** a governed metric of the document, by name (instead of a formula; roadmap 7.5) */
+  metric?: string;
   table?: string;
   kind: 'threshold' | 'check' | 'change' | 'worsening';
   op?: '>' | '>=' | '<' | '<=' | '=' | '!=';

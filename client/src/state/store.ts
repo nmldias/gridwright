@@ -1,6 +1,6 @@
 import type { Proposal, ServerPython } from '../api/client';
 import { create } from 'zustand';
-import type { AnalyticSelection, CellRef, CellView, Chart, DecompSplitSpec, DecompStep, KeyValue, MeasureSpec, NamedRange, TableId, TableMeta, Trace } from '../engine/types';
+import type { AnalyticSelection, CellRef, CellView, Chart, DecompSplitSpec, DecompStep, KeyValue, MeasureSpec, Metric, NamedRange, TableId, TableMeta, Trace } from '../engine/types';
 
 export interface Selection {
   table: TableId;
@@ -25,7 +25,7 @@ export interface Editing {
   source?: 'cell' | 'bar';
 }
 
-export type Panel = 'none' | 'code' | 'ai' | 'sql' | 'files' | 'share' | 'table' | 'settings' | 'history' | 'format' | 'chart' | 'review' | 'navigate' | 'admin' | 'records' | 'decompose';
+export type Panel = 'none' | 'code' | 'ai' | 'sql' | 'files' | 'share' | 'table' | 'settings' | 'history' | 'format' | 'chart' | 'review' | 'navigate' | 'admin' | 'records' | 'decompose' | 'metrics';
 
 /** A decomposition tree as this viewer has built it (roadmap 7.4): never an operation. */
 export interface Decomp {
@@ -176,6 +176,11 @@ interface State {
   filterPopover: FilterPopover | null;
   touch: boolean;
   charts: Chart[];
+  /** governed metric definitions of the workbook (roadmap 7.5), from the engine */
+  metrics: Metric[];
+  /** what the Metrics panel opens with: a metric to edit, or a new one prefilled (e.g. from a
+   * chart's measure); per viewer, never an operation */
+  metricDraft: { metric: Metric; isNew: boolean; fromChart?: number; measureIndex?: number } | null;
   selectedChart: number | null;
   /** marks selected in analytical charts, per chart: this viewer's interaction state, never an
    * operation (cross-filtering, docs/analytical-model.md) */
@@ -254,6 +259,8 @@ export const useStore = create<State>((set) => ({
   historyCell: null,
   filterPopover: null,
   charts: [],
+  metrics: [],
+  metricDraft: null,
   selectedChart: null,
   markSelections: {},
   drillPaths: {},

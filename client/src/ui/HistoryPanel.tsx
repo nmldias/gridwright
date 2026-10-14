@@ -88,6 +88,12 @@ function describe(e: HistoryEntry, tableName: (id: number) => string): string {
       return 'undo/redo: names restored';
     case 'restore_charts':
       return 'undo/redo: charts restored';
+    case 'set_metric':
+      return op.metric ? `defined metric ${op.metric.name || op.name}` : `removed metric ${op.name}`;
+    case 'rename_metric':
+      return `renamed metric ${op.name} → ${op.to}`;
+    case 'restore_metrics':
+      return 'undo/redo: metrics restored';
     default:
       return op.type;
   }

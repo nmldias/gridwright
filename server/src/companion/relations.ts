@@ -100,8 +100,11 @@ export function graphOf(doc: string): Graph {
   const conns = new Map(listConnections().map((c) => [c.id, c.name]));
   const { book } = openDocument(doc);
   let metas: TableMetaView[] = [];
+  // a metric watch reads its metric's table (7.5)
+  const metricTable = new Map<string, string>();
   try {
     metas = tableMetas(book);
+    for (const m of JSON.parse(book.metrics()) as { name: string; table: string }[]) metricTable.set(m.name.trim().toLowerCase(), m.table);
     for (const t of metas) {
       const src = sources.find((x) => x.name === t.name);
       nodes.push({ id: `table:${t.id}`, type: 'table', label: t.name, table: t.id, supply: src?.supply, lastChange: src?.lastChange, rows: t.rows });
@@ -144,8 +147,11 @@ export function graphOf(doc: string): Graph {
     nodes.push({ id, type: 'watch', label: w.def.purpose, health: w.health, status: w.authority, lastChange: w.lastChecked });
     const read = new Set(tablesReferenced(w.def.formula, metas));
     const ctx = w.def.table ? metas.find((m) => m.name.toLowerCase() === w.def.table!.toLowerCase()) : undefined;
-    if (ctx && !tablesReferenced(w.def.formula, metas).length) read.add(ctx.id);
-    for (const t of read) edge(id, `table:${t}`, 'watches', 'formula');
+    if (ctx && !tablesReferenced(w.def.formula, metas).length && !w.def.metric) read.add(ctx.id);
+    const mt = w.def.metric ? metricTable.get(w.def.metric.trim().toLowerCase()) : undefined;
+    const mtable = mt ? metas.find((m) => m.name.toLowerCase() === mt.toLowerCase()) : undefined;
+    if (mtable) read.add(mtable.id);
+    for (const t of read) edge(id, `table:${t}`, 'watches', w.def.metric ? 'metric' : 'formula');
     if (w.authority === 'approved') for (const o of objectives) edge(`record:${o.id}`, id, 'constrains', 'case');
     if (w.issue?.status === 'open') {
       nodes.push({ id: `issue:${w.issue.id}`, type: 'issue', label: w.issue.summary, status: w.issue.status, lastChange: w.issue.updatedAt });

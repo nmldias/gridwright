@@ -161,9 +161,13 @@ def make_tools(gw: Gridwright) -> list:
         return _dump({"id": r.get("id"), "status": r.get("status"), "error": r.get("error")} if isinstance(r, dict) else r)
 
     @tool
-    def propose_watch(purpose: str, formula: str, scope: str = "", kind: str = "threshold", op: str = ">", value: float = 0, sustain: int = 1, sources: list[str] | None = None) -> str:
-        """Propose something to watch, as a Gridwright formula with a threshold (kind threshold), a check that must stay TRUE (kind check), a change detector (kind change) or a worsening detector (kind worsening). Proposed until a person approves it; thresholds are theirs to set."""
-        body: dict[str, Any] = {"purpose": purpose, "formula": formula, "scope": scope, "kind": kind, "op": op, "value": value, "sustain": sustain}
+    def propose_watch(purpose: str, formula: str = "", scope: str = "", kind: str = "threshold", op: str = ">", value: float = 0, sustain: int = 1, sources: list[str] | None = None, metric: str = "") -> str:
+        """Propose something to watch, as a Gridwright formula with a threshold (kind threshold), a check that must stay TRUE (kind check), a change detector (kind change) or a worsening detector (kind worsening) — or, when the document defines a governed metric for it, the metric by name (metric instead of formula; never restate its definition). Proposed until a person approves it; thresholds are theirs to set."""
+        body: dict[str, Any] = {"purpose": purpose, "scope": scope, "kind": kind, "op": op, "value": value, "sustain": sustain}
+        if metric:
+            body["metric"] = metric
+        else:
+            body["formula"] = formula
         if sources:
             body["sources"] = list(sources)
         r = gw.rest("POST", f"/api/files/{gw.doc}/companion/watches", body) if gw.agent_token else gw.mcp("propose_watch", body)

@@ -16,6 +16,7 @@ import { selectCell } from '../grid/actions';
 import { acceptSuggestion, addSplit, chartOf, fieldsOf, findNode, flatten, keyText, query, rememberTree, removeSplit, staleSplits } from '../grid/decomp';
 import { cellAt, getState, saveDecompPrefs, useStore, type Decomp } from '../state/store';
 import { tableHeaders } from './review';
+import { measureColumns, metricRef, metricsOn, resolveSpec } from '../grid/metrics';
 
 const PAGE = 50;
 const lower = (s: string) => s.trim().toLowerCase();
@@ -32,6 +33,7 @@ function agree(a: number | null | undefined, b: number | null | undefined): bool
 }
 
 function measureLabel(m: MeasureSpec): string {
+  if (m.metric) return `Metric: ${m.name || m.metric}`;
   if (m.name) return m.name;
   if (m.agg === 'ratio') return `${m.numerator ?? '?'} ÷ ${m.denominator ?? '?'}`;
   if (m.agg === 'count') return m.field ? `Count of ${m.field}` : 'Count of rows';
@@ -43,7 +45,11 @@ function measureLabel(m: MeasureSpec): string {
  * when the measure has a currency column: the column's format (its first row's) may carry one
  * currency's symbol ("currency:AOA", `#,##0.00 "Kz"`), and the nodes' amounts are in their own
  * currencies, each shown with its code. */
-function patternOf(table: string, m: MeasureSpec): string | undefined {
+function patternOf(table: string, spec: MeasureSpec): string | undefined {
+  // a governed metric is shown in its own format, the same everywhere (7.5)
+  const r = resolveSpec(spec);
+  if (r.metric) return r.metric.format || undefined;
+  const m = r.spec;
   if (!m.field || m.currency || !['sum', 'average', 'min', 'max', ''].includes(m.agg ?? '')) return undefined;
   const id = book.tableIdByName(table);
   const meta = id ? getState().tables.get(id) : undefined;
@@ -70,7 +76,7 @@ const count = (n: number) => plain(n, 0);
 const times = (x: number | null) => (x === null ? '—' : `${plain(x, 2)}×`);
 
 function valueText(m: MeasureValue, fmt: Fmt): string {
-  if (m.status === 'mixed_currency') return (m.by_currency ?? []).map((c) => `${c.currency || '(none)'} ${fmt(c.value)}`).join(' · ');
+  if (m.status === 'mixed_currency' || m.status === 'currency_mismatch') return (m.by_currency ?? []).map((c) => `${c.currency || '(none)'} ${fmt(c.value)}`).join(' · ');
   if (m.value === null) return m.status === 'div0' ? '÷0' : 'no values';
   return `${fmt(m.value)}${m.currency ? ` ${m.currency}` : ''}`;
 }
@@ -84,6 +90,7 @@ function badges(m: MeasureValue, fmt: Fmt, counted: boolean): string[] {
     if (parts.length) out.push(`incomplete: ${parts.join(', ')} left out`);
   }
   if (m.status === 'mixed_currency') out.push(`mixed currencies: ${(m.by_currency ?? []).map((c) => `${c.currency || '(none)'} ${fmt(c.value)}`).join(' · ')}`);
+  if (m.status === 'currency_mismatch') out.push(`not in the metric's currency: ${(m.by_currency ?? []).map((c) => `${c.currency || '(none)'} ${fmt(c.value)}`).join(' · ')}`);
   if (m.status === 'div0') out.push('÷0');
   return out;
 }
@@ -172,7 +179,8 @@ export function DecompositionPanel() {
   useEffect(() => rememberTree(tree), [tree]);
   useEffect(() => setLimit(PAGE), [d?.records]);
 
-  const fmt = useMemo(() => makeFmt(d ? patternOf(d.table, d.measure) : undefined), [d?.table, d?.measure, cellsVersion, decimalComma]);
+  const metrics = useStore((s) => s.metrics);
+  const fmt = useMemo(() => makeFmt(d ? patternOf(d.table, d.measure) : undefined), [d?.table, d?.measure, cellsVersion, decimalComma, metrics]);
   const fields = useMemo(() => (d ? fieldsOf(d) : []), [d?.table, d?.fromChart, charts, tables, cellsVersion]);
   const flat = useMemo(() => (tree && d ? flatten(tree, d.collapsed) : []), [tree, d?.collapsed]);
   // DOM ids of the shown tree items, for aria-activedescendant
@@ -189,7 +197,7 @@ export function DecompositionPanel() {
     if (!d || !recordsNode) return null;
     const id = book.tableIdByName(d.table);
     const heads = id ? tableHeaders(id).filter(Boolean) : [];
-    const want = [heads[0], ...recordsNode.path.map((s) => s.field), d.measure.field, d.measure.numerator, d.measure.denominator, d.measure.currency];
+    const want = [heads[0], ...recordsNode.path.map((s) => s.field), ...measureColumns(d.measure)];
     const fs = [...new Set(want.filter((f): f is string => !!f && heads.some((h) => lower(h) === lower(f))))];
     return book.analyzeRecords({ table: d.table, measures: [d.measure], selections: recordsNode.selections, fields: fs, limit });
   }, [d, recordsNode, limit]);
@@ -204,7 +212,8 @@ export function DecompositionPanel() {
   }
 
   const chart = chartOf(d);
-  const counted = d.measure.agg === 'count' || d.measure.agg === 'count_distinct';
+  const resolved = resolveSpec(d.measure, metrics).spec;
+  const counted = resolved.agg === 'count' || resolved.agg === 'count_distinct';
   const stale = result.error ? staleSplits(d) : [];
   const tableId = [...tables.values()].find((t) => lower(t.name) === lower(d.table))?.id ?? null;
   const setPrefs = (patch: Partial<Pick<Decomp, 'topN' | 'suggest' | 'rule'>>) => {
@@ -212,8 +221,14 @@ export function DecompositionPanel() {
     const n = getState().decomp!;
     saveDecompPrefs({ topN: n.topN, suggest: n.suggest, rule: n.rule });
   };
-  const measures = d.measures.some((m) => m.agg === 'count' && !m.field) ? d.measures : [...d.measures, { agg: 'count' }];
-  const mIndex = measures.findIndex((m) => JSON.stringify(m) === JSON.stringify(d.measure));
+  // the chart's measures, a row count, then the workbook's metrics on this table (7.5)
+  const own = d.measures.some((m) => m.agg === 'count' && !m.field && !m.metric) ? d.measures : [...d.measures, { agg: 'count' }];
+  const fromMetrics = metricsOn(d.table, metrics)
+    .filter((x) => !own.some((m) => lower(m.metric ?? '') === lower(x.name)))
+    .map((x) => metricRef(x.name));
+  const measures = [...own, ...fromMetrics];
+  const mKey = (m: MeasureSpec) => (m.metric ? `metric:${lower(m.metric)}` : JSON.stringify([m.name || '', m.field || '', m.agg || '', m.numerator || '', m.denominator || '', m.currency || '']));
+  const mIndex = measures.findIndex((m) => mKey(m) === mKey(d.measure));
   const select = (n: DecompNode) => update((x) => ({ ...x, selected: n.id, selectedPath: n.path }));
   const toggle = (n: DecompNode, open?: boolean) =>
     update((x) => {
@@ -285,7 +300,7 @@ export function DecompositionPanel() {
           </span>
           {n.parts && (
             <span className="decomp-parts muted small">
-              {fmt(n.parts.numerator)} ÷ {counted || d.measure.agg === 'average' ? count(n.parts.denominator) : fmt(n.parts.denominator)}
+              {fmt(n.parts.numerator)} ÷ {counted || resolved.agg === 'average' ? count(n.parts.denominator) : fmt(n.parts.denominator)}
             </span>
           )}
           {badges(n.value, fmt, counted).map((b) => (
@@ -390,11 +405,20 @@ export function DecompositionPanel() {
             }}
           >
             {mIndex < 0 && <option value="">{measureLabel(d.measure)}</option>}
-            {measures.map((m, i) => (
+            {own.map((m, i) => (
               <option key={i} value={String(i)}>
                 {measureLabel(m)}
               </option>
             ))}
+            {fromMetrics.length > 0 && (
+              <optgroup label="Metrics">
+                {fromMetrics.map((m, i) => (
+                  <option key={m.metric} value={String(own.length + i)}>
+                    {measureLabel(m)}
+                  </option>
+                ))}
+              </optgroup>
+            )}
           </select>
         </label>
         <label>

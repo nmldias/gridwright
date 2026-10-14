@@ -842,6 +842,7 @@ function WatchingView({ watches, fileId, investigations, canInvestigate, stack }
   const [suggestions, setSuggestions] = useState<Suggestion[] | null>(null);
   const [details, setDetails] = useState<Record<string, boolean>>({});
   const cellsVersion = useStore((s) => s.cellsVersion);
+  const metrics = useStore((s) => s.metrics);
   const version = useStore((s) => s.companionVersion);
   useEffect(() => {
     let alive = true;
@@ -930,7 +931,7 @@ function WatchingView({ watches, fileId, investigations, canInvestigate, stack }
             </div>
             {open && (
               <div className="muted small">
-                <code>{w.def.formula}</code>
+                {w.def.metric ? <span className="watch-metric">Metric: {w.def.metric}</span> : <code>{w.def.formula}</code>}
                 {w.def.complement ? (
                   <>
                     {' · leaves out: '}
@@ -1016,13 +1017,29 @@ function WatchingView({ watches, fileId, investigations, canInvestigate, stack }
         (adding ? (
           <div className="watch-form">
             <input placeholder="Purpose, e.g. Vehicles over 90 days in stock (excluding reserved)" value={def.purpose} onChange={(e) => setDef({ ...def, purpose: e.target.value })} onKeyDown={(e) => e.stopPropagation()} />
-            <input placeholder='Formula, e.g. =COUNTIFS(Inventory[Days in stock], ">90", Inventory[Reserved], "no")' value={def.formula} onChange={(e) => setDef({ ...def, formula: e.target.value })} onKeyDown={(e) => e.stopPropagation()} className="mono" />
+            {metrics.length > 0 && (
+              <select aria-label="What to watch" value={def.metric ? 'metric' : 'formula'} onChange={(e) => setDef(e.target.value === 'metric' ? { ...def, formula: '', metric: metrics[0].name, kind: def.kind === 'check' ? 'worsening' : def.kind } : { ...def, metric: undefined })}>
+                <option value="formula">a formula</option>
+                <option value="metric">a metric of this workbook</option>
+              </select>
+            )}
+            {def.metric !== undefined ? (
+              <select aria-label="Metric" value={def.metric} onChange={(e) => setDef({ ...def, metric: e.target.value })}>
+                {metrics.map((m) => (
+                  <option key={m.name} value={m.name}>
+                    {m.name}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input placeholder='Formula, e.g. =COUNTIFS(Inventory[Days in stock], ">90", Inventory[Reserved], "no")' value={def.formula} onChange={(e) => setDef({ ...def, formula: e.target.value })} onKeyDown={(e) => e.stopPropagation()} className="mono" />
+            )}
             <input placeholder="Scope and exclusions, in words" value={def.scope} onChange={(e) => setDef({ ...def, scope: e.target.value })} onKeyDown={(e) => e.stopPropagation()} />
             <div className="row wrap">
               <select value={def.kind} onChange={(e) => setDef({ ...def, kind: e.target.value as WatchDef['kind'] })}>
                 <option value="worsening">tell me when it gets worse</option>
                 <option value="threshold">tell me when it passes a limit</option>
-                <option value="check">must stay TRUE</option>
+                {def.metric === undefined && <option value="check">must stay TRUE</option>}
                 <option value="change">tell me when it changes</option>
               </select>
               {def.kind === 'worsening' && (
@@ -1052,7 +1069,7 @@ function WatchingView({ watches, fileId, investigations, canInvestigate, stack }
             <div className="row">
               <button
                 className="primary"
-                disabled={!def.formula?.trim()}
+                disabled={!def.formula?.trim() && !def.metric}
                 onClick={() => {
                   void addWatch(def).then((w) => w && setAdding(false));
                 }}

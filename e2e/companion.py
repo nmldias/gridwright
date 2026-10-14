@@ -4,7 +4,8 @@ file, read the brief — plus the gates behind it: context from successive snaps
 periods read from the file names, exclusions carried by the watches themselves, a change raised only
 once it is sustained over comparable snapshots, one evolving issue, "not checked" ≠ "no issues", a
 moved threshold as a decision, an agent's proposals ratified by a person, the graph and what a change
-reaches, the LangGraph cycle, and the model's reading only on request.
+reaches, the LangGraph cycle, a watch on a governed metric (7.5: the metric's definition, a new
+baseline when it is redefined, an error when it is removed), and the model's reading only on request.
 
 Usage: python3 e2e/companion.py [http://localhost:8787] [--mock-llm http://127.0.0.1:8899/v1]
 """
@@ -263,6 +264,38 @@ def main():
         check("a person confirms and approves from the panel; the approved watch is then evaluated", next(r for r in c["records"] if r["kind"] == "hypothesis")["status"] == "confirmed" and next(x for x in c["watches"] if x["id"] == pw["watch"])["authority"] == "approved" and len(next(x for x in c["watches"] if x["id"] == pw["watch"])["observations"]) >= 1, "")
         att, _ = mcp("list_attention", {"id": fid})
         check("MCP exposes the attention gate for a decision-case system", isinstance(att["issues"], list) and "brief" in att, "")
+
+        # ------------------------------------------------------------------ a watch on a governed metric (7.5)
+        def set_metric(metric, name="Landed total"):
+            page.evaluate("([n, m]) => window.__gw.book.apply({ type: 'set_metric', name: n, metric: m })", [name, metric])
+            time.sleep(0.8)  # relayed to the server's log
+
+        landed = [24150009, 24150009, 18629981, 22785000, 540000000]  # the 20 Oct snapshot
+        set_metric({"name": "Landed total", "table": "inventory", "measure": {"field": "Landed cost", "agg": "sum"}})
+        mw = rest("POST", f"/api/files/{fid}/companion/watches", {"purpose": "Landed total (metric)", "metric": "Landed total", "kind": "threshold", "op": ">", "value": 1e12, "sustain": 1})
+        mw = wait_companion(lambda c: any(x["id"] == mw["id"] and x["observations"] for x in c["watches"]))
+        mw = next(x for x in mw["watches"] if x["def"]["purpose"] == "Landed total (metric)")
+        check("a watch refers to a metric by name and is evaluated through the metric's definition (the same query as the charts)",
+              mw["def"].get("metric") == "Landed total" and mw["def"]["formula"] == "" and mw["observations"][-1]["value"] == sum(landed) and mw["health"] == "ok", f"{mw['health']} {mw['observations'][-1:]}")
+        set_metric({"name": "Landed total", "table": "inventory", "measure": {"field": "Landed cost", "agg": "average"}})
+        c = wait_companion(lambda c: any(x["id"] == mw["id"] and x["observations"] and x["observations"][-1]["value"] == sum(landed) / 5 for x in c["watches"]))
+        mw2 = next(x for x in c["watches"] if x["id"] == mw["id"])
+        redefined = [r for r in c["records"] if r["kind"] == "decision" and "Landed total" in r["text"] and "redefined" in r["text"]]
+        check("redefining the metric reaches the watch: the new value under a new baseline (not compared with the old one), recorded as a decision",
+              mw2["observations"][-1]["value"] == sum(landed) / 5 and mw2["observations"][-1]["def"] != mw["observations"][-1]["def"] and len(redefined) == 1, f"{mw2['observations'][-1:]} {len(redefined)}")
+        set_metric(None)
+        c = wait_companion(lambda c: any(x["id"] == mw["id"] and x["health"] == "error" for x in c["watches"]))
+        mw3 = next(x for x in c["watches"] if x["id"] == mw["id"])
+        check("removing the metric gives the watch an error naming it, never 'ok'", mw3["health"] == "error" and "no metric named" in (mw3["observations"][-1].get("error") or ""), f"{mw3['health']} {mw3['observations'][-1:]}")
+        pm, perr = mcp("propose_watch", {"id": fid, "purpose": "Landed total proposed", "metric": "Landed total", "kind": "worsening"})
+        both, berr = mcp("propose_watch", {"id": fid, "purpose": "Both", "metric": "Landed total", "formula": "=1", "kind": "threshold"})
+        c = companion()
+        pmw = next((x for x in c["watches"] if x["id"] == (pm or {}).get("watch")), None) if isinstance(pm, dict) else None
+        check("an agent proposes a metric watch by name over MCP (proposed, not approved); a watch of a formula and a metric at once is refused",
+              not perr and pmw and pmw["authority"] == "proposed" and pmw["def"].get("metric") == "Landed total" and berr and "not both" in str(both), f"{pm} / {both}")
+        rest("DELETE", f"/api/files/{fid}/companion/watches/{mw['id']}")
+        if pmw:
+            rest("DELETE", f"/api/files/{fid}/companion/watches/{pmw['id']}")
 
         # ------------------------------------------------------------------ the model only on request
         if MOCK:

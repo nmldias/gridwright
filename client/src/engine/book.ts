@@ -3,7 +3,7 @@
 
 import init, { Book } from './pkg/gridwright_core';
 import wasmUrl from './pkg/gridwright_core_bg.wasm?url';
-import type { AnalyticAnswer, AnalyticQuery, AnalyticRecords, DecompQuery, DecompTree, CellRef, CellValue, CellView, Changes, Chart, CheckView, NamedRange, Op, SignoffStatus, TableId, TableMeta, Trace } from './types';
+import type { AnalyticAnswer, AnalyticQuery, AnalyticRecords, DecompQuery, DecompTree, CellRef, CellValue, CellView, Changes, Chart, CheckView, Metric, NamedRange, Op, SignoffStatus, TableId, TableMeta, Trace } from './types';
 import { cellKey, isCodeKind } from './types';
 import { cellAt, readOnly, useStore } from '../state/store';
 import { setDecimalCommaDisplay } from '../grid/format';
@@ -83,6 +83,7 @@ export async function loadBook(json: string | null, name = 'Untitled', fileId: s
     cells,
     names: JSON.parse(book.names()) as NamedRange[],
     charts: JSON.parse(book.charts()) as Chart[],
+    metrics: JSON.parse(book.metrics()) as Metric[],
     decimalComma: book.decimal_comma(),
     selectedChart: null,
     trace: null,
@@ -262,6 +263,7 @@ export function applyChanges(changes: Changes) {
     ...(changes.names ? { names: changes.names } : {}),
     ...(changes.decimal_comma !== undefined ? { decimalComma: changes.decimal_comma } : {}),
     ...(changes.charts ? { charts: changes.charts } : {}),
+    ...(changes.metrics ? { metrics: changes.metrics } : {}),
     ...(changes.created_chart ? { selectedChart: changes.created_chart } : {}),
   });
   requestRedraw();

@@ -16,6 +16,7 @@ import * as review from './ui/review';
 import * as charts from './grid/charts';
 import * as crossfilter from './grid/crossfilter';
 import * as decomp from './grid/decomp';
+import * as metrics from './grid/metrics';
 import { printDocumentHtml } from './ui/print';
 import { applyTemplate } from './ui/templates';
 import { transformOp } from './api/ws';
@@ -75,6 +76,9 @@ applyThemeCss();
   /** the decomposition tree (roadmap 7.4): open it on a chart id, a table name or a tree state; the last tree shown */
   decomp,
   openDecomposition: decomp.openDecomposition,
+  /** governed metrics (roadmap 7.5): helpers, and the Metrics panel (optionally on a draft) */
+  metrics,
+  openMetrics: metrics.openMetrics,
   decompTree: decomp.decompTree,
   viewport: () => {
     const r = getRenderer();

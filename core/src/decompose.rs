@@ -451,7 +451,7 @@ struct W {
 }
 
 fn parts_of(m: &Measure, w: &W) -> Option<Parts> {
-    if w.value.status == "mixed_currency" {
+    if w.value.status == "mixed_currency" || w.value.status == "currency_mismatch" {
         return None;
     }
     match m.agg {
@@ -1117,6 +1117,14 @@ fn suggest(
             "No split suggested: the amounts under this node are in different currencies ({}), so their items cannot be ranked against each other; split by {} first.",
             codes.join(", "),
             cur_field
+        );
+        return out;
+    }
+    // a governed metric's reporting currency is not the one these amounts are in: nothing to rank
+    if node.value.status == "currency_mismatch" {
+        out.text = format!(
+            "No split suggested: the amounts under this node are not in the metric's currency ({}).",
+            m.fixed_currency.as_deref().unwrap_or("")
         );
         return out;
     }

@@ -437,6 +437,19 @@ export function describeOp(op: Record<string, unknown>): { range: string; detail
       return { range: '', detail: `${(op.cells as unknown[])?.length ?? 0} cell(s) restored (undo/redo)` };
     case 'restore_tables':
       return { range: '', detail: `${(op.tables as unknown[])?.length ?? 0} table(s) restored (undo/redo)` };
+    case 'set_metric': {
+      // governed metric (7.5): the definition in words, so the audit trail says what every number using it means
+      const m = op.metric as { table?: string; measure?: Record<string, string>; currency?: string; format?: string } | null;
+      if (!m) return { range: '', detail: `metric ${op.name} removed` };
+      const s = m.measure ?? {};
+      const what = s.agg === 'ratio' ? `ratio ${s.numerator} / ${s.denominator}` : `${s.agg || 'sum'}${s.field ? ` of ${s.field}` : ''}`;
+      const extra = [s.currency ? `currency column ${s.currency}` : '', m.currency ? `reporting ${m.currency}` : '', m.format ? `format ${m.format}` : ''].filter(Boolean).join('; ');
+      return { range: '', detail: `metric ${op.name} = ${what} on ${m.table ?? ''}${extra ? `; ${extra}` : ''}`.slice(0, 300) };
+    }
+    case 'rename_metric':
+      return { range: '', detail: `metric ${op.name} renamed to ${op.to}` };
+    case 'restore_metrics':
+      return { range: '', detail: `${(op.metrics as unknown[])?.length ?? 0} metric(s) restored (undo/redo)` };
     default:
       return { range: '', detail: '' };
   }

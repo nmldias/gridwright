@@ -13,6 +13,7 @@ import type { Chart, KeyValue } from '../engine/types';
 import * as book from '../engine/book';
 import { getState, type MarkSelection } from '../state/store';
 import { currentField, drillLevel, incoming, keyId, ownSelection, pathLabels, pathSelections } from './crossfilter';
+import { formatMetricValue } from './metrics';
 
 export const PALETTE = {
   navy: '#0C447C',
@@ -28,6 +29,9 @@ const SERIES_COLORS = [PALETTE.navy, PALETTE.lightNavy, PALETTE.grey, '#C9D6E3',
 
 export interface ChartSeriesData {
   name: string;
+  /** a governed metric's display format and reporting currency (stat cards show values with them) */
+  format?: string;
+  currency?: string;
   values: (number | null)[];
   color: string;
 }
@@ -177,6 +181,8 @@ export function analyticData(chart: Chart, sels?: Record<number, MarkSelection>)
     name: m.name,
     values: a.groups.map((g) => g.values[i].value),
     color: SERIES_COLORS[i % SERIES_COLORS.length],
+    ...(m.format ? { format: m.format } : {}),
+    ...(m.currency ? { currency: m.currency } : {}),
   }));
   const strip: NonNullable<ChartData['strip']> = [];
   const lvl = drillLevel(chart);
@@ -203,6 +209,7 @@ export function analyticData(chart: Chart, sels?: Record<number, MarkSelection>)
   a.measures.forEach((m, i) => {
     const t = a.total[i];
     if (t.status === 'mixed_currency') strip.push({ text: `${m.name}: amounts in ${(t.by_currency ?? []).map((c) => c.currency || '(none)').join(', ')} are not added together`, tone: 'warn' });
+    else if (t.status === 'currency_mismatch') strip.push({ text: `${m.name}: reported in ${m.currency}, but these amounts are in ${(t.by_currency ?? []).map((c) => c.currency || '(none)').join(', ')} — not converted`, tone: 'warn' });
     else if (t.missing + t.invalid > 0 && m.agg !== 'count' && m.agg !== 'count_distinct') strip.push({ text: `${m.name}: ${t.missing + t.invalid} value(s) blank or not a number — left out, not counted as 0`, tone: 'warn' });
   });
   if (a.excluded.by_table_filter > 0) strip.push({ text: `${a.excluded.by_table_filter.toLocaleString('en-US')} rows hidden by the table's filters are left out`, tone: 'warn' });
@@ -317,21 +324,23 @@ function statCards(chart: Chart, data: ChartData): { label: string; value: strin
   const additive = !data.additive || data.additive[0];
   // "Amount" → "total amount", but acronyms such as "In AOA" keep their case
   const name = /[A-Z]/.test(s.name.slice(1)) ? s.name : s.name.charAt(0).toLowerCase() + s.name.slice(1);
+  // a governed metric's values are shown in its own format (one definition everywhere)
+  const fv = (v: number) => formatMetricValue(v, s) ?? fmtNum(v);
   const cards: { label: string; value: string; accent?: string }[] = additive
     ? [
-        { label: `Total ${name}`, value: fmtNum(total) },
-        { label: `Average per ${data.categories.length > 12 ? 'point' : 'category'}`, value: fmtNum(total / vals.length) },
+        { label: `Total ${name}`, value: fv(total) },
+        { label: `Average per ${data.categories.length > 12 ? 'point' : 'category'}`, value: fv(total / vals.length) },
       ]
     : [];
   const hi = chart.highlight ?? null;
   if (hi !== null && hi >= 0 && hi < s.values.length && s.values[hi] !== null) {
-    cards.push({ label: `${data.categories[hi]} (highlighted)`, value: fmtNum(s.values[hi] as number), accent: PALETTE.coral });
+    cards.push({ label: `${data.categories[hi]} (highlighted)`, value: fv(s.values[hi] as number), accent: PALETTE.coral });
   } else {
     let best = 0;
     s.values.forEach((v, i) => {
       if (v !== null && (s.values[best] === null || v > (s.values[best] as number))) best = i;
     });
-    cards.push({ label: `Highest: ${data.categories[best]}`, value: fmtNum(s.values[best] as number) });
+    cards.push({ label: `Highest: ${data.categories[best]}`, value: fv(s.values[best] as number) });
   }
   return cards;
 }

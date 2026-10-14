@@ -232,11 +232,127 @@ hold at Excel's precision, not beyond it.
 against an independent reference, `engine_limits.mjs` the bounds, and `e2e/decomposition_ui.py` the panel
 in the browser.
 
+## Governed metrics (7.5)
+
+A workbook keeps named definitions of its measures. Charts, the decomposition tree, drill-through, the
+assistant and companion watches refer to a metric **by name**, so one definition is used everywhere: a
+change to it reaches every number that uses it, and nothing restates it. Engine: `core/src/metrics.rs`
+(definition rules, resolution), the ops in `core/src/engine.rs`, `Book.metrics()`.
+
+### Definition
+
+```json
+{ "name": "Net revenue", "table": "Sales",
+  "measure": { "agg": "sum", "field": "Amount", "currency": "Currency" },
+  "currency": "EUR", "format": "#,##0.00", "description": "Invoiced amount before returns" }
+```
+
+| Field | Meaning | Checked when defined |
+|---|---|---|
+| `name` | unique in the workbook ignoring case; the label of the measure everywhere | 1–64 characters, starts with a letter; letters, digits, spaces, `_`, `.`, `-`; not a cell reference |
+| `table` | the table it reads (follows a table rename) | must exist and have a header row; stored as the workbook spells it |
+| `measure` | `agg`, `field` / `numerator` + `denominator`, `currency` (header of a column holding each row's currency code), exactly as in a query | must resolve against the table (the same errors as a query); cannot itself refer to a metric; stored without a label |
+| `currency` | reporting currency: a three-letter code, stored upper case | `^[A-Z]{3}$`; not on a count |
+| `format` | display pattern in the canonical syntax (`#,##0.00`, `0%`, `€#,##0.00`, `currency:EUR`) | at most 64 characters |
+| `description` | what it means, includes and leaves out | at most 2,000 characters |
+
+At most 500 metrics per workbook. A workbook without metrics is written exactly as before (the
+`metrics` key is left out), so older documents load and save unchanged.
+
+### Operations and undo
+
+| Op | Effect | Undo |
+|---|---|---|
+| `set_metric {name, metric}` | defines or replaces (same name ignoring case) the metric; `metric: null` removes it. The definition's name must equal `name` (a rename is its own op) | `restore_metrics` |
+| `rename_metric {name, to}` | renames it and rewrites every analytical chart's reference to it | `restore_metrics` + `restore_charts` |
+| `restore_metrics {metrics}` | the relay form of undo/redo | itself undoable |
+
+Each is an ordinary operation: in the server's log (with a readable detail in the audit CSV), relayed to
+other editors, replayed by the server, and changing no formula (no recalculation). A table rename rewrites
+`metric.table` as it rewrites chart bindings and names; its undo now restores all of them, not only the
+table (and an inserted/deleted row's undo restores the chart ranges and names it shifted).
+
+### Referring to a metric
+
+A measure spec carrying only `metric` (a `name` may relabel it) is a reference:
+
+```json
+{ "dims": ["Region"], "measures": [{ "metric": "Net revenue" }] }
+```
+
+`analyze`, `analyze_records` and `decompose` replace it with the stored definition before planning, so they
+all compute it the same way. The query's `table` may be left empty (it is the metric's); naming another
+table, mixing metrics of two tables, or giving a reference fields of its own is an error. The answer's
+`measures[i]` echoes `metric`, `format`, `currency` and `description`, so a chart, a tree or a record list
+shows the value with the metric's format.
+
+| Situation | Answer |
+|---|---|
+| no such metric (removed, misspelt) | error `no metric named "X"` |
+| the data drifted (a renamed column, a deleted table) | error `metric "X": field "Amount" is not a header of table "Sales"` / `metric "X": no table named "Sales"` |
+| query on another table | error `metric "X" is defined on table "Sales", not "Fleet"` |
+
+A metric is never repaired silently and never reads as a number when it cannot be computed: its charts show
+the error in place of bars, the Metrics panel marks it *broken* with the same reason, a watch on it is in
+*error*.
+
+### Change, rename, remove
+
+* **Change**: references hold only the name, so a redefinition reaches every chart, tree and watch with no
+  chart operation.
+* **Rename**: charts are rewritten in the same operation. Companion watches live outside the document and are
+  not rewritten: after a rename a watch reads `no metric named "old name"` (health *error*) until pointed at
+  the new name — never a silent *ok*.
+* **Remove**: allowed while in use (deterministic, undoable, replays everywhere); the panel asks first
+  (*Used by 2 charts. Remove anyway?*) and the references then fail explicitly until it is defined again.
+
+### Currency
+
+The measure's currency column keeps currencies apart as for any query (`mixed_currency` with the amount per
+currency). The metric's reporting currency adds two things: the value is labelled with it (`currency` on the
+value, also with no currency column), and with a currency column every contributing row must be in it — a
+group whose rows are all in another single currency (or blank) gives `status: "currency_mismatch"`, no value,
+the amount per currency, and an issue *the metric reports in AOA but these amounts are in EUR*. Nothing is
+converted.
+
+### Consumers
+
+* **Charts**: a measure row offers *Metric: …* (metrics on the chart's table) or *Custom…*; *Save as
+  metric…* turns an inline measure into a metric and the row into a reference; stat cards show values in the
+  metric's format.
+* **Decomposition**: the measure list has a *Metrics* group; the tree's values use the metric's format.
+* **Drill-through**: the record list's fields and totals come from the resolved definition.
+* **Assistant**: its context lists each metric canonically (`Net revenue = sum of Sales[Amount]; currency
+  column Currency; reporting EUR; format #,##0.00 — …`) and each analytical chart with the metrics it uses;
+  the prompt says to refer to metrics by name. Actions: `define_metric` (→ `set_metric`) and `add_chart` with
+  `dims` and `metrics` (a chart bound by name), in the client, in server proposals and over MCP; MCP
+  `read_document` returns `metrics` and the charts' bindings.
+* **Companion watches**: `metric` instead of `formula` (threshold, change or worsening; not *check*). The
+  watch is evaluated through `analyze` (the metric's total); a status other than ok (incomplete, no data,
+  mixed currency, currency mismatch, ÷0) is *invalid*, never within bounds. The watch's definition hash
+  includes a fingerprint of the metric's definition (table, measure, reporting currency), so a redefinition
+  starts a new baseline and is recorded as a decision; a missing metric is an *error*.
+
+### Limits
+
+| Bound | Value | Beyond it |
+|---|---|---|
+| Metrics per workbook | 500 | error |
+| Name / format / description | 64 / 64 / 2,000 characters | error |
+| Metric of a metric | not allowed | error |
+
+`core/src/metrics.rs` (14 tests) and `engine.rs` check the rules and undo; `e2e/metrics.mjs` checks the
+numbers on the 10,000-vehicle inventory against an independent reference, `engine_limits.mjs` the bounds,
+`e2e/metrics_ui.py` the panel, the pickers, the assistant and a watch in the browser, and `e2e/companion.py`
+the watches.
+
 ## What it does not do yet
 
 One table per query. There are no relationships, so there is no fan-out across a join (7.6). Currencies
-are refused when mixed, not converted. Metrics are given inline, not yet as governed workbook definitions
-(7.5). Permissions are per document, so a query sees what the document's reader sees.
+are refused when mixed, not converted. A governed metric is one plain measure (an aggregation of a column,
+or a ratio of two sums) on one table: no filters, calculated columns or metrics built from metrics.
+Permissions are per document, so a query sees what the document's reader sees.
 
-A decomposition tree has one measure; it cannot be saved or locked with the document (7.5); a tree node
-does not cross-filter charts; the tree is not printable.
+A decomposition tree has one measure; the tree view itself is not saved or locked with the document (the
+metric it breaks down can be, as a governed metric); a tree node does not cross-filter charts; the tree is
+not printable.

@@ -36,6 +36,7 @@ interface Doc {
   tables: DocTable[];
   charts?: { id: number; title: string; kind: string }[];
   names?: { name: string; reference: string }[];
+  metrics?: { name: string; table: string; measure: Record<string, string>; currency?: string; format?: string; description?: string }[];
 }
 
 const MAX = 500;
@@ -103,5 +104,18 @@ export function diffDocuments(jsonA: string, jsonB: string, a: number, b: number
   const nb = new Map((B.names ?? []).map((n) => [n.name, n.reference]));
   for (const [n, ref] of nb) if (na.get(n) !== ref) lines.push({ kind: na.has(n) ? 'changed' : 'added', where: `name ${n}`, before: na.get(n) ?? '', after: ref });
   for (const [n, ref] of na) if (!nb.has(n)) lines.push({ kind: 'removed', where: `name ${n}`, before: ref, after: '' });
+  // governed metrics: a changed definition is a change of every number that uses it
+  const mText = (m: NonNullable<Doc['metrics']>[number]) => {
+    const s = m.measure ?? {};
+    const what = s.agg === 'ratio' ? `ratio ${s.numerator} / ${s.denominator}` : `${s.agg || 'sum'}${s.field ? ' of ' + s.field : ''}`;
+    return [`${m.table}: ${what}`, s.currency ? `currency column ${s.currency}` : '', m.currency ? `reporting ${m.currency}` : '', m.format ? `format ${m.format}` : '', m.description ?? ''].filter(Boolean).join('; ');
+  };
+  const ma = new Map((A.metrics ?? []).map((m) => [m.name.toLowerCase(), m]));
+  const mb = new Map((B.metrics ?? []).map((m) => [m.name.toLowerCase(), m]));
+  for (const [k, m] of mb) {
+    const before = ma.get(k);
+    if (!before || mText(before) !== mText(m)) lines.push({ kind: before ? 'changed' : 'added', where: `metric ${m.name}`, before: before ? mText(before) : '', after: mText(m) });
+  }
+  for (const [k, m] of ma) if (!mb.has(k)) lines.push({ kind: 'removed', where: `metric ${m.name}`, before: mText(m), after: '' });
   return { a, b, lines: lines.slice(0, MAX), truncated: lines.length > MAX };
 }

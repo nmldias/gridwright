@@ -165,6 +165,31 @@ export interface MeasureSpec {
   denominator?: string;
   /** header of a column holding each row's currency code */
   currency?: string;
+  /** a reference to a governed metric by name (7.5): the workbook's definition is used and the
+   * fields above stay empty (`name` may still relabel it) */
+  metric?: string;
+}
+/** A governed metric (roadmap 7.5, core/src/metrics.rs): one definition of a measure saved with
+ * the workbook, referred to by name from charts, decomposition, the assistant and watches. */
+export interface Metric {
+  name: string;
+  table: string;
+  measure: MeasureSpec;
+  /** reporting currency (ISO code, upper case); never converted */
+  currency?: string;
+  /** canonical number-format pattern for display */
+  format?: string;
+  description?: string;
+}
+/** How the engine resolved a measure; the metric fields are set for a governed metric. */
+export interface MeasureInfo {
+  name: string;
+  agg: string;
+  additive: boolean;
+  metric?: string;
+  format?: string;
+  currency?: string;
+  description?: string;
 }
 export interface ChartAnalytic {
   table: string;
@@ -191,7 +216,7 @@ export interface AnalyticQuery {
 }
 export interface MeasureValue {
   value: number | null;
-  status: 'ok' | 'incomplete' | 'no_data' | 'mixed_currency' | 'div0';
+  status: 'ok' | 'incomplete' | 'no_data' | 'mixed_currency' | 'currency_mismatch' | 'div0';
   n: number;
   missing: number;
   invalid: number;
@@ -202,7 +227,7 @@ export interface AnalyticAnswer {
   error?: string;
   table: string;
   dims: string[];
-  measures: { name: string; agg: string; additive: boolean }[];
+  measures: MeasureInfo[];
   groups: { key: KeyValue[]; label: string[]; rows: number; members?: number[]; values: MeasureValue[] }[];
   total: MeasureValue[];
   excluded: { rows: number; by_selection: number; by_table_filter: number; values: MeasureValue[] };
@@ -301,7 +326,7 @@ export interface DecompSuggestion {
 }
 export interface DecompTree {
   table: string;
-  measure: { name: string; agg: string; additive: boolean };
+  measure: MeasureInfo;
   top_n: number;
   root: DecompNode;
   excluded: AnalyticAnswer['excluded'];
@@ -314,7 +339,7 @@ export interface AnalyticRecords {
   error?: string;
   table: string;
   fields: string[];
-  measures: { name: string; agg: string; additive: boolean }[];
+  measures: MeasureInfo[];
   total: MeasureValue[];
   count: number;
   truncated: boolean;
@@ -386,6 +411,8 @@ export interface Changes {
   created_chart?: number;
   /** the workbook's decimal-comma setting, when it changed */
   decimal_comma?: boolean;
+  /** governed metrics after the op, when they changed */
+  metrics?: Metric[];
   /** undo/redo: restore ops that reproduce the change on other clients */
   ops?: Op[];
 }
@@ -455,7 +482,12 @@ export type Op =
   | { type: 'restore_names'; names: NamedRange[] }
   | { type: 'restore_charts'; charts: Chart[] }
   /** type and show numbers with a decimal comma ("1.234,56") in this workbook */
-  | { type: 'set_decimal_comma'; on: boolean };
+  | { type: 'set_decimal_comma'; on: boolean }
+  /** define, replace (same name ignoring case) or remove (metric null) a governed metric */
+  | { type: 'set_metric'; name: string; metric: Metric | null }
+  /** rename a metric; analytical charts referring to it follow */
+  | { type: 'rename_metric'; name: string; to: string }
+  | { type: 'restore_metrics'; metrics: Metric[] };
 
 /** Ops that change the shape of a table (row/column indices shift). */
 export const STRUCTURAL_OPS = new Set<Op['type']>(['resize_table', 'insert_rows', 'delete_rows', 'insert_cols', 'delete_cols', 'delete_table', 'add_table', 'set_pivot', 'rename_table', 'set_header_rows', 'restore_tables']);

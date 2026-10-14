@@ -65,6 +65,7 @@ export const WatchDefSchema = z.object({
   purpose: optText(200),
   scope: optText(400),
   formula: optText(2000),
+  metric: optText(64),
   table: optText(120),
   kind: z.enum(['threshold', 'check', 'change', 'worsening']).optional(),
   op: z.enum(['>', '>=', '<', '<=', '=', '!=']).optional(),

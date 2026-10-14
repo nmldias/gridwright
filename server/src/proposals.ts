@@ -25,7 +25,19 @@ export interface Action {
   name?: string;
   rows?: number;
   cols?: number;
-  format?: Record<string, unknown>;
+  /** set_format: the format object; define_metric: the number-format pattern */
+  format?: Record<string, unknown> | string;
+  /** define_metric (governed metrics, 7.5) */
+  agg?: string;
+  field?: string;
+  numerator?: string;
+  denominator?: string;
+  currency_column?: string;
+  currency?: string;
+  description?: string;
+  /** add_chart bound to a table: dimensions and metric names */
+  dims?: string[];
+  metrics?: string[];
   kind?: string;
   title?: string;
   subtitle?: string;
@@ -126,6 +138,9 @@ export function actionsToOps(book: ReturnType<typeof openDocument>['book'], acti
     if (!p) throw new Error(`bad ref ${act.ref}`);
     return p;
   };
+  // metrics the document has, plus those this batch defines (a chart may use one defined just before)
+  const metricTables = new Map<string, { name: string; table: string }>();
+  for (const m of JSON.parse(book.metrics()) as { name: string; table: string }[]) metricTables.set(m.name.trim().toLowerCase(), m);
   for (const act of actions) {
     try {
       switch (act.action) {
@@ -180,14 +195,64 @@ export function actionsToOps(book: ReturnType<typeof openDocument>['book'], acti
         case 'set_format': {
           const table = resolveTable(act);
           const p = ref(act);
-          const f = (act.format ?? {}) as Record<string, unknown>;
+          const f = (typeof act.format === 'object' && act.format ? act.format : {}) as Record<string, unknown>;
           const format: Record<string, unknown> = {};
           for (const k of ['bold', 'italic', 'align', 'number_format', 'fill', 'color', 'wrap']) if (f[k] !== undefined) format[k] = f[k];
           ops.push({ type: 'set_format', table, r0: p.r0, c0: p.c0, r1: p.r1, c1: p.c1, format });
           break;
         }
+        case 'define_metric': {
+          const name = str(act.name).trim();
+          const metric = {
+            name,
+            table: str(act.table).trim(),
+            measure: { agg: str(act.agg) || 'sum', field: str(act.field), numerator: str(act.numerator), denominator: str(act.denominator), currency: str(act.currency_column) },
+            currency: str(act.currency).toUpperCase(),
+            format: typeof act.format === 'string' ? act.format : '',
+            description: str(act.description),
+          };
+          ops.push({ type: 'set_metric', name, metric });
+          metricTables.set(name.toLowerCase(), { name, table: metric.table });
+          break;
+        }
         case 'add_chart': {
           const kind = CHART_KINDS.includes(String(act.kind)) ? String(act.kind) : 'bar';
+          if (act.metrics?.length) {
+            // an analytical chart that refers to governed metrics by name
+            const defs = act.metrics.map((n) => {
+              const m = metricTables.get(str(n).trim().toLowerCase());
+              if (!m) throw new Error(`no metric named "${n}"`);
+              return m;
+            });
+            const dims = (act.dims ?? []).map(str).filter(Boolean);
+            if (!dims.length) throw new Error('a chart of metrics needs a dimension (dims)');
+            const table = act.table ? str(act.table) : defs[0].table;
+            const charts = JSON.parse(book.charts()) as unknown[];
+            const names = defs.map((m) => m.name).join(', ');
+            ops.push({
+              type: 'add_chart',
+              chart: {
+                id: 0,
+                kind,
+                title: str(act.title) || `${names} by ${dims[0]}`,
+                subtitle: str(act.subtitle) || `${table}, ${names}`,
+                exhibit: str(act.exhibit) || `Exhibit ${charts.length + 1}`,
+                source: str(act.source) || table,
+                x: 900,
+                y: 80,
+                w: 560,
+                h: 380,
+                categories: '',
+                series: [],
+                highlight: null,
+                reference: null,
+                show_values: true,
+                stat_cards: true,
+                analytic: { table, dims, measures: defs.map((m) => ({ agg: '', metric: m.name })), sort: 'value_desc' },
+              },
+            });
+            break;
+          }
           const series = (act.series ?? []).filter((x) => x && x.range).map((x, i) => ({ name: str(x.name) || `Series ${i + 1}`, range: str(x.range) }));
           if (!series.length) throw new Error('a chart needs at least one series');
           const charts = JSON.parse(book.charts()) as unknown[];
@@ -254,8 +319,15 @@ export function validateActions(doc: string, actions: Action[]): { ops: Record<s
     const preview = diffBooks(before, book, Array.from(touched).filter((t) => t >= 0));
     for (const op of applied) {
       if (op.type === 'add_chart') {
-        const c = op.chart as { kind: string; title: string; series: { range: string }[] };
-        preview.push({ where: 'chart', before: '', after: `${c.kind}: ${c.title} (${c.series.map((s) => s.range).join(', ')})` });
+        const c = op.chart as { kind: string; title: string; series: { range: string }[]; analytic?: { dims: string[]; measures: { metric?: string }[] } };
+        const what = c.analytic ? `metrics ${c.analytic.measures.map((m) => m.metric).join(', ')} by ${c.analytic.dims.join(' › ')}` : c.series.map((s) => s.range).join(', ');
+        preview.push({ where: 'chart', before: '', after: `${c.kind}: ${c.title} (${what})` });
+      }
+      if (op.type === 'set_metric') {
+        const m = op.metric as { name: string; table: string; measure: { agg: string; field: string; numerator: string; denominator: string } } | null;
+        const prev = (JSON.parse(before.metrics()) as { name: string; table: string; measure: { agg: string; field: string } }[]).find((x) => x.name.toLowerCase() === String(op.name).toLowerCase());
+        const text = (x: { table: string; measure: { agg: string; field?: string; numerator?: string; denominator?: string } }) => (x.measure.agg === 'ratio' ? `ratio of ${x.table}[${x.measure.numerator}] to ${x.table}[${x.measure.denominator}]` : `${x.measure.agg || 'sum'} of ${x.table}[${x.measure.field}]`);
+        preview.push({ where: `metric ${String(op.name)}`, before: prev ? text(prev) : '', after: m ? text(m) : '(removed)' });
       }
     }
     return { ops: applied, preview, errors, seq };

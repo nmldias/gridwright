@@ -17,19 +17,25 @@ const OPS: Op[] = ['>', '>=', '<', '<=', '=', '!='];
 
 export function normaliseDef(input: Partial<WatchDef>): WatchDef {
   const kind: WatchKind = input.kind === 'check' || input.kind === 'change' || input.kind === 'worsening' ? input.kind : 'threshold';
-  const formula = String(input.formula ?? '').trim();
-  if (!formula) throw new Error('formula required');
+  const metric = String(input.metric ?? '').trim();
+  const formula = metric ? '' : String(input.formula ?? '').trim();
+  if (!formula && !metric) throw new Error('formula or metric required');
+  if (metric && String(input.formula ?? '').trim()) throw new Error('a watch reads a formula or a metric, not both');
+  if (metric && kind === 'check') throw new Error('a metric is a number: watch it against a threshold, for change or for worsening');
+  if (metric.length > 64) throw new Error('a metric name has at most 64 characters');
   const def: WatchDef = {
     purpose: String(input.purpose ?? '').trim().slice(0, 300) || 'Watch',
     scope: String(input.scope ?? '').trim().slice(0, 500),
     formula: formula.slice(0, 2000),
+    ...(metric ? { metric } : {}),
     table: input.table ? String(input.table).slice(0, 120) : undefined,
     kind,
     sustain: Math.max(1, Math.min(50, Math.round(Number(input.sustain ?? 1) || 1))),
     response: input.response === 'case' || input.response === 'note' ? input.response : 'brief',
     sources: Array.isArray(input.sources) ? input.sources.map((x) => String(x).slice(0, 120)).slice(0, 20) : undefined,
     freshnessHours: typeof input.freshnessHours === 'number' && input.freshnessHours > 0 ? input.freshnessHours : undefined,
-    complement: input.complement ? String(input.complement).trim().slice(0, 2000) : undefined,
+    // the population a metric leaves out belongs in the metric's definition, not in a formula beside it
+    complement: input.complement && !metric ? String(input.complement).trim().slice(0, 2000) : undefined,
   };
   if (kind === 'threshold') {
     def.op = OPS.includes(input.op as Op) ? (input.op as Op) : '>';
@@ -38,15 +44,50 @@ export function normaliseDef(input: Partial<WatchDef>): WatchDef {
   if (kind === 'worsening') def.bad = input.bad === 'down' ? 'down' : 'up';
   return def;
 }
-const hashDef = (d: WatchDef) => createHash('sha256').update(JSON.stringify([d.formula, d.table ?? '', d.kind, d.op ?? '', d.value ?? '', d.bad ?? '', d.scope])).digest('hex').slice(0, 12);
+// a metric watch's identity includes the metric's definition: redefining the metric is a new definition of the watch
+const hashDef = (d: WatchDef, metricFp?: string) => createHash('sha256').update(JSON.stringify([d.formula, d.table ?? '', d.kind, d.op ?? '', d.value ?? '', d.bad ?? '', d.scope, ...(d.metric ? [d.metric.toLowerCase(), metricFp ?? ''] : [])])).digest('hex').slice(0, 12);
+
+interface MetricDefJson {
+  name: string;
+  table: string;
+  measure: Record<string, string>;
+  currency?: string;
+  format?: string;
+}
+/** The document's metric of that name (ignoring case), or undefined. */
+function metricOf(book: { metrics(): string }, name: string): MetricDefJson | undefined {
+  const n = name.trim().toLowerCase();
+  return (JSON.parse(book.metrics()) as MetricDefJson[]).find((m) => m.name.trim().toLowerCase() === n);
+}
+/** What the numbers of a metric depend on: table, measure and reporting currency (not its label, format or description). */
+export function metricFingerprint(m: MetricDefJson): string {
+  const s = m.measure ?? {};
+  return createHash('sha256').update(JSON.stringify([m.table.toLowerCase(), s.agg ?? '', s.field ?? '', s.numerator ?? '', s.denominator ?? '', s.currency ?? '', m.currency ?? ''])).digest('hex').slice(0, 12);
+}
+/** The fingerprint of a document's metric now (undefined when it is not defined or the document cannot be read). */
+function currentMetricFp(doc: string, name: string): string | undefined {
+  try {
+    const { book } = openDocument(doc);
+    try {
+      const m = metricOf(book, name);
+      return m ? metricFingerprint(m) : undefined;
+    } finally {
+      book.free();
+    }
+  } catch {
+    return undefined;
+  }
+}
 
 export function addWatch(doc: string, by: Author, origin: 'user' | 'agent', input: Partial<WatchDef>): Watch {
   const s = loadState(doc);
   const def = normaliseDef(input);
+  const metricFp = def.metric ? currentMetricFp(doc, def.metric) : undefined;
   const w: Watch = {
     id: newId(),
     def,
-    defHash: hashDef(def),
+    defHash: hashDef(def, metricFp),
+    ...(metricFp ? { metricFp } : {}),
     // a person's watch is approved; an agent may only propose
     authority: origin === 'agent' ? 'proposed' : 'approved',
     by,
@@ -74,8 +115,13 @@ export function updateWatch(doc: string, id: string, by: Author, patch: { approv
     event(s, { kind: 'watch', text: `Approved watch: ${w.def.purpose}`, by: who(by), level: 'quiet' });
   }
   if (patch.def) {
-    const next = normaliseDef({ ...w.def, ...patch.def });
-    const nextHash = hashDef(next);
+    // switching between a formula and a metric replaces the other
+    const merged = { ...w.def, ...patch.def };
+    if (patch.def.metric) merged.formula = '';
+    else if (patch.def.formula) delete merged.metric;
+    const next = normaliseDef(merged);
+    const nextFp = next.metric ? (currentMetricFp(doc, next.metric) ?? w.metricFp) : undefined;
+    const nextHash = hashDef(next, nextFp);
     const ruleMoved = ruleText(w.def) !== ruleText(next);
     const materially = nextHash !== w.defHash;
     if (ruleMoved) {
@@ -85,6 +131,7 @@ export function updateWatch(doc: string, id: string, by: Author, patch: { approv
       event(s, { kind: 'decision', text, by: who(by), level: 'watch' });
     }
     w.def = next;
+    w.metricFp = nextFp;
     if (materially) {
       w.defHash = nextHash;
       // earlier observations are no longer comparable: the baseline is rebuilt
@@ -149,9 +196,26 @@ export function sourceStatus(doc: string, entries?: LogEntry[], state?: Companio
 }
 // ------------------------------------------------------------------ checks
 type Plain = number | boolean | string | null;
-export function evaluate(doc: string, def: WatchDef, formula = def.formula): { value: Plain; error?: string } {
+const METRIC_STATUS: Record<string, string> = {
+  incomplete: 'some amounts are blank or not numbers',
+  no_data: 'no amounts',
+  mixed_currency: 'amounts in different currencies are not added together',
+  currency_mismatch: "amounts are not in the metric's reporting currency",
+  div0: 'the denominator is 0',
+};
+export function evaluate(doc: string, def: WatchDef, formula = def.formula): { value: Plain; error?: string; invalid?: Invalid; note?: string } {
   const { book } = openDocument(doc);
   try {
+    if (def.metric && formula === def.formula) {
+      // a governed metric: the same definition (and the same engine query) the charts use
+      const a = JSON.parse(book.analyze(JSON.stringify({ table: '', dims: [], measures: [{ metric: def.metric }] }))) as { error?: string; total?: { value: number | null; status: string; missing: number; invalid: number; by_currency?: { currency: string }[] }[] };
+      if (a.error) return { value: null, error: a.error };
+      const t = a.total?.[0];
+      if (!t) return { value: null, error: 'no total' };
+      // never "within bounds" on a partial or unaddable number
+      if (t.status !== 'ok') return { value: t.value, invalid: 'unavailable', note: `metric ${def.metric}: ${METRIC_STATUS[t.status] ?? t.status}` };
+      return { value: t.value };
+    }
     const t = def.table ? tableByName(book, def.table) : tableMetas(book)[0];
     if (!t) return { value: null, error: def.table ? `table “${def.table}” not found` : 'the document has no table' };
     const v = JSON.parse(book.preview(t.id, formula)) as { n?: number; b?: boolean; s?: string; e?: string } | null;
@@ -222,10 +286,35 @@ export function checkDocument(doc: string, reason = 'change', changedTables: num
     const byPeriod = (a: Observation, b: Observation) => (sortKey(a) < sortKey(b) ? -1 : sortKey(a) > sortKey(b) ? 1 : a.at < b.at ? -1 : a.at > b.at ? 1 : 0);
     for (const w of s.watches) {
       if (w.authority !== 'approved') continue;
-      const { value, error } = evaluate(doc, w.def);
+      // a metric watch whose metric was redefined: earlier observations are not comparable (a decision on record)
+      const metricDef = w.def.metric ? metricOf(book, w.def.metric) : undefined;
+      if (w.def.metric && metricDef) {
+        const fp = metricFingerprint(metricDef);
+        if (!w.metricFp) {
+          w.metricFp = fp;
+          w.defHash = hashDef(w.def, fp);
+        } else if (w.metricFp !== fp) {
+          w.metricFp = fp;
+          w.defHash = hashDef(w.def, fp);
+          const text = `Metric “${metricDef.name}” was redefined; “${w.def.purpose}” starts a new baseline`;
+          s.records.push({ id: newId(), kind: 'decision', text, arrivedAt: now(), by: { id: 'companion', name: 'the companion' }, origin: 'system', status: 'stated', source: 'metric definition' });
+          event(s, { kind: 'decision', text, level: 'watch' });
+          if (w.issue && w.issue.status === 'open') {
+            w.issue.status = 'resolved';
+            w.issue.resolvedAt = now();
+            w.issue.next = 'The metric was redefined; the issue was closed and a new baseline is being built.';
+            w.history.push(w.issue);
+            w.issue = undefined;
+          }
+          changed = true;
+        }
+      }
+      const ev = evaluate(doc, w.def);
+      const { value, error } = ev;
       const complement = w.def.complement ? evaluate(doc, w.def, w.def.complement) : null;
       const complementValue = complement && !complement.error && typeof complement.value === 'number' ? complement.value : complement ? null : undefined;
-      const readTables = tablesReferenced(w.def.formula, metas);
+      const metricTable = metricDef ? metas.find((m) => m.name.toLowerCase() === metricDef.table.toLowerCase()) : undefined;
+      const readTables = w.def.metric ? (metricTable ? [metricTable.id] : []) : tablesReferenced(w.def.formula, metas);
       const ctxTable = !readTables.length && w.def.table ? metas.find((m) => m.name.toLowerCase() === w.def.table!.toLowerCase()) : undefined;
       const tablesRead = readTables.length ? readTables : ctxTable ? [ctxTable.id] : metas[0] ? [metas[0].id] : [];
       const period = tablesRead.map((t) => periodOfTable.get(t)).find(Boolean);
@@ -244,6 +333,7 @@ export function checkDocument(doc: string, reason = 'change', changedTables: num
       // typed invalid states: a blank, a text or an error is never "within bounds"
       let invalid: Invalid | undefined;
       if (error) invalid = 'error';
+      else if (ev.invalid) invalid = ev.invalid;
       else if (w.def.kind === 'check') invalid = typeof value === 'boolean' ? undefined : value === null ? 'blank' : 'text';
       else invalid = typeof value === 'number' ? undefined : value === null ? 'blank' : 'text';
       // observation identity: one per (definition, period); the same period is revised, never counted twice
@@ -253,7 +343,7 @@ export function checkDocument(doc: string, reason = 'change', changedTables: num
       const earlier = mine.filter((o) => o !== obs).sort(byPeriod);
       const prevOrdered = [...earlier].reverse().find((o) => sortKey(o) <= (period ?? '\uffff') && !o.error && !o.invalid);
       let comparable: boolean = true;
-      let note: string | undefined;
+      let note: string | undefined = ev.note;
       if (prevOrdered && typeof prevOrdered.population === 'number' && prevOrdered.population > 0 && population > 0) {
         const ratio = Math.min(prevOrdered.population, population) / Math.max(prevOrdered.population, population);
         if (ratio < 0.5) {

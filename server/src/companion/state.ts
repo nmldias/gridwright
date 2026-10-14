@@ -82,8 +82,12 @@ export interface WatchDef {
   purpose: string;
   /** the population and its exclusions, in words */
   scope: string;
-  /** a Gridwright formula evaluated headlessly against the live document */
+  /** a Gridwright formula evaluated headlessly against the live document ('' for a metric watch) */
   formula: string;
+  /** or a governed metric of the document, by name (7.5): its total through the engine's analytical
+   * query, so the watch uses the same definition as the charts; a changed definition rebuilds the
+   * baseline, a missing one is an error, never ok */
+  metric?: string;
   /** table that gives the formula its context (default: the first table) */
   table?: string;
   kind: WatchKind;
@@ -176,6 +180,8 @@ export interface Watch {
   history: Issue[];
   /** how many times the recurrence was already pointed out */
   recurrenceRaised?: number;
+  /** a metric watch: fingerprint of the metric definition its observations were made with */
+  metricFp?: string;
 }
 
 export interface Event {
